@@ -1,0 +1,8 @@
+uint8 OFF=0
+uint8 TRACK_TOOL=1
+uint8 TRACK_HAND=2
+uint8 mode
+string tool_class
+---
+bool success
+string message
