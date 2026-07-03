@@ -155,8 +155,62 @@ class TaskManagerNode(Node):
         else:
             self._set_state(State.FAULT, detail=result.message)
 
+    def _check_trigger(self, tool_track_msg) -> bool:
+        """시야 내 + approaching이면 True (완화된 트리거 판정, 데모.md 1.3절)."""
+        raise NotImplementedError('_check_trigger 구현 필요')
+
+    def _get_grasp_spec(self, tool_class: str):
+        """(grasp_width_mm, grasp_force_n) 등록된 공구 스펙을 반환한다."""
+        raise NotImplementedError('_get_grasp_spec 구현 필요')
+
     def _on_tool_track(self, msg):
-        pass
+        if self.state != State.DETECT_TRACK:
+            return
+        triggered = self._safe_call(self._check_trigger, msg, default=False)
+        if not triggered:
+            self._detect_track_cycles += 1
+            max_cycles = self.get_parameter('detect_track_max_cycles').value
+            if self._detect_track_cycles >= max_cycles:
+                self._set_state(State.IDLE, detail='벨트에 없음')
+            return
+        spec = self._safe_call(self._get_grasp_spec, self.current_tool, default=None)
+        width_mm, force_n = spec if spec else (0.0, 0.0)
+        self._set_state(State.SERVO_PICK)
+        self._send_robot_goal(
+            'servo_pick', tool_class=self.current_tool,
+            grasp_width_mm=width_mm, grasp_force_n=force_n)
+
+    def _verify_grasp(self, result) -> bool:
+        """무게·폭·grip_detected 삼중 확인 (데모.md 2.6/VERIFY_GRASP)."""
+        raise NotImplementedError('_verify_grasp 구현 필요')
+
+    def _handle_servo_pick_result(self, result):
+        if not result.success:
+            if 'torque' in result.message:
+                self._set_state(State.FAULT, detail=result.message)
+            else:
+                self._detect_track_cycles = 0
+                self._set_state(State.DETECT_TRACK, detail=result.message)
+            return
+        self._set_state(State.VERIFY_GRASP)
+        verified = self._safe_call(self._verify_grasp, result, default=False)
+        if verified:
+            self._set_state(State.MOVE_SAFE)
+            self._send_robot_goal('move_named', named_target='safe')
+            return
+        self._verify_grasp_retries += 1
+        max_retries = self.get_parameter('verify_grasp_max_retries').value
+        if self._verify_grasp_retries > max_retries:
+            self._set_state(State.IDLE, detail='파지 검증 실패 - 보고')
+            return
+        self._send_robot_goal('release_and_retry')
+
+    def _handle_release_and_retry_result(self, result):
+        if result.success:
+            self._detect_track_cycles = 0
+            self._set_state(State.DETECT_TRACK)
+        else:
+            self._set_state(State.FAULT, detail=result.message)
 
     def _on_hand_pose(self, msg):
         pass
