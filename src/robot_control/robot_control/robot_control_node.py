@@ -1,3 +1,5 @@
+import time
+
 import rclpy
 from rclpy.action import ActionServer
 from rclpy.node import Node
@@ -94,6 +96,76 @@ class RobotControlNode(Node):
             result.message = 'release_and_retry failed to return to watch'
         return result
 
+    # ---- servo_pick ----
+
+    def _open_rt_session(self) -> None:
+        """Doosan 실시간 제어 세션을 연다. 드라이버 RT API 확인 후 구현."""
+        raise NotImplementedError('_open_rt_session 구현 필요')
+
+    def _close_rt_session(self) -> None:
+        """실시간 제어 세션을 닫고 서비스 모션 모드로 복귀한다."""
+        raise NotImplementedError('_close_rt_session 구현 필요')
+
+    def _estimate_payload(self) -> float:
+        """들어올림 직후 외부 토크로 페이로드(kg)를 추정한다."""
+        raise NotImplementedError('_estimate_payload 구현 필요')
+
+    def _servo_pick_tick(self):
+        abort_reason = self.servo_loop.should_abort()
+        if abort_reason is not None:
+            return ('ABORT', abort_reason)
+        if self.servo_loop.should_close():
+            return ('CLOSE', None)
+        return ('CONTINUE', None)
+
+    def _on_tool_track_during_servo(self, msg):
+        self.servo_loop.on_tool_track(msg)
+
+    def _execute_servo_pick(self, goal_handle):
+        from handover_interfaces.msg import ToolTrack
+
+        request = goal_handle.request
+        result = RobotTask.Result()
+
+        self._safe_call(self._open_rt_session)
+        self.servo_loop.start(request.tool_class, request.grasp_width_mm, request.grasp_force_n)
+        servo_sub = self.create_subscription(
+            ToolTrack, '/vision/tool_track', self._on_tool_track_during_servo, 10)
+
+        try:
+            while rclpy.ok():
+                status, reason = self._servo_pick_tick()
+                feedback = RobotTask.Feedback()
+                feedback.state = self.servo_loop.get_state()
+                goal_handle.publish_feedback(feedback)
+
+                if status == 'ABORT':
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = reason
+                    return result
+                if status == 'CLOSE':
+                    break
+
+                self.servo_loop.step()
+                time.sleep(0.01)
+
+            self._safe_call(self.rg2_client.close, request.grasp_width_mm, request.grasp_force_n)
+            width_mm, grip_detected = self._safe_call(
+                self.rg2_client.get_state, default=(0.0, False))
+            payload_kg = self._safe_call(self._estimate_payload, default=0.0)
+
+            goal_handle.succeed()
+            result.success = True
+            result.measured_payload_kg = payload_kg
+            result.final_width_mm = width_mm
+            result.grip_detected = grip_detected
+        finally:
+            self.destroy_subscription(servo_sub)
+            self._safe_call(self._close_rt_session)
+
+        return result
+
     # ---- action dispatch ----
 
     def _execute_callback(self, goal_handle):
@@ -103,6 +175,7 @@ class RobotControlNode(Node):
             'move_pose': self._execute_move_pose,
             'place_down': self._execute_move_named,
             'release_and_retry': self._execute_release_and_retry,
+            'servo_pick': self._execute_servo_pick,
         }
         handler = handlers.get(task_type)
         if handler is None:

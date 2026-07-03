@@ -113,3 +113,107 @@ def test_dispatch_routes_place_down_to_move_named_handler(node):
 
     assert gh.succeeded is True
     assert result.success is True
+
+
+def test_servo_pick_tick_continue(node):
+    node.servo_loop.should_abort = lambda: None
+    node.servo_loop.should_close = lambda: False
+
+    status, reason = node._servo_pick_tick()
+
+    assert status == 'CONTINUE'
+    assert reason is None
+
+
+def test_servo_pick_tick_close(node):
+    node.servo_loop.should_abort = lambda: None
+    node.servo_loop.should_close = lambda: True
+
+    status, reason = node._servo_pick_tick()
+
+    assert status == 'CLOSE'
+
+
+def test_servo_pick_tick_abort(node):
+    node.servo_loop.should_abort = lambda: 'diverged'
+
+    status, reason = node._servo_pick_tick()
+
+    assert status == 'ABORT'
+    assert reason == 'diverged'
+
+
+def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    ticks = iter(['CONTINUE', 'CONTINUE', 'CLOSE'])
+    node._servo_pick_tick = lambda: (next(ticks), None)
+    node.servo_loop.step = lambda: None
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: None
+    node._estimate_payload = lambda: 0.31
+    node.rg2_client.close = lambda width, force: None
+    node.rg2_client.get_state = lambda: (29.4, True)
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert result.measured_payload_kg == 0.31
+    assert result.final_width_mm == 29.4
+    assert result.grip_detected is True
+    assert len(gh.feedback_msgs) == 3
+
+
+def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._servo_pick_tick = lambda: ('ABORT', 'diverged')
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: None
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert result.message == 'diverged'
+
+
+def test_dispatch_routes_servo_pick(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._servo_pick_tick = lambda: ('CLOSE', None)
+    node.servo_loop.get_state = lambda: 'closing'
+    node.servo_loop.start = lambda *a, **k: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: None
+    node._estimate_payload = lambda: 0.3
+    node.rg2_client.close = lambda width, force: None
+    node.rg2_client.get_state = lambda: (30.0, True)
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_callback(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
