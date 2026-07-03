@@ -212,8 +212,79 @@ class TaskManagerNode(Node):
         else:
             self._set_state(State.FAULT, detail=result.message)
 
+    def _handle_move_safe_result(self, result):
+        if result.success:
+            self._set_state(State.TRACK_HAND)
+            self._set_vision_mode(SetVisionMode.Request.TRACK_HAND)
+            timeout_s = self.get_parameter('hand_detect_timeout_s').value
+            self._hand_timeout_timer = self.create_timer(timeout_s, self._on_hand_timeout)
+        else:
+            self._set_state(State.FAULT, detail=result.message)
+
+    def _on_hand_timeout(self):
+        self._hand_timeout_timer.cancel()
+        self._hand_timeout_timer = None
+        if self.state != State.TRACK_HAND:
+            return
+        self._send_robot_goal('move_named', named_target='handover_default')
+
     def _on_hand_pose(self, msg):
-        pass
+        if self.state != State.TRACK_HAND:
+            return
+        if self._hand_timeout_timer is not None:
+            self._hand_timeout_timer.cancel()
+            self._hand_timeout_timer = None
+        offset_pose = PoseStamped()
+        offset_pose.header = msg.header
+        offset_pose.pose = msg.pose
+        offset_pose.pose.position.z += 0.08
+        self._send_robot_goal('move_pose', target_pose=offset_pose)
+
+    def _handle_track_hand_result(self, result):
+        if result.success:
+            self._set_state(State.WAIT_PULL)
+            timeout_s = self.get_parameter('wait_pull_timeout_s').value
+            self._wait_pull_timeout_timer = self.create_timer(timeout_s, self._on_wait_pull_timeout)
+            self._send_robot_goal('handover_hold')
+        else:
+            self._set_state(State.FAULT, detail=result.message)
+
+    def _on_wait_pull_timeout(self):
+        self._wait_pull_timeout_timer.cancel()
+        self._wait_pull_timeout_timer = None
+        if self.state != State.WAIT_PULL:
+            return
+        self._set_state(State.RELEASE, detail='wait_pull timeout')
+        self._send_robot_goal('place_down', named_target='place_down')
+
+    def _handle_wait_pull_result(self, result):
+        if self._wait_pull_timeout_timer is not None:
+            self._wait_pull_timeout_timer.cancel()
+            self._wait_pull_timeout_timer = None
+        if result.success:
+            # RELEASE는 robot_control이 handover_hold 안에서 이미 개방을 완료했음을
+            # 표시하기 위한 경유 상태 - 별도 goal 없이 바로 HOME으로 넘어간다.
+            self._set_state(State.RELEASE, detail=result.message)
+            self._set_state(State.HOME)
+            self._set_vision_mode(SetVisionMode.Request.OFF)
+            self._send_robot_goal('move_named', named_target='home')
+        else:
+            self._set_state(State.FAULT, detail=result.message)
+
+    def _handle_release_result(self, result):
+        # WAIT_PULL 타임아웃 후 보낸 place_down goal의 결과 처리
+        if result.success:
+            self._set_state(State.HOME)
+            self._set_vision_mode(SetVisionMode.Request.OFF)
+            self._send_robot_goal('move_named', named_target='home')
+        else:
+            self._set_state(State.FAULT, detail=result.message)
+
+    def _handle_home_result(self, result):
+        if result.success:
+            self._set_state(State.IDLE, detail=f'DONE tool={self.current_tool}')
+        else:
+            self._set_state(State.FAULT, detail=result.message)
 
 
 def main(args=None):

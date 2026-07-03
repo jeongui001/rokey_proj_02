@@ -4,6 +4,7 @@ import rclpy
 import pytest
 from std_msgs.msg import String
 
+from geometry_msgs.msg import PoseStamped
 from handover_interfaces.msg import ToolTrack
 from task_manager.task_manager_node import TaskManagerNode, State
 
@@ -244,5 +245,126 @@ def test_release_and_retry_result_failure_goes_to_fault(node):
     node.state = State.VERIFY_GRASP
 
     node._handle_release_and_retry_result(_FakeResult(success=False, message='release failed'))
+
+    assert node.state == State.FAULT
+
+
+def test_move_safe_result_success_transitions_to_track_hand(node):
+    node.state = State.MOVE_SAFE
+    node._set_vision_mode = lambda mode, tool_class='': None
+
+    node._handle_move_safe_result(_FakeResult(success=True))
+
+    assert node.state == State.TRACK_HAND
+    assert node._hand_timeout_timer is not None
+    node._hand_timeout_timer.cancel()
+
+
+def test_move_safe_result_failure_goes_to_fault(node):
+    node.state = State.MOVE_SAFE
+
+    node._handle_move_safe_result(_FakeResult(success=False, message='motion failed'))
+
+    assert node.state == State.FAULT
+
+
+def test_hand_pose_sends_move_pose_with_offset(node):
+    node.state = State.TRACK_HAND
+    node._hand_timeout_timer = node.create_timer(100.0, lambda: None)
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    msg = PoseStamped()
+    msg.pose.position.z = 0.30
+    node._on_hand_pose(msg)
+
+    assert node._hand_timeout_timer is None
+    assert sent[0][0] == 'move_pose'
+    assert abs(sent[0][1]['target_pose'].pose.position.z - 0.38) < 1e-9
+
+
+def test_hand_pose_ignored_unless_track_hand(node):
+    node.state = State.IDLE
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._on_hand_pose(PoseStamped())
+
+    assert sent == []
+
+
+def test_hand_timeout_sends_fallback_goal(node):
+    node.state = State.TRACK_HAND
+    node._hand_timeout_timer = node.create_timer(100.0, lambda: None)
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._on_hand_timeout()
+
+    assert sent == [('move_named', {'named_target': 'handover_default'})]
+
+
+def test_track_hand_result_success_transitions_to_wait_pull(node):
+    node.state = State.TRACK_HAND
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_track_hand_result(_FakeResult(success=True))
+
+    assert node.state == State.WAIT_PULL
+    assert sent == [('handover_hold', {})]
+    node._wait_pull_timeout_timer.cancel()
+
+
+def test_wait_pull_result_success_goes_home(node):
+    node.state = State.WAIT_PULL
+    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
+    node._set_vision_mode = lambda mode, tool_class='': None
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_wait_pull_result(_FakeResult(success=True, message='pull_detected, released'))
+
+    assert node.state == State.HOME
+    assert sent == [('move_named', {'named_target': 'home'})]
+
+
+def test_wait_pull_timeout_sends_place_down(node):
+    node.state = State.WAIT_PULL
+    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._on_wait_pull_timeout()
+
+    assert node.state == State.RELEASE
+    assert sent == [('place_down', {'named_target': 'place_down'})]
+
+
+def test_release_result_success_goes_home(node):
+    node.state = State.RELEASE
+    node._set_vision_mode = lambda mode, tool_class='': None
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_release_result(_FakeResult(success=True))
+
+    assert node.state == State.HOME
+    assert sent == [('move_named', {'named_target': 'home'})]
+
+
+def test_home_result_success_returns_to_idle(node):
+    node.state = State.HOME
+    node.current_tool = 'spanner'
+
+    node._handle_home_result(_FakeResult(success=True))
+
+    assert node.state == State.IDLE
+
+
+def test_home_result_failure_goes_to_fault(node):
+    node.state = State.HOME
+
+    node._handle_home_result(_FakeResult(success=False, message='motion failed'))
 
     assert node.state == State.FAULT
