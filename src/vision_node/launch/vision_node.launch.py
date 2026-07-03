@@ -11,13 +11,11 @@ def generate_launch_description():
             FindPackageShare('realsense2_camera'), '/launch/rs_launch.py'
         ]),
         launch_arguments={
-            'depth_module.profile': '424x240x60',
-            'rgb_camera.profile': '424x240x60',
+            'depth_module.depth_profile': '424x240x60',
+            'rgb_camera.color_profile': '424x240x60',
             'align_depth.enable': 'true',
         }.items()
     )
-    # NOTE: realsense2_camera 버전에 따라 launch 인자명이 다를 수 있으니
-    # 설치된 realsense-ros 문서로 재확인할 것.
     static_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
