@@ -76,8 +76,84 @@ class TaskManagerNode(Node):
             return
         self._set_state(State.FAULT, detail=msg.data)
 
+    def _call_llm(self, text: str) -> dict:
+        """LLM API를 호출해 {"tool": ..., "action": ...}를 반환한다. 스키마 검증·재시도 포함."""
+        raise NotImplementedError('_call_llm 구현 필요')
+
     def _on_user_command(self, msg):
-        pass
+        if self.state != State.IDLE:
+            return
+        self._set_state(State.PARSING, detail=msg.data)
+        self._handle_parsing(msg.data)
+
+    def _handle_parsing(self, text):
+        parsed = self._safe_call(self._call_llm, text, default=None)
+        if not parsed or 'tool' not in parsed:
+            self._set_state(State.IDLE, detail='명령을 이해하지 못했습니다. 다시 말씀해주세요.')
+            return
+        self.current_tool = parsed['tool']
+        self._detect_track_cycles = 0
+        self._verify_grasp_retries = 0
+        self._set_state(State.MOVE_TO_WATCH)
+        self._set_vision_mode(SetVisionMode.Request.TRACK_TOOL, self.current_tool)
+        self._send_robot_goal('move_named', named_target='watch')
+
+    def _set_vision_mode(self, mode, tool_class=''):
+        request = SetVisionMode.Request()
+        request.mode = mode
+        request.tool_class = tool_class
+        self.set_mode_client.call_async(request)
+
+    def _send_robot_goal(self, task_type, named_target='', target_pose=None,
+                          tool_class='', grasp_width_mm=0.0, grasp_force_n=0.0):
+        goal = RobotTask.Goal()
+        goal.task_type = task_type
+        goal.named_target = named_target
+        if target_pose is not None:
+            goal.target_pose = target_pose
+        goal.tool_class = tool_class
+        goal.grasp_width_mm = grasp_width_mm
+        goal.grasp_force_n = grasp_force_n
+        future = self.robot_task_client.send_goal_async(
+            goal, feedback_callback=self._on_robot_feedback)
+        future.add_done_callback(self._on_goal_response)
+
+    def _on_robot_feedback(self, feedback_msg):
+        self._publish_status(detail=f'servo:{feedback_msg.feedback.state}')
+
+    def _on_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._set_state(State.FAULT, detail='goal rejected')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_robot_result)
+
+    def _on_robot_result(self, future):
+        response = future.result()
+        result = response.result
+        if self.state == State.MOVE_TO_WATCH:
+            self._handle_move_to_watch_result(result)
+        elif self.state == State.SERVO_PICK:
+            self._handle_servo_pick_result(result)
+        elif self.state == State.VERIFY_GRASP:
+            self._handle_release_and_retry_result(result)
+        elif self.state == State.MOVE_SAFE:
+            self._handle_move_safe_result(result)
+        elif self.state == State.TRACK_HAND:
+            self._handle_track_hand_result(result)
+        elif self.state == State.WAIT_PULL:
+            self._handle_wait_pull_result(result)
+        elif self.state == State.RELEASE:
+            self._handle_release_result(result)
+        elif self.state == State.HOME:
+            self._handle_home_result(result)
+
+    def _handle_move_to_watch_result(self, result):
+        if result.success:
+            self._set_state(State.DETECT_TRACK)
+        else:
+            self._set_state(State.FAULT, detail=result.message)
 
     def _on_tool_track(self, msg):
         pass
