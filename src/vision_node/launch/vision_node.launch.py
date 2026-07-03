@@ -13,6 +13,7 @@ def generate_launch_description():
         launch_arguments={
             'depth_module.profile': '424x240x60',
             'rgb_camera.profile': '424x240x60',
+            'align_depth.enable': 'true',
         }.items()
     )
     # NOTE: realsense2_camera 버전에 따라 launch 인자명이 다를 수 있으니
