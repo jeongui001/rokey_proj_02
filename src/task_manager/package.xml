@@ -12,6 +12,12 @@
   <depend>geometry_msgs</depend>
   <depend>handover_interfaces</depend>
 
+  <!-- handover_system.launch.py 통합 실행용 -->
+  <exec_depend>stt_node</exec_depend>
+  <exec_depend>vision_node</exec_depend>
+  <exec_depend>robot_control</exec_depend>
+  <exec_depend>handover_ui</exec_depend>
+
   <test_depend>python3-pytest</test_depend>
 
   <export>
