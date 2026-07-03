@@ -7,8 +7,10 @@
   <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
   <license>MIT</license>
 
-  <!-- PyQt5, roslibpy, pytest-qt는 ROS 패키지가 아니라 pip 의존성:
-       pip install PyQt5 roslibpy pytest-qt -->
+  <exec_depend>rosbridge_server</exec_depend>
+
+  <!-- PyQt5, roslibpy, pytest-qt는 ROS 패키지가 아니라 pip 의존성.
+       requirements.txt(런타임) / test-requirements.txt(테스트) 참고 -->
 
   <test_depend>python3-pytest</test_depend>
 

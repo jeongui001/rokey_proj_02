@@ -13,6 +13,7 @@
   <depend>tf2_ros</depend>
   <depend>message_filters</depend>
   <depend>handover_interfaces</depend>
+  <exec_depend>realsense2_camera</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 
