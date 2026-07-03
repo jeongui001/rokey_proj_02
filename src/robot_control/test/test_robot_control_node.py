@@ -217,3 +217,92 @@ def test_dispatch_routes_servo_pick(node, monkeypatch):
 
     assert gh.succeeded is True
     assert result.success is True
+
+
+def test_handover_hold_releases_on_pull_detected(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._latest_robot_state = 'state'
+    node._enable_compliance = lambda: None
+    node._disable_compliance = lambda: None
+    node._is_pull_detected = lambda state: True
+    calls = []
+    node.rg2_client.open = lambda: calls.append('open')
+
+    gh = FakeGoalHandle(_goal('handover_hold'))
+
+    result = node._execute_handover_hold(gh)
+
+    assert calls == ['open']
+    assert gh.succeeded is True
+    assert result.success is True
+    assert result.message == 'pull_detected, released'
+
+
+def test_dispatch_routes_handover_hold(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._latest_robot_state = 'state'
+    node._enable_compliance = lambda: None
+    node._disable_compliance = lambda: None
+    node._is_pull_detected = lambda state: True
+    node.rg2_client.open = lambda: None
+
+    gh = FakeGoalHandle(_goal('handover_hold'))
+
+    result = node._execute_callback(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+def test_gripper_timer_publishes_state(node):
+    from handover_interfaces.msg import GripperState
+
+    node.rg2_client.get_state = lambda: (30.0, True)
+    published = []
+    node.pub_gripper_state.publish = published.append
+
+    node._on_gripper_timer()
+
+    assert len(published) == 1
+    assert isinstance(published[0], GripperState)
+    assert published[0].width_mm == 30.0
+    assert published[0].grip_detected is True
+
+
+def test_state_poll_timer_publishes_fault_when_detected(node):
+    node._read_robot_state = lambda: 'state'
+    node._check_fault = lambda state: 'protective_stop'
+    published = []
+    node.pub_fault.publish = published.append
+
+    node._on_state_poll_timer()
+
+    assert len(published) == 1
+    assert published[0].data == 'protective_stop'
+    assert node._latest_robot_state == 'state'
+
+
+def test_state_poll_timer_silent_when_no_fault(node):
+    node._read_robot_state = lambda: 'state'
+    node._check_fault = lambda state: None
+    published = []
+    node.pub_fault.publish = published.append
+
+    node._on_state_poll_timer()
+
+    assert published == []
+
+
+def test_state_poll_timer_skips_when_state_unavailable(node):
+    node._read_robot_state = lambda: None
+    published = []
+    node.pub_fault.publish = published.append
+
+    node._on_state_poll_timer()
+
+    assert published == []
+    assert node._latest_robot_state is None

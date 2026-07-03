@@ -5,6 +5,8 @@ from rclpy.action import ActionServer
 from rclpy.node import Node
 
 from handover_interfaces.action import RobotTask
+from handover_interfaces.msg import GripperState
+from std_msgs.msg import String
 
 from robot_control.rg2_client import RG2Client
 from robot_control.servo_loop import ServoLoop
@@ -42,6 +44,13 @@ class RobotControlNode(Node):
 
         self._action_server = ActionServer(
             self, RobotTask, 'robot_task', execute_callback=self._execute_callback)
+
+        self._latest_robot_state = None
+        self._gripper_timer = self.create_timer(0.5, self._on_gripper_timer)
+        self._state_poll_timer = self.create_timer(0.1, self._on_state_poll_timer)
+
+        self.pub_gripper_state = self.create_publisher(GripperState, '/gripper/state', 10)
+        self.pub_fault = self.create_publisher(String, '/robot/fault', 10)
 
     def _safe_call(self, fn, *args, default=None, **kwargs):
         try:
@@ -166,6 +175,66 @@ class RobotControlNode(Node):
 
         return result
 
+    # ---- handover_hold ----
+
+    def _enable_compliance(self) -> None:
+        """컴플라이언스 모드를 켠다."""
+        raise NotImplementedError('_enable_compliance 구현 필요')
+
+    def _disable_compliance(self) -> None:
+        """컴플라이언스 모드를 끈다."""
+        raise NotImplementedError('_disable_compliance 구현 필요')
+
+    def _is_pull_detected(self, robot_state) -> bool:
+        """robot_state의 외부 토크로 당김 힘 임계 초과 여부를 판정한다."""
+        raise NotImplementedError('_is_pull_detected 구현 필요')
+
+    def _execute_handover_hold(self, goal_handle):
+        result = RobotTask.Result()
+        self._safe_call(self._enable_compliance)
+        try:
+            while rclpy.ok():
+                if self._latest_robot_state is not None and self._safe_call(
+                        self._is_pull_detected, self._latest_robot_state, default=False):
+                    break
+                time.sleep(0.01)
+            self._safe_call(self.rg2_client.open)
+            goal_handle.succeed()
+            result.success = True
+            result.message = 'pull_detected, released'
+        finally:
+            self._safe_call(self._disable_compliance)
+        return result
+
+    # ---- fault / robot state polling ----
+
+    def _read_robot_state(self):
+        """Doosan 드라이버로부터 최신 로봇 상태(외부 토크 등)를 읽는다."""
+        raise NotImplementedError('_read_robot_state 구현 필요')
+
+    def _check_fault(self, robot_state):
+        """protective stop / 토크 이상 등을 판정한다. 사유 문자열 또는 None."""
+        raise NotImplementedError('_check_fault 구현 필요')
+
+    def _on_state_poll_timer(self):
+        state = self._safe_call(self._read_robot_state, default=None)
+        if state is None:
+            return
+        self._latest_robot_state = state
+        fault_reason = self._safe_call(self._check_fault, state, default=None)
+        if fault_reason is not None:
+            msg = String()
+            msg.data = fault_reason
+            self.pub_fault.publish(msg)
+
+    def _on_gripper_timer(self):
+        width_mm, grip_detected = self._safe_call(
+            self.rg2_client.get_state, default=(0.0, False))
+        msg = GripperState()
+        msg.width_mm = width_mm
+        msg.grip_detected = grip_detected
+        self.pub_gripper_state.publish(msg)
+
     # ---- action dispatch ----
 
     def _execute_callback(self, goal_handle):
@@ -176,6 +245,7 @@ class RobotControlNode(Node):
             'place_down': self._execute_move_named,
             'release_and_retry': self._execute_release_and_retry,
             'servo_pick': self._execute_servo_pick,
+            'handover_hold': self._execute_handover_hold,
         }
         handler = handlers.get(task_type)
         if handler is None:
