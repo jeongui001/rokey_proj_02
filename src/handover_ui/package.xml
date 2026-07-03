@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>handover_ui</name>
+  <version>0.0.1</version>
+  <description>PyQt 데스크톱 UI - rosbridge(roslibpy) 경유로 /task/status, /gripper/state, /robot/fault 표시 및 /user_command/text 입력</description>
+  <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
+  <license>MIT</license>
+
+  <!-- PyQt5, roslibpy, pytest-qt는 ROS 패키지가 아니라 pip 의존성:
+       pip install PyQt5 roslibpy pytest-qt -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
