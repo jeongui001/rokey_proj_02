@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'vision_node = vision_node.vision_node:main',
+            'fake_detection_publisher = vision_node.tools.fake_detection_publisher:main',
         ],
     },
 )
