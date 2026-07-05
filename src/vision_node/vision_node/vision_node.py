@@ -136,7 +136,6 @@ class VisionNode(Node):
         track.depth_valid = bool(depth_valid)
         track.approaching = bool(is_approaching(
             (position[0], position[1]), velocity, self.approach_ref_xy))
-        track.confidence = 1.0
         return track
 
     def _track_hand(self, color_msg, depth_msg, info_msg, tf_at_stamp):
