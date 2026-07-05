@@ -9,7 +9,19 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
   <depend>handover_interfaces</depend>
+
+  <!-- hardware_enabled=true로 실제 M0609를 제어할 때만 필요 (dry_run에서는 미사용).
+       이 워크스페이스에는 포함되어 있지 않으며, ~/cobot_ws 또는 ~/ros_ws의
+       doosan-robot2/dsr_msgs2를 별도로 source해야 한다. -->
+  <exec_depend>dsr_msgs2</exec_depend>
+
+  <!-- pip 의존성(rosdep 키 없음, apt/ROS 패키지가 아님) - requirements.txt 참고.
+       hardware_enabled=true일 때만 실제로 import되며(지연 임포트), dry_run 기동에는
+       필요하지 않다: scipy(move_pose 자세 변환), pymodbus(RG2 Modbus TCP 제어).
+       설치: pip install -r src/robot_control/requirements.txt -->
 
   <test_depend>python3-pytest</test_depend>
 

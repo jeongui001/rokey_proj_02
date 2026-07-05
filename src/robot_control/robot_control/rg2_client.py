@@ -1,18 +1,11 @@
-class RG2Client:
-    """OnRobot RG2 그리퍼를 Modbus TCP(Compute Box)로 제어하는 클라이언트."""
+"""하위 호환용 재노출 모듈.
 
-    def __init__(self, ip: str, port: int = 502):
-        self.ip = ip
-        self.port = port
+RG2Client의 실제 구현은 robot_control_node.py로 이동했다 (요청: "핵심 로직을
+robot_control_node.py/servo_loop.py 두 파일 중심으로 정리"). 기존
+``from robot_control.rg2_client import RG2Client`` 형태의 import가 계속
+동작하도록 이 모듈에서 재노출만 한다.
+"""
 
-    def open(self) -> None:
-        """RG2를 완전 개방한다."""
-        raise NotImplementedError('RG2Client.open 구현 필요 (Modbus TCP 레지스터 쓰기)')
+from robot_control.robot_control_node import RG2Client
 
-    def close(self, width_mm: float, force_n: float) -> None:
-        """지정한 폭(mm)·힘(N)으로 RG2를 폐합한다."""
-        raise NotImplementedError('RG2Client.close 구현 필요 (Modbus TCP 레지스터 쓰기)')
-
-    def get_state(self):
-        """(width_mm: float, grip_detected: bool) 튜플을 반환한다."""
-        raise NotImplementedError('RG2Client.get_state 구현 필요 (Modbus TCP 레지스터 읽기)')
+__all__ = ['RG2Client']

@@ -1,0 +1,52 @@
+# robot_control 노드 파라미터 템플릿.
+#
+# named_poses.*는 절대 추측한 값을 채워 넣지 않았다 - 실제 M0609로 각 자세에서
+# get_current_posj (dsr_msgs2/srv/aux_control/GetCurrentPosj) 등을 이용해 실측한
+# 관절각(degree, [j1,j2,j3,j4,j5,j6]) 6개를 직접 채워야 한다.
+# 값이 비어 있으면(기본값) 해당 named pose로의 이동은 항상 실패로 처리된다
+# (robot_control_node._call_move_service 참고).
+/**:
+  ros__parameters:
+    hardware_enabled: false  # 실제 M0609/RG2를 사용하려면 true로 명시적으로 설정
+
+    robot_id: 'dsr01'  # launch의 namespace와 일치해야 함 (DoosanBootcamp 예제 관례)
+
+    rg2_ip: '192.168.1.1'
+    rg2_port: 502
+    rg2_gripper: 'rg2'
+
+    # named_poses.<name>은 실측한 6축 관절각(degree)이 준비되면 여기에 주석을 풀고
+    # 채워 넣는다. 빈 배열([])을 파라미터 override로 명시하면 rclpy가 배열 타입을
+    # 추론하지 못해 파라미터가 미초기화 상태로 남는 문제가 있어(ROS2 Humble 확인됨),
+    # 값이 없는 named pose는 아예 이 파일에 키를 적지 않는다 - 코드 쪽 기본값([])이
+    # 그대로 적용되며, 그 경우 해당 named pose로의 이동은 명확한 실패로 처리된다
+    # (robot_control_node._call_move_service 참고).
+    # named_poses:
+    #   home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+    #   front: [...]
+    #   up: [...]
+    #   down: [...]
+    #   watch: [...]
+    #   handover_safe: [...]
+    #   place_down: [...]
+
+    move:
+      vel_deg_s: 30.0
+      acc_deg_s2: 30.0
+      line_vel_mm_s: 100.0
+      line_vel_deg_s: 30.0
+      line_acc_mm_s2: 100.0
+      line_acc_deg_s2: 30.0
+      ref: 0        # DR_BASE(0) | DR_TOOL(1) | DR_WORLD(2)
+      timeout_s: 30.0
+
+    handover_hold:
+      # TODO(캘리브레이션 필요): 실제 그리퍼-TCP 장착 방향에 따라 결정해야 한다.
+      # 미설정(-1)이면 당김 감지가 항상 비활성화된다(오탐 방지가 기본값).
+      pull_axis_index: -1     # 0=x,1=y,2=z,3=rx,4=ry,5=rz (tool_force 기준)
+      pull_direction_sign: 1  # 1 또는 -1
+      pull_force_threshold_n: 15.0
+
+    safety:
+      external_torque_threshold_nm: 20.0  # TODO: 실기 캘리브레이션 필요
+      fault_stop_mode: 1  # TODO(전문가 검토 필요): MoveStop stop_mode 0~3 중 선택
