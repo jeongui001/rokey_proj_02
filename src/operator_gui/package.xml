@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>operator_gui</name>
+  <version>0.0.1</version>
+  <description>PyQt 오퍼레이터 GUI - rosbridge(roslibpy) 경유로 /task/status, /gripper/state,
+    /robot/fault, 카메라(CompressedImage)를 표시하고 /user_command/text로 명령을 발행한다.
+    (handover_ui에서 분리된 확장 버전)</description>
+  <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>rosbridge_server</exec_depend>
+
+  <!-- roslibpy가 문자열 타입 이름으로만 참조하는 메시지들 - Python에서 직접
+       import하지는 않지만, rosbridge가 해당 메시지 정의를 알 수 있어야 하므로
+       실행 의존성으로 명시한다. -->
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>handover_interfaces</exec_depend>
+
+  <!-- PyQt5, roslibpy, pytest-qt는 ROS 패키지가 아니라 pip 의존성.
+       requirements.txt(런타임) / test-requirements.txt(테스트) 참고:
+       pip install -r src/operator_gui/requirements.txt
+       pip install -r src/operator_gui/test-requirements.txt  # 테스트 실행 시에만 필요 -->
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
