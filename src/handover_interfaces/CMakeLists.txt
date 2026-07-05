@@ -9,6 +9,8 @@ find_package(geometry_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ToolTrack.msg"
   "msg/GripperState.msg"
+  "msg/Detection2D.msg"
+  "msg/DetectionArray.msg"
   "srv/SetVisionMode.srv"
   "action/RobotTask.action"
   DEPENDENCIES std_msgs geometry_msgs
