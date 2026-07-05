@@ -12,8 +12,10 @@
   <depend>geometry_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>message_filters</depend>
+  <depend>cv_bridge</depend>
   <depend>handover_interfaces</depend>
   <exec_depend>realsense2_camera</exec_depend>
+  <!-- mediapipe는 rosdep 대상이 아니므로 pip로 별도 설치: pip install mediapipe -->
 
   <test_depend>python3-pytest</test_depend>
 
