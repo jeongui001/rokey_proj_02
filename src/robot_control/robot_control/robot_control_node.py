@@ -119,6 +119,10 @@ class RobotControlNode(Node):
         """들어올림 직후 외부 토크로 페이로드(kg)를 추정한다."""
         raise NotImplementedError('_estimate_payload 구현 필요')
 
+    def _get_current_tcp_pose(self):
+        """Doosan RT 세션에서 현재 TCP pose(base_link 기준 x,y,z,rx,ry,rz)를 읽는다."""
+        raise NotImplementedError('_get_current_tcp_pose 구현 필요 (Doosan RT API)')
+
     def _servo_pick_tick(self):
         abort_reason = self.servo_loop.should_abort()
         if abort_reason is not None:
@@ -156,7 +160,9 @@ class RobotControlNode(Node):
                 if status == 'CLOSE':
                     break
 
-                self.servo_loop.step()
+                tcp_pose = self._safe_call(self._get_current_tcp_pose, default=None)
+                if tcp_pose is not None:
+                    self.servo_loop.step(tcp_pose, time.monotonic())
                 time.sleep(0.01)
 
             self._safe_call(self.rg2_client.close, request.grasp_width_mm, request.grasp_force_n)

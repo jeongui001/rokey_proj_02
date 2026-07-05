@@ -149,9 +149,10 @@ def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monk
 
     ticks = iter(['CONTINUE', 'CONTINUE', 'CLOSE'])
     node._servo_pick_tick = lambda: (next(ticks), None)
-    node.servo_loop.step = lambda: None
+    node.servo_loop.step = lambda *a, **k: None
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
+    node._get_current_tcp_pose = lambda: (0.0, 0.0, 0.05, 0, 0, 0)
     node._open_rt_session = lambda: None
     node._close_rt_session = lambda: None
     node._estimate_payload = lambda: 0.31
@@ -202,6 +203,8 @@ def test_dispatch_routes_servo_pick(node, monkeypatch):
     node._servo_pick_tick = lambda: ('CLOSE', None)
     node.servo_loop.get_state = lambda: 'closing'
     node.servo_loop.start = lambda *a, **k: None
+    node.servo_loop.step = lambda *a, **k: None
+    node._get_current_tcp_pose = lambda: (0.0, 0.0, 0.05, 0, 0, 0)
     node._open_rt_session = lambda: None
     node._close_rt_session = lambda: None
     node._estimate_payload = lambda: 0.3
