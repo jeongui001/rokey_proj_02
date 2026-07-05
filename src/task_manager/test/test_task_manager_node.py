@@ -6,6 +6,7 @@ from std_msgs.msg import String
 
 from geometry_msgs.msg import PoseStamped
 from handover_interfaces.msg import ToolTrack
+from handover_interfaces.srv import SetVisionMode
 from task_manager.task_manager_node import TaskManagerNode, State
 
 
@@ -368,3 +369,60 @@ def test_home_result_failure_goes_to_fault(node):
     node._handle_home_result(_FakeResult(success=False, message='motion failed'))
 
     assert node.state == State.FAULT
+
+
+class _FakeSetModeResponse:
+    def __init__(self, success=True, message=''):
+        self.success = success
+        self.message = message
+
+
+class _FakeSetModeFuture:
+    def __init__(self, response):
+        self._response = response
+
+    def result(self):
+        return self._response
+
+    def add_done_callback(self, callback):
+        callback(self)
+
+
+def test_set_vision_mode_success_does_not_change_state(node):
+    node.state = State.MOVE_TO_WATCH
+    node.set_mode_client.call_async = lambda req: _FakeSetModeFuture(
+        _FakeSetModeResponse(success=True))
+
+    node._set_vision_mode(SetVisionMode.Request.TRACK_TOOL, 'spanner')
+
+    assert node.state == State.MOVE_TO_WATCH
+
+
+def test_set_vision_mode_failure_for_track_tool_goes_to_fault(node):
+    node.state = State.MOVE_TO_WATCH
+    node.set_mode_client.call_async = lambda req: _FakeSetModeFuture(
+        _FakeSetModeResponse(success=False, message='camera busy'))
+
+    node._set_vision_mode(SetVisionMode.Request.TRACK_TOOL, 'spanner')
+
+    assert node.state == State.FAULT
+
+
+def test_set_vision_mode_failure_for_track_hand_goes_to_fault(node):
+    node.state = State.MOVE_SAFE
+    node.set_mode_client.call_async = lambda req: _FakeSetModeFuture(
+        _FakeSetModeResponse(success=False, message='camera busy'))
+
+    node._set_vision_mode(SetVisionMode.Request.TRACK_HAND)
+
+    assert node.state == State.FAULT
+
+
+def test_set_vision_mode_failure_for_off_does_not_change_state(node):
+    node.state = State.HOME
+    node.set_mode_client.call_async = lambda req: _FakeSetModeFuture(
+        _FakeSetModeResponse(success=False, message='camera busy'))
+
+    node._set_vision_mode(SetVisionMode.Request.OFF)
+
+    assert node.state == State.HOME

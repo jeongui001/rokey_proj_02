@@ -102,7 +102,17 @@ class TaskManagerNode(Node):
         request = SetVisionMode.Request()
         request.mode = mode
         request.tool_class = tool_class
-        self.set_mode_client.call_async(request)
+        future = self.set_mode_client.call_async(request)
+        future.add_done_callback(
+            lambda f: self._on_set_vision_mode_response(f, mode))
+
+    def _on_set_vision_mode_response(self, future, requested_mode):
+        response = future.result()
+        if response.success:
+            return
+        self.get_logger().warn(f'set_vision_mode({requested_mode}) failed: {response.message}')
+        if requested_mode != SetVisionMode.Request.OFF:
+            self._set_state(State.FAULT, detail=f'vision 모드 전환 실패: {response.message}')
 
     def _send_robot_goal(self, task_type, named_target='', target_pose=None,
                           tool_class='', grasp_width_mm=0.0, grasp_force_n=0.0):
