@@ -1738,9 +1738,13 @@ Expected: 두 패키지 전부 PASS
 - [ ] **Step 3: 남은 gap 정리(코드 변경 없음, 확인만)**
 
 다음은 이번 계획 범위 밖이며 별도로 처리해야 함을 기록만 해둔다:
-- `src/vision_node/launch/vision_node.launch.py`의 hand-eye 캘리브레이션 TF 값이 아직 `0 0 0 0 0 0`
-  placeholder — 실제 캘리브레이션 결과값으로 교체 필요
-- `mediapipe`가 개발 환경에 설치돼 있지 않음 — `TRACK_HAND` 실제 구동 전 `pip install mediapipe` 필요
+- ~~`src/vision_node/launch/vision_node.launch.py`의 hand-eye 캘리브레이션 TF 값이 아직
+  `0 0 0 0 0 0` placeholder~~ → 2026-07-05, `T_gripper2camera.npy` 반영 완료
+  (평행이동 m 단위 + 쿼터니언, `src/vision_node/resource/T_gripper2camera.npy`에 원본 보관).
+  겸사겸사 이 ROS2 배포판의 `static_transform_publisher`가 positional 인자를 받지 않고
+  `--x/--y/--z/--qx.../--frame-id/--child-frame-id` named 인자만 받는 걸 확인해 함께 수정
+- ~~`mediapipe`가 개발 환경에 설치돼 있지 않음~~ → 2026-07-05, `src/vision_node/requirements.txt`에
+  명시(`pip install -r requirements.txt`로 설치)
 - 팀원3의 `/detection/tool_boxes` 실제 퍼블리셔가 아직 없음 — 지금은 Task 8의
   `fake_detection_publisher`로 대체 검증
 - 팀원1 담당 스텁(`_get_current_tcp_pose`, `_call_move_service`, `_open_rt_session` 등)은

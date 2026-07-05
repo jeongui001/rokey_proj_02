@@ -16,11 +16,16 @@ def generate_launch_description():
             'align_depth.enable': 'true',
         }.items()
     )
+    # hand-eye 캘리브레이션 결과(T_gripper2camera.npy, flange -> camera_link)를
+    # m 단위 평행이동 + 쿼터니언으로 변환해 반영 (src/vision_node/resource/T_gripper2camera.npy 참고)
     static_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
-        # TODO: hand-eye 캘리브레이션 결과값(flange -> camera_link)으로 인자 교체
-        arguments=['0', '0', '0', '0', '0', '0', 'flange', 'camera_link'],
+        arguments=[
+            '--x', '0.032594', '--y', '0.065706', '--z', '-0.203569',
+            '--qx', '0.000794', '--qy', '0.011346', '--qz', '0.999927', '--qw', '0.004194',
+            '--frame-id', 'flange', '--child-frame-id', 'camera_link',
+        ],
     )
     vision_node = Node(
         package='vision_node',
