@@ -30,9 +30,9 @@ def generate_launch_description():
             FindPackageShare('robot_control'), '/launch/robot_control.launch.py'
         ])
     )
-    handover_ui_launch = IncludeLaunchDescription(
+    operator_gui_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
-            FindPackageShare('handover_ui'), '/launch/handover_ui.launch.py'
+            FindPackageShare('operator_gui'), '/launch/operator_gui.launch.py'
         ])
     )
 
@@ -41,5 +41,5 @@ def generate_launch_description():
         stt_node_launch,
         vision_node_launch,
         robot_control_launch,
-        handover_ui_launch,
+        operator_gui_launch,
     ])

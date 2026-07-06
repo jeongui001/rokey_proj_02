@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='hwangjeongui',
     maintainer_email='hwangjeongui01@gmail.com',
-    description='PyQt 오퍼레이터 GUI (rosbridge 경유, handover_ui에서 분리된 확장 버전)',
+    description='PyQt 오퍼레이터 GUI (rosbridge 경유)',
     license='MIT',
     tests_require=['pytest'],
     entry_points={

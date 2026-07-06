@@ -4,8 +4,7 @@
   <name>operator_gui</name>
   <version>0.0.1</version>
   <description>PyQt 오퍼레이터 GUI - rosbridge(roslibpy) 경유로 /task/status, /gripper/state,
-    /robot/fault, 카메라(CompressedImage)를 표시하고 /user_command/text로 명령을 발행한다.
-    (handover_ui에서 분리된 확장 버전)</description>
+    /robot/fault, 카메라(CompressedImage)를 표시하고 /user_command/text로 명령을 발행한다.</description>
   <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
   <license>MIT</license>
 
