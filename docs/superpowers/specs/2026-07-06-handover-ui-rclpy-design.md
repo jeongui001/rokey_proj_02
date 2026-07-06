@@ -28,11 +28,18 @@ main.py
               └─ RosSpinThread(QThread) 생성 (아직 시작 안 함)
   MainWindow(ros_client)  ── ros_client.on_task_status 등 콜백 슬롯에
                               MainWindow의 pyqtSignal.emit을 꽂음
-  ros_client.connect()   ── RosSpinThread.start() → rclpy.spin(node)
+  ros_client.connect()   ── RosSpinThread.start() → spin 루프 시작
   ros_client.subscribe_all()
   app.exec_()
   (종료 시) app.aboutToQuit → ros_client.close() → rclpy.shutdown()
 ```
+
+> **참고(2026-07-06 확정):** 아래 컴포넌트 설명은 최초 초안에서
+> `RosSpinThread`가 자체 `pyqtSignal`을 갖고 그걸 emit하는 2단계 구조였으나,
+> PyQt의 `pyqtSignal.emit()`은 호출 스레드와 무관하게 수신측(MainWindow)
+> 스레드로 자동 큐잉되므로(지금 roslibpy 콜백도 이 방식으로 이미 동작 중)
+> 그 중계 시그널은 불필요하다고 판단해 단순화했다. `_HandoverUiNode`는
+> `RosClient`의 `on_task_status` 등 콜백 속성을 직접 호출한다.
 
 `main_window.py`는 **변경 없음**. 이미 "콜백이 다른 스레드에서 올 수 있다"는
 전제로 pyqtSignal을 통해 위젯을 갱신하고 있어서(roslibpy 스레드 대응),
@@ -46,19 +53,25 @@ main.py
 - `/task/status`(String), `/gripper/state`(handover_interfaces/GripperState),
   `/robot/fault`(String) 구독. `/user_command/text`(String) 퍼블리셔.
 - 구독 콜백은 파싱만 하고(예: `/task/status`의 JSON 디코딩), 결과는
-  `RosSpinThread`의 pyqtSignal을 emit해 전달한다. 위젯을 직접 만지지 않는다.
+  자신을 소유한 `RosClient`의 콜백 속성(`on_task_status` 등)을 직접
+  호출해 전달한다. 위젯을 직접 만지지는 않는다 — 그 안전성은
+  `pyqtSignal.emit()`이 호출 스레드와 무관하게 큐잉되는 것으로 보장된다
+  (위 참고 항목).
 
 ### `RosSpinThread(QThread)`
-- `task_status`, `gripper_state`, `fault` 3개의 `pyqtSignal` 보유.
-- `run()`에서 `rclpy.spin(self.node)` 실행. `stop()`은
-  `rclpy.shutdown()` 대신 `executor.shutdown()`/`spin` 루프 탈출 방식으로
-  스레드를 정지시키고 `join`한다.
+- 자체 시그널 없이 spin 루프만 도는 순수 워커 스레드.
+- `run()`에서 `while self._running and rclpy.ok(): rclpy.spin_once(node,
+  timeout_sec=0.1)` 루프 실행. `stop()`은 `self._running = False` 후
+  `wait()`로 스레드가 끝나길 기다린다(최대 0.1s 지연) —
+  `rclpy.shutdown()`(전역, main.py 소관)에 의존하지 않고 자체적으로
+  루프를 탈출한다.
 
 ### `RosClient`
-- `_HandoverUiNode` + `RosSpinThread`를 조립하는 얇은 래퍼. `__init__`에서
-  스레드의 시그널을 각각 `self.on_task_status(...)` 등 기존 콜백 속성을
-  호출하는 내부 슬롯에 connect한다.
-- `connect()` = 스레드 시작, `close()` = 스레드 정지 + `node.destroy_node()`.
+- `_HandoverUiNode` + `RosSpinThread`를 조립하는 얇은 래퍼.
+  `on_task_status`/`on_gripper_state`/`on_fault` 콜백 속성을 그대로
+  들고 있고, `_HandoverUiNode`가 이 속성들을 직접 호출한다.
+- `connect()` = 스레드 시작, `close()` = 스레드 정지(`stop()`) +
+  `node.destroy_node()`.
 - `subscribe_all()`은 지금처럼 유지하되 내부적으로
   `node.create_subscription(...)` / 퍼블리셔 생성 호출로 바뀐다.
 
