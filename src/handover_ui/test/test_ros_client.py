@@ -5,7 +5,7 @@ import rclpy
 from std_msgs.msg import String
 
 from handover_interfaces.msg import GripperState
-from handover_ui.ros_client import _HandoverUiNode
+from handover_ui.ros_client import RosClient, _HandoverUiNode
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -87,6 +87,51 @@ def test_publish_command_sends_message(node, peer):
     time.sleep(0.3)
 
     node.publish_command('스패너 갖다줘')
+
+    assert _spin_until(peer, lambda: received)
+    assert received == ['스패너 갖다줘']
+
+
+@pytest.fixture
+def client():
+    c = RosClient()
+    yield c
+    c.close()
+
+
+def test_connect_starts_and_close_stops_spin_thread(client):
+    client.connect()
+    assert client.is_connected() is True
+
+    client.close()
+    assert client.is_connected() is False
+
+
+def test_subscribe_all_and_receive_task_status(client, peer):
+    received = []
+    client.on_task_status = lambda state, detail: received.append((state, detail))
+    client.subscribe_all()
+    client.connect()
+
+    pub = peer.create_publisher(String, '/task/status', 10)
+    time.sleep(0.3)
+    pub.publish(String(data='{"state": "IDLE", "detail": "ready"}'))
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not received:
+        time.sleep(0.05)
+
+    assert received == [('IDLE', 'ready')]
+
+
+def test_publish_command_via_client(client, peer):
+    received = []
+    peer.create_subscription(String, '/user_command/text', lambda m: received.append(m.data), 10)
+    client.subscribe_all()
+    client.connect()
+    time.sleep(0.3)
+
+    client.publish_command('스패너 갖다줘')
 
     assert _spin_until(peer, lambda: received)
     assert received == ['스패너 갖다줘']
