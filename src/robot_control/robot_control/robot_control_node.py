@@ -5,7 +5,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rcl_interfaces.msg import ParameterDescriptor, ParameterType
+from rclpy.parameter import Parameter
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -27,8 +27,17 @@ NAMED_POSE_NAMES = ('home', 'front', 'up', 'down', 'watch', 'handover_safe')
 
 
 def _declare_double_array(node, name, default):
-    node.declare_parameter(
-        name, default, ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+    if not default:
+        # rclpy Humble 버그: declare_parameter에 빈 리스트([])를 기본값으로 주면
+        # Parameter.Type.from_parameter_value([])가 항상 BYTE_ARRAY로 추론한다
+        # (all(...)이 빈 시퀀스에서 True이기 때문) - ParameterDescriptor로 명시한
+        # DOUBLE_ARRAY 타입이 그 추론 결과에 덮어써진다. Parameter.Type을 직접
+        # 넘겨 타입 추론 자체를 건너뛴다 - 대신 override가 없으면 파라미터가
+        # 미초기화 상태로 남으므로, 읽는 쪽(_refresh_named_poses)에서
+        # get_parameter_or로 빈 배열 기본값을 되돌려줘야 한다.
+        node.declare_parameter(name, Parameter.Type.DOUBLE_ARRAY)
+        return
+    node.declare_parameter(name, default)
 
 
 class RobotControlNode(Node, TaskExecutor):
@@ -266,7 +275,9 @@ class RobotControlNode(Node, TaskExecutor):
 
     def _refresh_named_poses(self):
         for name in NAMED_POSE_NAMES:
-            value = self.get_parameter(f'named_poses.{name}').value
+            param_name = f'named_poses.{name}'
+            alternative = Parameter(param_name, Parameter.Type.DOUBLE_ARRAY, [])
+            value = self.get_parameter_or(param_name, alternative).value
             self._named_poses[name] = list(value) if value else []
 
     def _init_doosan_driver(self):
