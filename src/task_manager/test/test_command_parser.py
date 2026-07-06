@@ -40,3 +40,16 @@ def test_fetch_tool_keyword_water_bottle():
 
 def test_unknown_command():
     assert parse_command('asdf') == {'type': Command.UNKNOWN, 'text': 'asdf'}
+
+
+def test_tool_name_without_fetch_intent_is_unknown():
+    assert parse_command('드라이버') == {'type': Command.UNKNOWN, 'text': '드라이버'}
+
+
+def test_negated_fetch_command_is_unknown():
+    text = '드라이버 가져오지 마'
+    assert parse_command(text) == {'type': Command.UNKNOWN, 'text': text}
+
+
+def test_automobile_does_not_switch_auto_mode():
+    assert parse_command('자동차') == {'type': Command.UNKNOWN, 'text': '자동차'}

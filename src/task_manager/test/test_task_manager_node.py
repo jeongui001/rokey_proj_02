@@ -129,6 +129,22 @@ class _FakeRecoverFuture:
         return self._result
 
 
+class _FakeVisionFuture:
+    def __init__(self):
+        self._callback = None
+        self._response = None
+
+    def add_done_callback(self, callback):
+        self._callback = callback
+
+    def result(self):
+        return self._response
+
+    def fire(self, success=True, message=''):
+        self._response = SetVisionMode.Response(success=success, message=message)
+        self._callback(self)
+
+
 class _FakeRecoverClient:
     """task_manager.recover_client(std_srvs/Trigger 클라이언트)를 흉내낸다."""
 
@@ -158,13 +174,13 @@ def test_set_state_publishes_json_status_with_mode_and_safety(node):
     published = []
     node.pub_status.publish = published.append
 
-    node._set_state(State.PARSING, detail='hello')
+    node._set_state(State.MOVE_TO_WATCH, detail='hello')
 
-    assert node.state == State.PARSING
+    assert node.state == State.MOVE_TO_WATCH
     assert len(published) == 1
     payload = json.loads(published[0].data)
     assert payload == {
-        'state': 'PARSING',
+        'state': 'MOVE_TO_WATCH',
         'detail': 'hello',
         'operation_mode': Mode.MANUAL,
         'safety_state': Safety.NORMAL,
@@ -198,7 +214,7 @@ def test_status_publish_timer_republishes_full_four_fields(node):
 
 
 def test_status_publish_timer_keeps_last_detail(node):
-    node._set_state(State.PARSING, detail='hello')
+    node._set_state(State.MOVE_TO_WATCH, detail='hello')
     published = []
     node.pub_status.publish = published.append
 
@@ -206,7 +222,7 @@ def test_status_publish_timer_keeps_last_detail(node):
 
     payload = json.loads(published[0].data)
     assert payload['detail'] == 'hello'
-    assert payload['state'] == State.PARSING
+    assert payload['state'] == State.MOVE_TO_WATCH
 
 
 def test_status_publish_timer_does_not_change_state_or_detail(node):
@@ -1209,6 +1225,53 @@ def test_user_command_triggers_move_to_watch(node):
     assert node.state == State.MOVE_TO_WATCH
     assert node.current_tool == 'spanner'
     assert sent_goals == [('move_named', {'named_target': 'watch'})]
+
+
+def test_fetch_waits_for_vision_mode_success_before_robot_goal(node):
+    node.set_parameters([Parameter('auto.config_ready', value=True)])
+    node.operation_mode = Mode.AUTO
+    future = _FakeVisionFuture()
+    node.set_mode_client.service_is_ready = lambda: True
+    node.set_mode_client.call_async = lambda request: future
+    sent = []
+    node._send_robot_goal = lambda task_type, **kwargs: sent.append((task_type, kwargs))
+
+    node._handle_fetch_tool('spanner')
+
+    assert sent == []
+    future.fire(success=True)
+    assert sent == [('move_named', {'named_target': 'watch'})]
+
+
+def test_fetch_stops_when_vision_mode_change_fails(node):
+    node.set_parameters([Parameter('auto.config_ready', value=True)])
+    node.operation_mode = Mode.AUTO
+    future = _FakeVisionFuture()
+    node.set_mode_client.service_is_ready = lambda: True
+    node.set_mode_client.call_async = lambda request: future
+    node._send_robot_goal = lambda *args, **kwargs: pytest.fail('goal must not be sent')
+    node._request_cancel = lambda callback: callback()
+
+    node._handle_fetch_tool('spanner')
+    future.fire(success=False, message='camera unavailable')
+
+    assert node.safety_state == Safety.FAULT
+
+
+def test_old_vision_response_cannot_start_goal_after_stop(node):
+    node.set_parameters([Parameter('auto.config_ready', value=True)])
+    node.operation_mode = Mode.AUTO
+    future = _FakeVisionFuture()
+    node.set_mode_client.service_is_ready = lambda: True
+    node.set_mode_client.call_async = lambda request: future
+    sent = []
+    node._send_robot_goal = lambda task_type, **kwargs: sent.append((task_type, kwargs))
+
+    node._handle_fetch_tool('spanner')
+    node._set_vision_mode(SetVisionMode.Request.OFF)
+    future.fire(success=True)
+
+    assert sent == []
 
 
 # ---- AUTO 설정 준비 게이트 (auto.config_ready) ----

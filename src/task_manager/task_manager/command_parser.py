@@ -29,6 +29,9 @@ _MANUAL_MOVE_KEYWORDS = {
 
 _MODE_MANUAL_KEYWORDS = ('수동',)
 _MODE_AUTO_KEYWORDS = ('자동',)
+_MODE_INTENTS = ('모드', '전환', '변환')
+_FETCH_INTENTS = ('가져', '갖다', '전달', '줘', '주세요')
+_NEGATION_KEYWORDS = ('가져오지 마', '갖다주지 마', '전달하지 마', '하지 마')
 
 # AUTO 공구 전달 명령: 발화에 포함된 공구 이름 -> tool_class
 _TOOL_KEYWORDS = {
@@ -39,6 +42,8 @@ _TOOL_KEYWORDS = {
     '망치': 'hammer',
     '물병': 'water_bottle',
 }
+
+SUPPORTED_TOOL_CLASSES = tuple(dict.fromkeys(_TOOL_KEYWORDS.values()))
 
 
 def parse_command(text: str) -> dict:
@@ -64,13 +69,16 @@ def parse_command(text: str) -> dict:
         if phrase in stripped:
             return {'type': Command.MOVE_NAMED, 'named_target': named_target}
 
-    if any(keyword in stripped for keyword in _MODE_MANUAL_KEYWORDS):
+    has_mode_intent = any(intent in stripped for intent in _MODE_INTENTS)
+    if has_mode_intent and any(keyword in stripped for keyword in _MODE_MANUAL_KEYWORDS):
         return {'type': Command.MODE_SWITCH, 'mode': Mode.MANUAL}
-    if any(keyword in stripped for keyword in _MODE_AUTO_KEYWORDS):
+    if has_mode_intent and any(keyword in stripped for keyword in _MODE_AUTO_KEYWORDS):
         return {'type': Command.MODE_SWITCH, 'mode': Mode.AUTO}
 
     for keyword, tool in _TOOL_KEYWORDS.items():
-        if keyword in stripped:
+        if (keyword in stripped
+                and any(intent in stripped for intent in _FETCH_INTENTS)
+                and not any(negative in stripped for negative in _NEGATION_KEYWORDS)):
             return {'type': Command.FETCH_TOOL, 'tool': tool}
 
     return {'type': Command.UNKNOWN, 'text': stripped}
