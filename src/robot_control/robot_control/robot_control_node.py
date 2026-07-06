@@ -25,6 +25,17 @@ class SafetyState:
     FAULT = 'FAULT'
 
 
+# 안전상태 우선순위: 숫자가 클수록 더 심각하다. task_manager.task_manager_node.Safety와
+# 합의된 순서(NORMAL < RECOVERY_REQUIRED < PROTECTIVE_STOP < FAULT < EMERGENCY_STOP)와
+# 일치시킨다 (robot_control에는 RECOVERY_REQUIRED가 없다).
+SAFETY_STATE_PRIORITY = {
+    SafetyState.NORMAL: 0,
+    SafetyState.PROTECTIVE_STOP: 1,
+    SafetyState.FAULT: 2,
+    SafetyState.EMERGENCY_STOP: 3,
+}
+
+
 class FaultPrefix:
     """task_manager와의 계약: /robot/fault 문자열 접두어 (task_manager_node._is_protective_stop 등과 합의됨)."""
     PROTECTIVE_STOP = 'PROTECTIVE_STOP: '
@@ -231,12 +242,21 @@ class DoosanDriver:
                 # move_stop 이후에도 원래 future가 짧게 더 완료되길 기다린다 (무한 대기 방지).
                 self._wait_for_future(future, 2.0)
                 return False
+            if self._node.safety_state != SafetyState.NORMAL:
+                # cancel뿐 아니라 Fault도 주기적으로 확인한다 - 이동 완료 응답이 성공으로
+                # 오는 순간과 Fault 발생이 겹치는 경합을 줄인다.
+                self._node.get_logger().warn('이동 대기 중 안전상태 비정상 감지 - move_stop 호출')
+                self.stop(self._node.get_parameter('safety.fault_stop_mode').value)
+                self._wait_for_future(future, 2.0)
+                return False
             if time.monotonic() - start > timeout_s:
                 self._node.get_logger().error('move 서비스 응답 타임아웃 - move_stop 호출')
                 self.stop(self._node.get_parameter('safety.fault_stop_mode').value)
                 return False
             time.sleep(poll_interval_s)
         if not future.done():
+            return False
+        if self._node.safety_state != SafetyState.NORMAL:
             return False
         response = future.result()
         return bool(response is not None and response.success)
@@ -450,6 +470,11 @@ class RobotControlNode(Node):
         _declare_double_array(
             self, 'handover_hold.compliance_stiffness', [3000.0, 3000.0, 3000.0, 200.0, 200.0, 200.0])
         self.declare_parameter('handover_hold.compliance_transition_s', 0.4)
+        # handover_hold 시작 이전에 수신된 오래된 힘 샘플로 당김을 오판하지 않도록,
+        # 샘플의 최대 허용 나이(초)와 연속 확인 횟수를 파라미터로 둔다 (실제 축/임계값과
+        # 달리 이 값들은 타이밍/디바운스 설정이라 임의 하드웨어 값을 추측하는 것이 아니다).
+        self.declare_parameter('handover_hold.force_sample_max_age_s', 0.5)
+        self.declare_parameter('handover_hold.pull_confirm_samples', 3)
 
         self.declare_parameter('safety.external_torque_threshold_nm', 20.0)
         self.declare_parameter('safety.fault_stop_mode', 1)  # DR_QSTOP: Quick stop Cat.2
@@ -471,6 +496,11 @@ class RobotControlNode(Node):
 
         self.hardware_enabled = bool(self.get_parameter('hardware_enabled').value)
         self.safety_state = SafetyState.NORMAL
+        # 동일 Fault 메시지를 매 폴링 주기(0.1s)마다 반복 발행하지 않기 위한 dedup 키.
+        self._last_fault_reason = None
+        # robot_state 샘플 식별자. _read_robot_state가 실제로 새 샘플을 얻을 때마다
+        # 증가시켜, handover_hold가 같은 샘플을 여러 번 읽어 중복 평가하지 않도록 한다.
+        self._robot_state_seq = 0
         self._named_poses = {name: [] for name in NAMED_POSE_NAMES}
         self._refresh_named_poses()
 
@@ -614,12 +644,67 @@ class RobotControlNode(Node):
         return [position.x * 1000.0, position.y * 1000.0, position.z * 1000.0,
                 float(euler_zyz_deg[0]), float(euler_zyz_deg[1]), float(euler_zyz_deg[2])]
 
+    # ---- 하드웨어 정리 경계 (MoveStop / RT 종료 / compliance 해제 / subscription 제거) ----
+    #
+    # 이 아래 _cleanup_* 함수들은 _safe_call()과 다른 목적을 가진다: _safe_call은
+    # 알고리즘 스텁(NotImplementedError)만 걸러내기 위한 것이라 그 용도를 넓히지 않는다.
+    # 반면 여기 cleanup 경계는 실제 하드웨어/서비스 호출이라 통신 오류 등 임의의
+    # Exception이 발생할 수 있고, 그 예외가 Action 실행 함수 밖으로 새어나가 최종
+    # result가 반환되지 못하는 사고(취소/Fault 처리 도중 두 번째 예외가 무방비로
+    # 전파되는 경우)를 막아야 한다. 그래서 각 함수는 예외를 명시적으로 잡아 로그를
+    # 남기고 성공 여부를 bool로만 반환한다. 여러 번 호출돼도 안전(idempotent)하다 -
+    # 이미 정지/종료된 하드웨어에 다시 정지/종료를 요청하는 것은 그 자체로 무해하다.
+
+    def _cleanup_stop_motion(self) -> bool:
+        """M0609 MoveStop 정지를 시도한다. 실패/예외 시에도 절대 상위로 전파하지 않는다."""
+        if not self.hardware_enabled or self._doosan is None:
+            return True
+        stop_mode = self.get_parameter('safety.fault_stop_mode').value
+        try:
+            return bool(self._doosan.stop(stop_mode))
+        except Exception as exc:
+            self.get_logger().error(f'MoveStop cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_close_rt_session(self) -> bool:
+        """RT 세션 stop/disconnect (_close_rt_session 경계). 실패/예외 시에도 절대
+        상위로 전파하지 않는다."""
+        try:
+            self._close_rt_session()
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'RT 세션 종료 cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_disable_compliance(self) -> bool:
+        """compliance 해제 (_disable_compliance 경계). 실패/예외 시에도 절대 상위로
+        전파하지 않는다."""
+        try:
+            self._disable_compliance()
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'compliance 해제 cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_destroy_subscription(self, sub) -> bool:
+        """servo_pick 중 임시로 만든 ToolTrack subscription을 제거한다."""
+        if sub is None:
+            return True
+        try:
+            self.destroy_subscription(sub)
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'subscription 제거 cleanup 중 예외: {exc}')
+            return False
+
     def _dry_run_move(self, goal_handle) -> bool:
         duration_s = self.get_parameter('move.dry_run_duration_s').value
         poll_interval_s = max(self.get_parameter('move.poll_interval_s').value, 0.001)
         deadline = time.monotonic() + duration_s
         while time.monotonic() < deadline:
             if goal_handle is not None and goal_handle.is_cancel_requested:
+                return False
+            if self.safety_state != SafetyState.NORMAL:
                 return False
             time.sleep(min(poll_interval_s, max(deadline - time.monotonic(), 0.0)))
         return True
@@ -662,8 +747,8 @@ class RobotControlNode(Node):
                 return False
             vel = self.get_parameter('move.vel_deg_s').value
             acc = self.get_parameter('move.acc_deg_s2').value
-            return self._move_joint(goal_handle, pos, vel, acc)
-        if target_pose is not None:
+            success = self._move_joint(goal_handle, pos, vel, acc)
+        elif target_pose is not None:
             pos6 = self._pose_stamped_to_posx(target_pose)
             if pos6 is None:
                 return False
@@ -671,9 +756,18 @@ class RobotControlNode(Node):
                     self.get_parameter('move.line_vel_deg_s').value]
             acc2 = [self.get_parameter('move.line_acc_mm_s2').value,
                     self.get_parameter('move.line_acc_deg_s2').value]
-            return self._move_line(goal_handle, pos6, vel2, acc2)
-        self.get_logger().error('_call_move_service: named_target 또는 target_pose가 필요합니다.')
-        return False
+            success = self._move_line(goal_handle, pos6, vel2, acc2)
+        else:
+            self.get_logger().error('_call_move_service: named_target 또는 target_pose가 필요합니다.')
+            return False
+        # 이동 함수가 반환된 직후에도 안전상태를 다시 확인한다 - 이동 서비스가 성공
+        # 응답을 반환하는 순간과 거의 동시에 Fault가 발생하는 경합으로 인해 Action이
+        # 성공 처리되지 않도록 막는다.
+        if success and self.safety_state != SafetyState.NORMAL:
+            self.get_logger().warn(
+                f'이동 완료 직후 안전상태 비정상({self.safety_state}) 감지 - 성공으로 처리하지 않습니다.')
+            return False
+        return success
 
     def _execute_move_named(self, goal_handle):
         result = RobotTask.Result()
@@ -745,6 +839,20 @@ class RobotControlNode(Node):
             result.message = f'release_and_retry rejected - safety_state={self.safety_state}'
             return result
         try:
+            # RG2를 실제로 열기 직전에 취소/안전 상태를 다시 확인한다 - 그 사이 취소나
+            # Fault가 발생했다면 그리퍼를 열지 않는다.
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                result.success = False
+                result.message = 'release_and_retry canceled before opening gripper'
+                return result
+            if self.safety_state != SafetyState.NORMAL:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f'release_and_retry aborted before opening gripper - '
+                    f'safety_state={self.safety_state}')
+                return result
             self._safe_call(self.rg2_client.open)
             success = self._safe_call(
                 self._call_move_service, goal_handle=goal_handle,
@@ -829,6 +937,51 @@ class RobotControlNode(Node):
         rt_session_open = False
         rt_confirmed = False
         servo_sub = None
+
+        def _finish_cancel(cancel_message):
+            """취소 확인 시 하드웨어 정리를 모두 시도한 뒤, 정리가 전부 성공한
+            경우에만 canceled()로 마무리한다. 정지/RT 종료/subscription 제거 중
+            하나라도 실패하면 취소 성공으로 가장하지 않고 FAULT로 abort한다
+            (요구사항: cleanup 실패 시 취소 성공으로 가장하지 않음)."""
+            nonlocal servo_sub, rt_session_open
+            stop_ok = self._cleanup_stop_motion()
+            sub_ok = self._cleanup_destroy_subscription(servo_sub)
+            servo_sub = None
+            rt_ok = True
+            if rt_session_open:
+                rt_ok = self._cleanup_close_rt_session()
+                rt_session_open = False
+            if stop_ok and sub_ok and rt_ok:
+                goal_handle.canceled()
+                result.success = False
+                result.message = cancel_message
+                return result
+            detail = (
+                f'servo_pick cleanup 실패로 안전을 위해 FAULT 처리 '
+                f'(move_stop={stop_ok}, subscription={sub_ok}, rt_session={rt_ok})')
+            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+            goal_handle.abort()
+            result.success = False
+            result.message = detail
+            return result
+
+        def _finish_shutdown():
+            """while rclpy.ok()가 False가 되어(프로세스 종료 중) 루프가 끝난
+            경우에만 호출된다(break로 CLOSE 상태에 도달한 경우는 호출되지 않는다 -
+            while/else 참고). 정상 CLOSE/파지 조건으로 간주하지 않고, RG2를 절대
+            열거나 닫지 않은 채 실제 정지 시도 및 하드웨어 정리 후 abort한다."""
+            nonlocal servo_sub, rt_session_open
+            self._cleanup_stop_motion()
+            self._cleanup_destroy_subscription(servo_sub)
+            servo_sub = None
+            if rt_session_open:
+                self._cleanup_close_rt_session()
+                rt_session_open = False
+            goal_handle.abort()
+            result.success = False
+            result.message = 'servo_pick aborted - rclpy가 종료 중입니다.'
+            return result
+
         try:
             rt_session_open = True  # 오픈을 시도하는 시점부터 - 실패해도 finally에서 정리한다.
             rt_confirmed = self._safe_call(self._open_rt_session, default=False)
@@ -847,10 +1000,8 @@ class RobotControlNode(Node):
             hardware_ready = self.get_parameter('servo_pick.hardware_ready').value
             while rclpy.ok():
                 if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                    result.success = False
-                    result.message = 'servo_pick canceled'
-                    return result
+                    # 취소 순서: 정지 요청 -> RT 세션 종료/구독 해제(먼저 정리) -> canceled().
+                    return _finish_cancel('servo_pick canceled')
                 if self.safety_state != SafetyState.NORMAL:
                     goal_handle.abort()
                     result.success = False
@@ -878,11 +1029,46 @@ class RobotControlNode(Node):
                         and self._doosan is not None):
                     self._safe_call(self._doosan.publish_speedl_rt, cmd)
                 time.sleep(control_period_s)
+            else:
+                # while의 조건(rclpy.ok())이 거짓이 되어 루프가 끝난 경우에만 실행된다
+                # (break로 빠져나온 경우는 실행되지 않는다) - 즉 CLOSE 상태 도달이 아니라
+                # 프로세스 종료 중이라는 뜻이다. 정상 종료로 간주하지 않는다.
+                return _finish_shutdown()
+
+            # RG2를 실제로 닫기(파지) 직전에 취소/안전 상태를 다시 확인한다.
+            if goal_handle.is_cancel_requested:
+                return _finish_cancel('servo_pick canceled before closing gripper')
+            if self.safety_state != SafetyState.NORMAL:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f'servo_pick aborted before closing gripper - safety_state={self.safety_state}')
+                return result
 
             self._safe_call(self.rg2_client.close, request.grasp_width_mm, request.grasp_force_n)
             width_mm, grip_detected = self._safe_call(
                 self.rg2_client.get_state, default=(0.0, False))
             payload_kg = self._safe_call(self._estimate_payload, default=0.0)
+
+            # succeed() 전에 반드시 subscription 제거 + RT 세션 종료를 시도하고, 모두
+            # 성공한 경우에만 성공으로 마무리한다 - cleanup 실패를 숨기고 성공으로
+            # 보고하지 않는다.
+            sub_ok = self._cleanup_destroy_subscription(servo_sub)
+            servo_sub = None
+            rt_ok = True
+            if rt_session_open:
+                rt_ok = self._cleanup_close_rt_session()
+                rt_session_open = False
+
+            if not (sub_ok and rt_ok):
+                detail = (
+                    f'servo_pick 파지 후 cleanup 실패로 안전을 위해 FAULT 처리 '
+                    f'(subscription={sub_ok}, rt_session={rt_ok})')
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                goal_handle.abort()
+                result.success = False
+                result.message = detail
+                return result
 
             goal_handle.succeed()
             result.success = True
@@ -893,17 +1079,24 @@ class RobotControlNode(Node):
         except Exception as exc:  # 통신 오류/예외 시 성공을 반환하지 않는다
             self.get_logger().error(f'servo_pick 실행 중 예외: {exc}')
             if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-            else:
-                goal_handle.abort()
+                return _finish_cancel(f'servo_pick canceled after exception: {exc}')
+            stop_ok = self._cleanup_stop_motion()
+            if not stop_ok:
+                self._declare_fault(
+                    f'{FaultPrefix.FAULT}servo_pick 예외 처리 중 MoveStop cleanup 실패: {exc}')
+            goal_handle.abort()
             result.success = False
             result.message = f'servo_pick exception: {exc}'
             return result
         finally:
+            # 위 경로들에서 이미 정리됐다면 servo_sub/rt_session_open이 None/False로
+            # 남아 있어 아래는 아무 것도 하지 않는다. 이 wrapper들은 예외를 던지지
+            # 않으므로 finally에서 실패하더라도 위에서 이미 결정된 result를 덮어쓰지
+            # 않는다.
             if servo_sub is not None:
-                self.destroy_subscription(servo_sub)
+                self._cleanup_destroy_subscription(servo_sub)
             if rt_session_open:
-                self._safe_call(self._close_rt_session)
+                self._cleanup_close_rt_session()
 
     # ---- handover_hold ----
 
@@ -953,6 +1146,18 @@ class RobotControlNode(Node):
         component = sign * tool_force[axis]
         return component > threshold_n
 
+    @staticmethod
+    def _is_fresh_robot_state(robot_state, since_monotonic: float, max_age_s: float) -> bool:
+        """robot_state 샘플이 since_monotonic(예: handover_hold 시작 시각) 이후에
+        수신됐고, 수신된 지 max_age_s 이내인 경우에만 신선하다고 판단한다.
+        handover_hold 시작 전의 오래된 샘플을 당김 판정에 사용하지 않기 위함이다."""
+        if not isinstance(robot_state, dict):
+            return False
+        received_at = robot_state.get('received_at')
+        if received_at is None or received_at < since_monotonic:
+            return False
+        return (time.monotonic() - received_at) <= max_age_s
+
     def _execute_handover_hold(self, goal_handle):
         result = RobotTask.Result()
         if self.safety_state != SafetyState.NORMAL:
@@ -961,26 +1166,137 @@ class RobotControlNode(Node):
             result.message = f'handover_hold rejected - safety_state={self.safety_state}'
             return result
         compliance_on = False
+
+        def _finish_cancel(cancel_message):
+            """취소 확인 시 하드웨어 정리를 모두 시도한 뒤, 정리가 전부 성공한
+            경우에만 canceled()로 마무리한다. 실패 시 취소 성공으로 가장하지 않고
+            FAULT로 abort한다 (RG2는 이 시점까지 열지 않았으므로 그대로 유지된다)."""
+            nonlocal compliance_on
+            stop_ok = self._cleanup_stop_motion()
+            compliance_ok = True
+            if compliance_on:
+                compliance_ok = self._cleanup_disable_compliance()
+                compliance_on = False
+            if stop_ok and compliance_ok:
+                goal_handle.canceled()
+                result.success = False
+                result.message = cancel_message
+                return result
+            detail = (
+                f'handover_hold cleanup 실패로 안전을 위해 FAULT 처리 '
+                f'(move_stop={stop_ok}, compliance={compliance_ok})')
+            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+            goal_handle.abort()
+            result.success = False
+            result.message = detail
+            return result
+
+        def _finish_shutdown():
+            """while rclpy.ok()가 False가 되어(프로세스 종료 중) 루프가 끝난
+            경우에만 호출된다(break로 pull 확정에 도달한 경우는 호출되지 않는다 -
+            while/else 참고). 정상 pull 확정으로 간주하지 않고, RG2를 절대 열지
+            않은 채 실제 정지 시도 및 compliance 해제 후 abort한다."""
+            nonlocal compliance_on
+            self._cleanup_stop_motion()
+            if compliance_on:
+                self._cleanup_disable_compliance()
+                compliance_on = False
+            goal_handle.abort()
+            result.success = False
+            result.message = 'handover_hold aborted - rclpy가 종료 중입니다.'
+            return result
+
         try:
             self._safe_call(self._enable_compliance)
             compliance_on = True
             poll_interval_s = self.get_parameter('handover_hold.poll_interval_s').value
+            max_age_s = self.get_parameter('handover_hold.force_sample_max_age_s').value
+            confirm_needed = max(
+                1, int(self.get_parameter('handover_hold.pull_confirm_samples').value))
+            hold_start_time = time.monotonic()
+            pull_confirm_count = 0
+            # 마지막으로 실제 평가에 반영한 sample_seq. 같은 sample_seq를 여러 번
+            # 읽어도(handover_hold의 폴링 주기가 상태 폴링 주기보다 빠른 경우) 한 번만
+            # 평가한다 (요구사항 1: "동일한 센서 샘플은 몇 번 반복 조회해도 1회만 평가").
+            last_evaluated_sample_seq = None
             while rclpy.ok():
                 if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                    result.success = False
-                    result.message = 'handover_hold canceled'
-                    return result
+                    # 취소 순서: 정지 요청 -> compliance 해제(먼저 정리) -> RG2는 열지
+                    # 않음 -> canceled().
+                    return _finish_cancel('handover_hold canceled')
                 if self.safety_state != SafetyState.NORMAL:
                     # Fault 발생 시에도 그리퍼를 자동으로 열지 않는다 (낙하 방지).
                     goal_handle.abort()
                     result.success = False
                     result.message = f'handover_hold aborted - safety_state={self.safety_state}'
                     return result
-                if self._latest_robot_state is not None and self._safe_call(
-                        self._is_pull_detected, self._latest_robot_state, default=False):
+
+                state = self._latest_robot_state
+                is_fresh = self._is_fresh_robot_state(state, hold_start_time, max_age_s)
+                sample_seq = state.get('sample_seq') if isinstance(state, dict) else None
+
+                if not is_fresh:
+                    # stale이거나 handover_hold 시작 이전 샘플만 있음 - 긴 센서 단절
+                    # 이전의 count가 단절 이후로 이어지지 않도록 0으로 초기화한다.
+                    pull_confirm_count = 0
+                    last_evaluated_sample_seq = None
+                elif sample_seq is not None and sample_seq != last_evaluated_sample_seq:
+                    last_evaluated_sample_seq = sample_seq
+                    if self._safe_call(self._is_pull_detected, state, default=False):
+                        pull_confirm_count += 1
+                    else:
+                        pull_confirm_count = 0
+                # else: 같은 sample_seq의 신선한 중복 조회 - count를 변경하지 않는다.
+                if pull_confirm_count >= confirm_needed:
                     break
                 time.sleep(poll_interval_s)
+            else:
+                # while의 조건(rclpy.ok())이 거짓이 되어 루프가 끝난 경우에만 실행된다
+                # (break로 pull 확정에 도달한 경우는 실행되지 않는다) - 프로세스 종료
+                # 중이라는 뜻이므로 정상 pull 확정으로 간주하지 않는다.
+                return _finish_shutdown()
+
+            # RG2를 실제로 열기 직전에 취소/안전 상태를 다시 확인한다.
+            if goal_handle.is_cancel_requested:
+                return _finish_cancel('handover_hold canceled before opening gripper')
+            if self.safety_state != SafetyState.NORMAL:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f'handover_hold aborted before opening gripper - safety_state={self.safety_state}')
+                return result
+
+            # RG2를 열기 전에 compliance를 먼저 해제한다 - 해제가 실패하면 RG2를 열지
+            # 않고 FAULT로 abort한다 (요구사항: compliance 해제 실패 시 RG2 open 금지).
+            compliance_ok = True
+            if compliance_on:
+                compliance_ok = self._cleanup_disable_compliance()
+                compliance_on = False
+            if not compliance_ok:
+                detail = (
+                    'handover_hold compliance 해제 실패로 안전을 위해 FAULT 처리 - '
+                    'RG2를 열지 않았습니다.')
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                goal_handle.abort()
+                result.success = False
+                result.message = detail
+                return result
+
+            # compliance 해제를 기다리는 동안 취소/Fault가 새로 발생했을 수 있으므로
+            # RG2를 열기 직전에 다시 한번 확인한다.
+            if goal_handle.is_cancel_requested:
+                self._cleanup_stop_motion()
+                goal_handle.canceled()
+                result.success = False
+                result.message = 'handover_hold canceled after compliance released'
+                return result
+            if self.safety_state != SafetyState.NORMAL:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f'handover_hold aborted after compliance released - '
+                    f'safety_state={self.safety_state}')
+                return result
 
             self._safe_call(self.rg2_client.open)
             goal_handle.succeed()
@@ -990,24 +1306,37 @@ class RobotControlNode(Node):
         except Exception as exc:
             self.get_logger().error(f'handover_hold 실행 중 예외: {exc}')
             if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-            else:
-                goal_handle.abort()
+                return _finish_cancel(f'handover_hold canceled after exception: {exc}')
+            stop_ok = self._cleanup_stop_motion()
+            if not stop_ok:
+                self._declare_fault(
+                    f'{FaultPrefix.FAULT}handover_hold 예외 처리 중 MoveStop cleanup 실패: {exc}')
+            goal_handle.abort()
             result.success = False
             result.message = f'handover_hold exception: {exc}'
             return result
         finally:
             if compliance_on:
-                self._safe_call(self._disable_compliance)
+                self._cleanup_disable_compliance()
 
     # ---- fault / robot state polling ----
 
     def _read_robot_state(self):
+        # received_at(수신 시각)을 기록해 handover_hold가 시작되기 전의 오래된
+        # 샘플을 당김 판정에 사용하지 않도록 한다 (_is_fresh_robot_state 참고).
+        # sample_seq는 이 함수가 실제로 새 샘플을 얻을 때마다 1씩 증가하는 식별자다 -
+        # handover_hold의 폴링 주기(handover_hold.poll_interval_s)가 상태 폴링 주기
+        # (safety.state_poll_period_s)보다 빠를 수 있어, 같은 물리 샘플을
+        # self._latest_robot_state에서 여러 번 읽더라도 sample_seq가 같으면 중복
+        # 평가하지 않도록 한다 (_execute_handover_hold 참고).
         if not self.hardware_enabled:
+            self._robot_state_seq += 1
             return {
                 'robot_state': DoosanRobotState.STANDBY,
                 'ext_torque': [0.0] * 6,
                 'tool_force': [0.0] * 6,
+                'received_at': time.monotonic(),
+                'sample_seq': self._robot_state_seq,
             }
         if self._doosan is None:
             return None
@@ -1017,7 +1346,11 @@ class RobotControlNode(Node):
         ext_torque = self._doosan.get_external_torque() or [0.0] * 6
         tool_force = self._doosan.get_tool_force(
             ref=self.get_parameter('handover_hold.ref').value) or [0.0] * 6
-        return {'robot_state': robot_state, 'ext_torque': ext_torque, 'tool_force': tool_force}
+        self._robot_state_seq += 1
+        return {
+            'robot_state': robot_state, 'ext_torque': ext_torque, 'tool_force': tool_force,
+            'received_at': time.monotonic(), 'sample_seq': self._robot_state_seq,
+        }
 
     def _check_fault(self, robot_state):
         if not isinstance(robot_state, dict):
@@ -1035,31 +1368,51 @@ class RobotControlNode(Node):
             return f'{FaultPrefix.FAULT}예상하지 못한 외력이 감지되었습니다 (ext_torque peak={peak:.1f} Nm).'
         return None
 
-    def _declare_fault(self, fault_reason: str):
+    @staticmethod
+    def _classify_fault_level(fault_reason: str) -> str:
+        """/robot/fault 접두어로 안전상태 단계를 분류한다 (task_manager의
+        TaskManagerNode._classify_fault_prefix와 합의된 접두어)."""
         if fault_reason.startswith(FaultPrefix.EMERGENCY_STOP):
-            self.safety_state = SafetyState.EMERGENCY_STOP
-        elif fault_reason.startswith(FaultPrefix.PROTECTIVE_STOP):
-            self.safety_state = SafetyState.PROTECTIVE_STOP
-        else:
-            self.safety_state = SafetyState.FAULT
-        # task_manager의 응답(취소 요청)을 기다리지 않고 robot_control이 먼저 정지한다.
-        if self.hardware_enabled and self._doosan is not None:
-            stop_mode = self.get_parameter('safety.fault_stop_mode').value
-            self._safe_call(self._doosan.stop, stop_mode)
+            return SafetyState.EMERGENCY_STOP
+        if fault_reason.startswith(FaultPrefix.PROTECTIVE_STOP):
+            return SafetyState.PROTECTIVE_STOP
+        return SafetyState.FAULT
+
+    def _declare_fault(self, fault_reason: str) -> None:
+        """안전상태를 fault_reason에 따라 갱신하고 /robot/fault를 발행한다.
+
+        SAFETY_STATE_PRIORITY상 현재 상태보다 낮은 단계로는 절대 강등하지 않는다 -
+        예를 들어 이미 EMERGENCY_STOP인데 cleanup 실패로 인한 FAULT 선언 요청이
+        들어와도 EMERGENCY_STOP을 덮어쓰지 않는다(요구사항: "EMERGENCY_STOP을 낮은
+        상태로 자동 강등하지 않음"). 정지 시도는 예외에 안전한 _cleanup_stop_motion을
+        사용한다 - task_manager의 취소 응답을 기다리지 않고 robot_control이 먼저
+        정지를 시도한다."""
+        new_state = self._classify_fault_level(fault_reason)
+        if SAFETY_STATE_PRIORITY[new_state] < SAFETY_STATE_PRIORITY[self.safety_state]:
+            return
+        self.safety_state = new_state
+        self._last_fault_reason = fault_reason
+        self._cleanup_stop_motion()
         msg = String()
         msg.data = fault_reason
         self.pub_fault.publish(msg)
 
     def _on_state_poll_timer(self):
+        """로봇 상태 폴링은 이미 비정상 상태여도 절대 멈추지 않는다 - 그래야 더 높은
+        단계의 Fault(예: PROTECTIVE_STOP 도중 물리 E-Stop이 눌리는 경우)를 계속
+        감지해 즉시 반영할 수 있다. 다만 완전히 동일한 fault_reason 문자열이 반복되면
+        (예: 매 0.1초 polling마다 같은 조건이 계속 감지되는 경우) 재발행하지 않는다.
+        새로 감지된 상태가 현재보다 낮은 단계라면 _declare_fault가 강등을 막는다."""
         state = self._safe_call(self._read_robot_state, default=None)
         if state is None:
             return
         self._latest_robot_state = state
-        if self.safety_state != SafetyState.NORMAL:
-            return  # 이미 안전정지/고장 상태 - 자동 재시작하지 않고 중복 처리도 하지 않는다.
         fault_reason = self._safe_call(self._check_fault, state, default=None)
-        if fault_reason is not None:
-            self._declare_fault(fault_reason)
+        if fault_reason is None:
+            return  # 새로 감지된 이상 없음 - 기존 안전상태를 자동으로 되돌리지 않는다.
+        if fault_reason == self._last_fault_reason:
+            return  # 완전히 동일한 메시지의 반복 발행 방지
+        self._declare_fault(fault_reason)
 
     def _on_gripper_timer(self):
         width_mm, grip_detected = self._safe_call(

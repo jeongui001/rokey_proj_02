@@ -1,0 +1,86 @@
+# task_manager 노드 파라미터 템플릿.
+#
+# 이 파일의 값 대부분은 아직 실기 캘리브레이션 전이다. 조용히 추측값으로 동작하지
+# 않도록, 미합의 수치는 -1(또는 빈 문자열) sentinel로 두었다 - 코드(task_manager_node.py)는
+# 이 sentinel을 "미설정"으로 해석해 안전하게 거부(fail-closed)한다.
+#
+# auto.config_ready가 false인 동안(기본값)에는:
+#   - AUTO 모드로 "전환"하는 것 자체는 허용된다.
+#   - 그러나 실제 "물체 가져오기" 명령은 실행하지 않고(goal을 보내지 않음),
+#     "AUTO 설정값 미확정" detail만 발행한다.
+# 실기 검증이 끝난 뒤에만 auto.config_ready를 true로 바꾸고, trigger.*/tools.*의
+# 실제 값을 채워 넣는다.
+/**:
+  ros__parameters:
+    auto:
+      config_ready: false  # TODO: 실기 검증 완료 후 true로 전환
+
+    # DETECT_TRACK 상태에서 ToolTrack 메시지를 servo_pick 트리거로 인정할지 판단하는
+    # 조건들. min_confidence/max_track_age_s/required_frame_id는 vision_node 및 실기
+    # 환경과 합의가 끝난 뒤 채워야 하는 값이라 -1/빈 문자열(미설정)로 두었다 - 이
+    # 값들이 미설정인 동안 _check_trigger는 항상 False를 반환한다(안전 측 fail-closed).
+    trigger:
+      min_confidence: -1.0        # TODO(vision_node와 캘리브레이션 필요, 범위 0.0~1.0)
+      require_depth_valid: true   # 안전한 기본값 - depth 무효 트랙은 신뢰하지 않는다
+      require_approaching: true   # 안전한 기본값 - 멀어지는 트랙은 트리거로 쓰지 않는다
+      required_frame_id: ''       # TODO(vision_node와 프레임 이름 합의 필요)
+      max_track_age_s: -1.0       # TODO(캘리브레이션 필요, 초 단위)
+
+    # 공구별 grasp spec. width_mm/force_n은 servo_pick goal에 실제로 실어 보내는 값,
+    # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위,
+    # payload_min/max_kg은 선택적 payload 검증 범위다(둘 다 0 이상이어야 활성화되며,
+    # 캘리브레이션 전까지는 -1로 두어 비활성 상태로 유지한다).
+    # command_parser.py의 _TOOL_KEYWORDS 값과 반드시 일치해야 한다:
+    # water_bottle, spanner, driver, wrench, pliers, hammer.
+    tools:
+      water_bottle:
+        width_mm: -1.0              # TODO(RG2 실측 필요, mm)
+        force_n: -1.0                # TODO(RG2 실측 필요, N)
+        verify_min_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
+        verify_max_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
+        payload_min_kg: -1.0         # TODO(선택, 캘리브레이션 전까지 비활성)
+        payload_max_kg: -1.0
+      spanner:
+        width_mm: -1.0
+        force_n: -1.0
+        verify_min_width_mm: -1.0
+        verify_max_width_mm: -1.0
+        payload_min_kg: -1.0
+        payload_max_kg: -1.0
+      driver:
+        width_mm: -1.0
+        force_n: -1.0
+        verify_min_width_mm: -1.0
+        verify_max_width_mm: -1.0
+        payload_min_kg: -1.0
+        payload_max_kg: -1.0
+      wrench:
+        width_mm: -1.0
+        force_n: -1.0
+        verify_min_width_mm: -1.0
+        verify_max_width_mm: -1.0
+        payload_min_kg: -1.0
+        payload_max_kg: -1.0
+      pliers:
+        width_mm: -1.0
+        force_n: -1.0
+        verify_min_width_mm: -1.0
+        verify_max_width_mm: -1.0
+        payload_min_kg: -1.0
+        payload_max_kg: -1.0
+      hammer:
+        width_mm: -1.0
+        force_n: -1.0
+        verify_min_width_mm: -1.0
+        verify_max_width_mm: -1.0
+        payload_min_kg: -1.0
+        payload_max_kg: -1.0
+
+    # 아래는 통신/타이밍 관련 값으로, 하드웨어 캘리브레이션 값이 아니다 - 실 환경에
+    # 맞게 조정 가능하다.
+    detect_track_timeout_s: 5.0
+    verify_grasp_max_retries: 2
+    wait_pull_timeout_s: 60.0
+    cancel_timeout_s: 5.0
+    recovery_timeout_s: 5.0
+    status_publish_period_s: 1.0
