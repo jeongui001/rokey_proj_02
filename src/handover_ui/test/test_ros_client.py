@@ -1,73 +1,92 @@
-import roslibpy
+import time
+
 import pytest
+import rclpy
+from std_msgs.msg import String
 
-from handover_ui.ros_client import RosClient
-
-
-class _FakeTopic:
-    instances = []
-
-    def __init__(self, ros, name, msg_type):
-        self.ros = ros
-        self.name = name
-        self.msg_type = msg_type
-        self.subscribed_callback = None
-        self.published = []
-        _FakeTopic.instances.append(self)
-
-    def subscribe(self, callback):
-        self.subscribed_callback = callback
-
-    def publish(self, message):
-        self.published.append(message)
+from handover_interfaces.msg import GripperState
+from handover_ui.ros_client import _HandoverUiNode
 
 
-@pytest.fixture(autouse=True)
-def patch_roslibpy(monkeypatch):
-    _FakeTopic.instances = []
-    monkeypatch.setattr(roslibpy, 'Topic', _FakeTopic)
-    monkeypatch.setattr(roslibpy, 'Ros', lambda host, port: object())
+@pytest.fixture(scope='module', autouse=True)
+def ros_context():
+    rclpy.init()
     yield
+    rclpy.shutdown()
 
 
-def test_subscribe_all_creates_three_subscriptions():
-    client = RosClient()
-    client.subscribe_all()
-    names = [t.name for t in _FakeTopic.instances]
-    assert '/task/status' in names
-    assert '/gripper/state' in names
-    assert '/robot/fault' in names
+class _FakeOwner:
+    def __init__(self):
+        self.task_status_calls = []
+        self.gripper_state_calls = []
+        self.fault_calls = []
+        self.on_task_status = lambda state, detail: self.task_status_calls.append((state, detail))
+        self.on_gripper_state = lambda width, grip: self.gripper_state_calls.append((width, grip))
+        self.on_fault = lambda msg: self.fault_calls.append(msg)
 
 
-def test_task_status_callback_parses_json():
-    client = RosClient()
-    client.subscribe_all()
+@pytest.fixture
+def owner():
+    return _FakeOwner()
+
+
+@pytest.fixture
+def node(owner):
+    n = _HandoverUiNode(owner)
+    n.subscribe_all()
+    yield n
+    n.destroy_node()
+
+
+@pytest.fixture
+def peer():
+    p = rclpy.create_node('test_peer_node')
+    yield p
+    p.destroy_node()
+
+
+def _spin_until(spin_target, predicate, timeout_s=3.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rclpy.spin_once(spin_target, timeout_sec=0.1)
+        if predicate():
+            return True
+    return False
+
+
+def test_task_status_callback_parses_json(node, owner, peer):
+    pub = peer.create_publisher(String, '/task/status', 10)
+    time.sleep(0.3)
+    pub.publish(String(data='{"state": "IDLE", "detail": "ready"}'))
+
+    assert _spin_until(node, lambda: owner.task_status_calls)
+    assert owner.task_status_calls == [('IDLE', 'ready')]
+
+
+def test_gripper_state_callback_forwards_fields(node, owner, peer):
+    pub = peer.create_publisher(GripperState, '/gripper/state', 10)
+    time.sleep(0.3)
+    pub.publish(GripperState(width_mm=30.0, grip_detected=True))
+
+    assert _spin_until(node, lambda: owner.gripper_state_calls)
+    assert owner.gripper_state_calls == [(30.0, True)]
+
+
+def test_fault_callback_forwards_message(node, owner, peer):
+    pub = peer.create_publisher(String, '/robot/fault', 10)
+    time.sleep(0.3)
+    pub.publish(String(data='torque anomaly'))
+
+    assert _spin_until(node, lambda: owner.fault_calls)
+    assert owner.fault_calls == ['torque anomaly']
+
+
+def test_publish_command_sends_message(node, peer):
     received = []
-    client.on_task_status = lambda state, detail: received.append((state, detail))
+    peer.create_subscription(String, '/user_command/text', lambda m: received.append(m.data), 10)
+    time.sleep(0.3)
 
-    status_topic = next(t for t in _FakeTopic.instances if t.name == '/task/status')
-    status_topic.subscribed_callback({'data': '{"state": "IDLE", "detail": "ready"}'})
+    node.publish_command('스패너 갖다줘')
 
-    assert received == [('IDLE', 'ready')]
-
-
-def test_gripper_state_callback_forwards_fields():
-    client = RosClient()
-    client.subscribe_all()
-    received = []
-    client.on_gripper_state = lambda width, grip: received.append((width, grip))
-
-    gripper_topic = next(t for t in _FakeTopic.instances if t.name == '/gripper/state')
-    gripper_topic.subscribed_callback({'width_mm': 30.0, 'grip_detected': True})
-
-    assert received == [(30.0, True)]
-
-
-def test_publish_command_sends_message():
-    client = RosClient()
-    client.subscribe_all()
-
-    client.publish_command('스패너 갖다줘')
-
-    command_topic = next(t for t in _FakeTopic.instances if t.name == '/user_command/text')
-    assert command_topic.published[0]['data'] == '스패너 갖다줘'
+    assert _spin_until(peer, lambda: received)
+    assert received == ['스패너 갖다줘']
