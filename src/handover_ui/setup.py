@@ -15,7 +15,7 @@ setup(
     zip_safe=True,
     maintainer='hwangjeongui',
     maintainer_email='hwangjeongui01@gmail.com',
-    description='PyQt 데스크톱 UI (rosbridge 경유)',
+    description='PyQt 데스크톱 UI (rclpy 직접 연동)',
     license='MIT',
     tests_require=['pytest'],
     entry_points={

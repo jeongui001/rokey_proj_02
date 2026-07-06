@@ -3,13 +3,15 @@
 <package format="3">
   <name>handover_ui</name>
   <version>0.0.1</version>
-  <description>PyQt 데스크톱 UI - rosbridge(roslibpy) 경유로 /task/status, /gripper/state, /robot/fault 표시 및 /user_command/text 입력</description>
+  <description>PyQt 데스크톱 UI - rclpy로 ROS2에 직접 접속해 /task/status, /gripper/state, /robot/fault 표시 및 /user_command/text 입력</description>
   <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
   <license>MIT</license>
 
-  <exec_depend>rosbridge_server</exec_depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>handover_interfaces</depend>
 
-  <!-- PyQt5, roslibpy, pytest-qt는 ROS 패키지가 아니라 pip 의존성.
+  <!-- PyQt5, pytest-qt는 ROS 패키지가 아니라 pip 의존성.
        requirements.txt(런타임) / test-requirements.txt(테스트) 참고 -->
 
   <test_depend>python3-pytest</test_depend>
