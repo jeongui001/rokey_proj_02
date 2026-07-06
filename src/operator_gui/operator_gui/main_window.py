@@ -11,6 +11,8 @@ DEFAULT_CAMERA_STALE_TIMEOUT_S = 2.0
 # 짧게 유지해 멈춤 표시가 늦게 뜨지 않게 한다.
 _CAMERA_STALE_CHECK_INTERVAL_MS = 300
 
+_MONO_FONT_STACK = '"Cascadia Code", "DejaVu Sans Mono", "Consolas", monospace'
+
 
 def _sanitize_camera_stale_timeout_s(value):
     """finite 양수만 허용한다.
@@ -29,16 +31,134 @@ def _sanitize_camera_stale_timeout_s(value):
         return DEFAULT_CAMERA_STALE_TIMEOUT_S
     return parsed
 
-# safety_state -> (배경색, 글자색). NORMAL은 초록, PROTECTIVE_STOP/RECOVERY_REQUIRED는
-# 주황, EMERGENCY_STOP/FAULT는 빨강. 정의되지 않은 값은 회색(기본색)으로 표시한다.
+# safety_state -> (glow 색, 은은한 배경 tint). NORMAL은 초록, PROTECTIVE_STOP/
+# RECOVERY_REQUIRED는 주황, EMERGENCY_STOP/FAULT는 빨강 - HUD 톤에 맞춰 어두운
+# 배경 위에서 빛나는 느낌으로 표현한다. 정의되지 않은 값은 회색 계열로 표시한다.
 SAFETY_STATE_COLORS = {
-    'NORMAL': ('#2e7d32', 'white'),
-    'PROTECTIVE_STOP': ('#e65100', 'white'),
-    'RECOVERY_REQUIRED': ('#e65100', 'white'),
-    'EMERGENCY_STOP': ('#c62828', 'white'),
-    'FAULT': ('#c62828', 'white'),
+    'NORMAL': ('#39e991', 'rgba(57, 233, 145, 0.14)'),
+    'PROTECTIVE_STOP': ('#ffb454', 'rgba(255, 180, 84, 0.16)'),
+    'RECOVERY_REQUIRED': ('#ffb454', 'rgba(255, 180, 84, 0.16)'),
+    'EMERGENCY_STOP': ('#ff4d5e', 'rgba(255, 77, 94, 0.18)'),
+    'FAULT': ('#ff4d5e', 'rgba(255, 77, 94, 0.18)'),
 }
-DEFAULT_SAFETY_COLOR = ('#757575', 'white')
+DEFAULT_SAFETY_COLOR = ('#7f95a3', 'rgba(127, 149, 163, 0.12)')
+
+# 앱 전역 다크 HUD 테마. safety_label/fault_banner/connection_label처럼 상태에
+# 따라 색이 바뀌는 위젯은 이 QSS와 별개로 각자 setStyleSheet()을 계속 사용한다
+# (이 전역 QSS는 그 외 정적인 부분 - 배경, 버튼, 그룹박스, 입력창, 로그 - 을 담당).
+_JARVIS_QSS = f"""
+QMainWindow {{
+    background-color: #05080d;
+}}
+QWidget {{
+    color: #cfe6f2;
+    background-color: transparent;
+}}
+QGroupBox {{
+    border: 1px solid #16324a;
+    border-radius: 3px;
+    margin-top: 16px;
+    padding: 12px 10px 10px 10px;
+    font-weight: 600;
+    color: #cfe6f2;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    top: 2px;
+    padding: 0 6px;
+    color: #5f7c8e;
+    font-size: 11px;
+    letter-spacing: 1px;
+}}
+QPushButton {{
+    background-color: #0f1c28;
+    color: #cfe6f2;
+    border: 1px solid #2c5a7d;
+    border-radius: 4px;
+    padding: 9px 12px;
+    font-size: 13px;
+}}
+QPushButton:hover {{
+    border-color: #4dd8ff;
+    color: #4dd8ff;
+}}
+QPushButton:pressed {{
+    background-color: #16324a;
+}}
+QPushButton:disabled {{
+    color: #3d4f5c;
+    border-color: #1c2a33;
+    background-color: #0a1119;
+}}
+QPushButton#primaryButton {{
+    background-color: #4dd8ff;
+    color: #05141c;
+    border: 1px solid #4dd8ff;
+    font-weight: 700;
+}}
+QPushButton#primaryButton:hover {{
+    background-color: #7ee4ff;
+    color: #05141c;
+}}
+QPushButton#primaryButton:disabled {{
+    background-color: #123544;
+    color: #3d4f5c;
+    border-color: #1c2a33;
+}}
+QPushButton#dangerButton {{
+    background-color: transparent;
+    color: #ff4d5e;
+    border: 1px solid #ff4d5e;
+    font-weight: 700;
+}}
+QPushButton#dangerButton:hover {{
+    background-color: #ff4d5e;
+    color: #05080d;
+}}
+QLineEdit {{
+    background-color: #0c141d;
+    color: #cfe6f2;
+    border: 1px solid #2c5a7d;
+    border-radius: 4px;
+    padding: 7px 9px;
+}}
+QLineEdit:focus {{
+    border-color: #4dd8ff;
+}}
+QListWidget {{
+    background-color: #0c141d;
+    color: #8fb3c4;
+    border: 1px solid #16324a;
+    border-radius: 3px;
+    font-family: {_MONO_FONT_STACK};
+    font-size: 12px;
+}}
+QLabel#sectionNote {{
+    color: #5f7c8e;
+    font-size: 11px;
+}}
+QLabel#cameraLabel {{
+    background-color: #0a0f16;
+    border: 1px solid #16324a;
+    border-radius: 3px;
+    color: #4d6577;
+    font-family: {_MONO_FONT_STACK};
+}}
+QScrollBar:vertical {{
+    background: #0c141d;
+    width: 10px;
+}}
+QScrollBar::handle:vertical {{
+    background: #2c5a7d;
+    border-radius: 4px;
+    min-height: 20px;
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+    height: 0px;
+}}
+"""
 
 
 def _severity_from_fault_message(message: str) -> str:
@@ -118,17 +238,28 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---- UI 구성 ----
 
     def _build_ui(self):
+        self.setStyleSheet(_JARVIS_QSS)
+
         # 상단: rosbridge 연결 상태 / AUTO·MANUAL / task state / safety state / detail
         self.connection_label = QtWidgets.QLabel('rosbridge: 연결 확인 중...')
         self.mode_label = QtWidgets.QLabel('모드: -')
         self.state_label = QtWidgets.QLabel('상태: -')
         self.safety_label = QtWidgets.QLabel('안전상태: -')
         self.detail_label = QtWidgets.QLabel('디테일: -')
-        for label in (self.connection_label, self.mode_label, self.state_label,
-                      self.safety_label, self.detail_label):
-            label.setStyleSheet('padding: 2px 6px;')
+
+        _chip_base = (
+            f'font-family: {_MONO_FONT_STACK}; font-size: 12px; font-weight: 600; '
+            'padding: 6px 12px; border: 1px solid #16324a; border-radius: 3px; '
+            'background-color: #0c141d; color: #8fb3c4;'
+        )
+        for label in (self.connection_label, self.mode_label, self.state_label):
+            label.setStyleSheet(_chip_base)
+        self.detail_label.setStyleSheet(
+            'font-size: 12px; color: #5f7c8e; padding: 6px 4px;')
+        self.safety_label.setStyleSheet(_chip_base)
 
         top_bar = QtWidgets.QHBoxLayout()
+        top_bar.setSpacing(8)
         top_bar.addWidget(self.connection_label)
         top_bar.addWidget(self.mode_label)
         top_bar.addWidget(self.state_label)
@@ -136,26 +267,51 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.detail_label, stretch=1)
 
         self.fault_banner = QtWidgets.QLabel('')
-        self.fault_banner.setStyleSheet('background-color: #c62828; color: white; font-weight: bold; padding: 4px;')
+        self.fault_banner.setStyleSheet(
+            f'background-color: rgba(255, 77, 94, 0.18); color: #ff4d5e; '
+            f'font-family: {_MONO_FONT_STACK}; font-weight: 700; '
+            'border: 1px solid #ff4d5e; border-radius: 3px; padding: 6px 10px;')
         self.fault_banner.hide()
+
+        # 안전상태 배너가 위험할 때 은은하게 깜빡이도록(pulse) 하는 애니메이션 -
+        # NORMAL일 때는 항상 정지 상태(불투명도 1.0)로 둔다.
+        self._safety_opacity_effect = QtWidgets.QGraphicsOpacityEffect(self.safety_label)
+        self._safety_opacity_effect.setOpacity(1.0)
+        self.safety_label.setGraphicsEffect(self._safety_opacity_effect)
+        fade_out = QtCore.QPropertyAnimation(self._safety_opacity_effect, b'opacity', self)
+        fade_out.setDuration(700)
+        fade_out.setStartValue(1.0)
+        fade_out.setEndValue(0.45)
+        fade_in = QtCore.QPropertyAnimation(self._safety_opacity_effect, b'opacity', self)
+        fade_in.setDuration(700)
+        fade_in.setStartValue(0.45)
+        fade_in.setEndValue(1.0)
+        self._safety_pulse = QtCore.QSequentialAnimationGroup(self)
+        self._safety_pulse.addAnimation(fade_out)
+        self._safety_pulse.addAnimation(fade_in)
+        self._safety_pulse.setLoopCount(-1)
 
         # 왼쪽: 카메라
         self.camera_label = QtWidgets.QLabel('카메라 대기 중...')
+        self.camera_label.setObjectName('cameraLabel')
         self.camera_label.setAlignment(QtCore.Qt.AlignCenter)
         self.camera_label.setMinimumSize(320, 240)
-        self.camera_label.setStyleSheet('background-color: #202020; color: #aaaaaa;')
 
-        # 오른쪽: 그리퍼 상태 + 명령 버튼
+        # 오른쪽: 그리퍼 상태 + 명령 버튼 (모드 / 이동 / 비상 조치 / 명령 전송으로 그룹화)
         self.gripper_label = QtWidgets.QLabel('그리퍼: -')
+        self.gripper_label.setStyleSheet(f'font-family: {_MONO_FONT_STACK}; font-size: 12px;')
 
+        mode_group = QtWidgets.QGroupBox('모드')
         self.auto_button = QtWidgets.QPushButton('AUTO 모드')
         self.manual_button = QtWidgets.QPushButton('MANUAL 모드')
         self.auto_button.clicked.connect(lambda: self._send_text(CMD_AUTO))
         self.manual_button.clicked.connect(lambda: self._send_text(CMD_MANUAL))
-        mode_button_layout = QtWidgets.QHBoxLayout()
-        mode_button_layout.addWidget(self.auto_button)
-        mode_button_layout.addWidget(self.manual_button)
+        mode_layout = QtWidgets.QHBoxLayout()
+        mode_layout.addWidget(self.auto_button)
+        mode_layout.addWidget(self.manual_button)
+        mode_group.setLayout(mode_layout)
 
+        move_group = QtWidgets.QGroupBox('이동')
         self.home_button = QtWidgets.QPushButton('홈')
         self.front_button = QtWidgets.QPushButton('정면')
         self.up_button = QtWidgets.QPushButton('위')
@@ -172,37 +328,47 @@ class MainWindow(QtWidgets.QMainWindow):
         pose_grid.addWidget(self.watch_button, 0, 2)
         pose_grid.addWidget(self.up_button, 1, 0)
         pose_grid.addWidget(self.down_button, 1, 1)
+        move_group.setLayout(pose_grid)
 
+        estop_group = QtWidgets.QGroupBox('비상 조치')
         self.stop_button = QtWidgets.QPushButton('작업 중단')
+        self.stop_button.setObjectName('dangerButton')
         self.stop_button.clicked.connect(lambda: self._send_text(CMD_STOP))
+        self.reset_button = QtWidgets.QPushButton('복구 요청 (리셋)')
+        self.reset_button.setObjectName('primaryButton')
+        self.reset_button.clicked.connect(lambda: self._send_text(CMD_RESET))
         self.estop_notice_label = QtWidgets.QLabel(
             '※ 실제 비상정지(E-Stop)는 로봇 본체의 물리 버튼입니다.')
-        self.estop_notice_label.setStyleSheet('color: #757575; font-size: 11px;')
+        self.estop_notice_label.setObjectName('sectionNote')
         self.estop_notice_label.setWordWrap(True)
+        estop_layout = QtWidgets.QVBoxLayout()
+        estop_layout.addWidget(self.stop_button)
+        estop_layout.addWidget(self.reset_button)
+        estop_layout.addWidget(self.estop_notice_label)
+        estop_group.setLayout(estop_layout)
 
-        self.reset_button = QtWidgets.QPushButton('복구 요청 (리셋)')
-        self.reset_button.clicked.connect(lambda: self._send_text(CMD_RESET))
-
+        cmd_group = QtWidgets.QGroupBox('명령 전송')
         self.command_input = QtWidgets.QLineEdit()
+        self.command_input.setPlaceholderText('예: 드라이버 가져와')
         self.send_button = QtWidgets.QPushButton('전송')
         self.send_button.clicked.connect(self._on_send_clicked)
         free_command_layout = QtWidgets.QHBoxLayout()
         free_command_layout.addWidget(self.command_input)
         free_command_layout.addWidget(self.send_button)
+        cmd_group.setLayout(free_command_layout)
 
         right_panel = QtWidgets.QVBoxLayout()
+        right_panel.setSpacing(10)
         right_panel.addWidget(self.gripper_label)
-        right_panel.addLayout(mode_button_layout)
-        right_panel.addLayout(pose_grid)
-        right_panel.addWidget(self.stop_button)
-        right_panel.addWidget(self.estop_notice_label)
-        right_panel.addWidget(self.reset_button)
+        right_panel.addWidget(mode_group)
+        right_panel.addWidget(move_group)
+        right_panel.addWidget(estop_group)
         right_panel.addStretch(1)
-        right_panel.addLayout(free_command_layout)
+        right_panel.addWidget(cmd_group)
 
         right_container = QtWidgets.QWidget()
         right_container.setLayout(right_panel)
-        right_container.setMaximumWidth(260)
+        right_container.setMaximumWidth(280)
 
         middle_layout = QtWidgets.QHBoxLayout()
         middle_layout.addWidget(self.camera_label, stretch=2)
@@ -216,11 +382,13 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.fault_banner)
         layout.addLayout(middle_layout, stretch=1)
         layout.addWidget(self.log_view, stretch=1)
+        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12)
 
         container = QtWidgets.QWidget()
         container.setLayout(layout)
         self.setCentralWidget(container)
-        self.resize(900, 640)
+        self.resize(960, 680)
 
     def _wire_signals(self):
         self.task_status_received.connect(self._update_task_status)
@@ -278,14 +446,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._received_first_status = True
         self._apply_button_policy()
 
+    def _style_safety_chip(self, widget, glow, tint):
+        widget.setStyleSheet(
+            f'font-family: {_MONO_FONT_STACK}; font-size: 12px; font-weight: 700; '
+            f'padding: 6px 12px; border: 1px solid {glow}; border-radius: 3px; '
+            f'background-color: {tint}; color: {glow};')
+
+    def _apply_safety_pulse(self, safety_state):
+        if safety_state == 'NORMAL':
+            self._safety_pulse.stop()
+            self._safety_opacity_effect.setOpacity(1.0)
+        elif self._safety_pulse.state() != QtCore.QAbstractAnimation.Running:
+            self._safety_pulse.start()
+
     def _apply_safety_state(self, safety_state):
         if safety_state != self._last_safety_state:
             self._log(f'안전상태 변화: {self._last_safety_state or "-"} -> {safety_state}')
         self._last_safety_state = safety_state
 
-        bg, fg = SAFETY_STATE_COLORS.get(safety_state, DEFAULT_SAFETY_COLOR)
+        glow, tint = SAFETY_STATE_COLORS.get(safety_state, DEFAULT_SAFETY_COLOR)
         self.safety_label.setText(f'안전상태: {safety_state or "-"}')
-        self.safety_label.setStyleSheet(f'background-color: {bg}; color: {fg}; padding: 2px 6px;')
+        self._style_safety_chip(self.safety_label, glow, tint)
+        self._apply_safety_pulse(safety_state)
 
         if safety_state != 'NORMAL':
             # /task/status 스스로 비정상 상태를 확인해줬다 - 이후 NORMAL만 배너를 숨길 수 있다.
@@ -294,7 +476,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 text = self._last_fault_message or f'안전상태: {safety_state}'
                 self.fault_banner.setText(text)
                 self.fault_banner.setStyleSheet(
-                    f'background-color: {bg}; color: {fg}; font-weight: bold; padding: 4px;')
+                    f'background-color: {tint}; color: {glow}; '
+                    f'font-family: {_MONO_FONT_STACK}; font-weight: 700; '
+                    f'border: 1px solid {glow}; border-radius: 3px; padding: 6px 10px;')
                 self.fault_banner.show()
             return
 
@@ -362,13 +546,16 @@ class MainWindow(QtWidgets.QMainWindow):
         severity = _severity_from_fault_message(message)
         # UI 내부 안전상태도 즉시 비정상으로 간주한다 (/task/status 갱신을 기다리지 않음).
         self._last_safety_state = severity
-        bg, fg = SAFETY_STATE_COLORS.get(severity, ('#c62828', 'white'))
+        glow, tint = SAFETY_STATE_COLORS.get(severity, DEFAULT_SAFETY_COLOR)
         self.safety_label.setText(f'안전상태: {severity}')
-        self.safety_label.setStyleSheet(f'background-color: {bg}; color: {fg}; padding: 2px 6px;')
+        self._style_safety_chip(self.safety_label, glow, tint)
+        self._apply_safety_pulse(severity)
 
         self.fault_banner.setText(message)
         self.fault_banner.setStyleSheet(
-            f'background-color: {bg}; color: {fg}; font-weight: bold; padding: 4px;')
+            f'background-color: {tint}; color: {glow}; '
+            f'font-family: {_MONO_FONT_STACK}; font-weight: 700; '
+            f'border: 1px solid {glow}; border-radius: 3px; padding: 6px 10px;')
         self.fault_banner.show()
         self._log(f'Fault: {message}')
         # 다음 /task/status를 기다리지 않고 즉시 이동/AUTO/MANUAL 버튼을 차단한다
@@ -379,10 +566,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_connection_status(self, connected):
         if connected:
             self.connection_label.setText('rosbridge: 연결됨')
-            self.connection_label.setStyleSheet('color: white; background-color: #2e7d32; padding: 2px 6px;')
+            self.connection_label.setStyleSheet(
+                f'font-family: {_MONO_FONT_STACK}; font-size: 12px; font-weight: 700; '
+                'padding: 6px 12px; border: 1px solid #39e991; border-radius: 3px; '
+                'background-color: rgba(57, 233, 145, 0.14); color: #39e991;')
         else:
             self.connection_label.setText('rosbridge: 연결 안 됨')
-            self.connection_label.setStyleSheet('color: white; background-color: #c62828; padding: 2px 6px;')
+            self.connection_label.setStyleSheet(
+                f'font-family: {_MONO_FONT_STACK}; font-size: 12px; font-weight: 700; '
+                'padding: 6px 12px; border: 1px solid #ff4d5e; border-radius: 3px; '
+                'background-color: rgba(255, 77, 94, 0.18); color: #ff4d5e;')
         self._log('rosbridge 연결됨' if connected else 'rosbridge 연결 끊김')
 
     # ---- 카메라 ----
@@ -439,6 +632,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def closeEvent(self, event):
         self._reconnect_timer.stop()
         self._camera_stale_timer.stop()
+        self._safety_pulse.stop()
         try:
             self.ros_client.close()
         except Exception:

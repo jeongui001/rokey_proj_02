@@ -146,11 +146,11 @@ def test_command_blocked_when_not_connected(qtbot):
 # ---- Fault 배너 상태 ----
 
 @pytest.mark.parametrize('safety_state,expected_color', [
-    ('NORMAL', '#2e7d32'),
-    ('PROTECTIVE_STOP', '#e65100'),
-    ('RECOVERY_REQUIRED', '#e65100'),
-    ('EMERGENCY_STOP', '#c62828'),
-    ('FAULT', '#c62828'),
+    ('NORMAL', '#39e991'),
+    ('PROTECTIVE_STOP', '#ffb454'),
+    ('RECOVERY_REQUIRED', '#ffb454'),
+    ('EMERGENCY_STOP', '#ff4d5e'),
+    ('FAULT', '#ff4d5e'),
 ])
 def test_safety_state_label_color(window, qtbot, safety_state, expected_color):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
@@ -203,10 +203,10 @@ def test_fault_banner_persists_until_normal_status_received(window, qtbot):
 
 
 @pytest.mark.parametrize('prefix,expected_color', [
-    ('PROTECTIVE_STOP: torque anomaly', '#e65100'),
-    ('EMERGENCY_STOP: e-stop pressed', '#c62828'),
-    ('FAULT: unexpected force', '#c62828'),
-    ('torque anomaly (no prefix)', '#c62828'),
+    ('PROTECTIVE_STOP: torque anomaly', '#ffb454'),
+    ('EMERGENCY_STOP: e-stop pressed', '#ff4d5e'),
+    ('FAULT: unexpected force', '#ff4d5e'),
+    ('torque anomaly (no prefix)', '#ff4d5e'),
 ])
 def test_fault_after_normal_status_never_shows_green(window, qtbot, prefix, expected_color):
     # 직전 safety_state가 NORMAL이었더라도, Fault 메시지 도착 시 배너가 초록으로
@@ -219,7 +219,7 @@ def test_fault_after_normal_status_never_shows_green(window, qtbot, prefix, expe
         window.ros_client.on_fault(prefix)
 
     assert window.fault_banner.isVisible()
-    assert '#2e7d32' not in window.fault_banner.styleSheet()  # 초록으로 표시되지 않는다
+    assert '#39e991' not in window.fault_banner.styleSheet()  # 초록(NORMAL)으로 표시되지 않는다
     assert expected_color in window.fault_banner.styleSheet()
 
 
