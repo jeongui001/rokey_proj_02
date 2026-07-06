@@ -25,7 +25,7 @@ def generate_launch_description():
         ])
     )
     ui_process = ExecuteProcess(
-        cmd=['operator_gui'],
+        cmd=['ros2', 'run', 'operator_gui', 'operator_gui'],
         additional_env={
             'OPERATOR_GUI_ROSBRIDGE_HOST': LaunchConfiguration('rosbridge_host'),
             'OPERATOR_GUI_ROSBRIDGE_PORT': LaunchConfiguration('rosbridge_port'),

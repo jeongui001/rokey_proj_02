@@ -2259,13 +2259,17 @@ def test_check_fault_detects_emergency_stop(node):
     assert reason.startswith(FaultPrefix.EMERGENCY_STOP)
 
 
-def test_check_fault_detects_unexpected_external_torque(node):
+def test_check_fault_no_longer_reacts_to_external_torque(node):
+    # 외력 감지는 이제 check_fault(ROS 서비스 폴링)가 아니라 DrflForceMonitor
+    # (독립 쓰레드, DRFL 직접 연결)가 전담한다 - MOVING 중에도 동작해야 해서
+    # 옮겼다(2026-07-06). ext_torque가 아무리 커도 STANDBY/robot_state 자체에
+    # 문제가 없으면 check_fault는 항상 None을 반환해야 한다.
     state = {'robot_state': DoosanRobotState.STANDBY,
-             'ext_torque': [0.0, 0.0, 25.0, 0.0, 0.0, 0.0], 'tool_force': [0.0] * 6}
+             'ext_torque': [0.0, 0.0, 999.0, 0.0, 0.0, 0.0], 'tool_force': [0.0] * 6}
 
     reason = node._check_fault(state)
 
-    assert reason.startswith(FaultPrefix.FAULT)
+    assert reason is None
 
 
 def test_state_poll_timer_publishes_fault_when_detected(node):
@@ -2443,6 +2447,55 @@ def test_recover_hardware_rejects_emergency_stop(node):
     assert response.success is False
     assert node.safety_state == SafetyState.EMERGENCY_STOP
     assert fake.set_robot_control_calls == []
+
+
+# ---- /robot/recover: STANDBY 확인 후 외력(관절별 절대 임계값) 재검사 ----
+#
+# 예전엔 baseline/delta 방식이었지만, 외력 감지 전체를 DrflForceMonitor(절대
+# 임계값 + 히스테리시스)로 옮기면서 recover()도 같은 direct_threshold_nm을
+# 재사용하는 단순한 절대값 비교로 바꿨다(2026-07-06).
+
+def test_recover_standby_succeeds_when_torque_within_threshold(node):
+    node.hardware_enabled = True
+    node.safety_state = SafetyState.FAULT
+    fake = _FakeDoosanDriver()
+    fake.robot_state_sequence = [DoosanRobotState.STANDBY]
+    fake.ext_torque = [0.0] * 6  # 전부 임계값 이내
+    node._doosan = fake
+
+    response = node._on_recover(Trigger.Request(), Trigger.Response())
+
+    assert response.success is True
+    assert node.safety_state == SafetyState.NORMAL
+
+
+def test_recover_standby_blocked_when_torque_exceeds_threshold(node):
+    node.hardware_enabled = True
+    node.safety_state = SafetyState.FAULT
+    fake = _FakeDoosanDriver()
+    fake.robot_state_sequence = [DoosanRobotState.STANDBY]
+    # 손목 관절(인덱스 5, 기본 threshold=10.0)이 여전히 초과
+    fake.ext_torque = [0.0, 0.0, 0.0, 0.0, 0.0, 15.0]
+    node._doosan = fake
+
+    response = node._on_recover(Trigger.Request(), Trigger.Response())
+
+    assert response.success is False
+    assert node.safety_state == SafetyState.FAULT
+
+
+def test_recover_standby_blocked_when_torque_measurement_fails(node):
+    node.hardware_enabled = True
+    node.safety_state = SafetyState.FAULT
+    fake = _FakeDoosanDriver()
+    fake.robot_state_sequence = [DoosanRobotState.STANDBY]
+    fake.ext_torque = None
+    node._doosan = fake
+
+    response = node._on_recover(Trigger.Request(), Trigger.Response())
+
+    assert response.success is False
+    assert node.safety_state == SafetyState.FAULT
 
 
 # ---- hardware_enabled=true인데 DoosanDriver 초기화가 실패하는 경우 ----

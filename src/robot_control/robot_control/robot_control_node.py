@@ -13,6 +13,7 @@ from handover_interfaces.action import RobotTask
 from handover_interfaces.msg import GripperState
 
 from robot_control.doosan_driver import DoosanDriver, DoosanRobotControl
+from robot_control.drfl_force_monitor import DrflForceMonitor
 from robot_control.rg2_client import RG2Client, RG2Status
 from robot_control.safety_monitor import (
     DoosanRobotState,
@@ -106,7 +107,23 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('handover_hold.force_sample_max_age_s', 0.5)
         self.declare_parameter('handover_hold.pull_confirm_samples', 3)
 
-        self.declare_parameter('safety.external_torque_threshold_nm', 20.0)
+        # 외력 감지: dsr_msgs2 ROS 서비스가 아니라 DRFL 라이브러리에 ctypes로 직접
+        # 연결해 ROS2 executor와 무관한 독립 쓰레드에서 고주기(기본 100Hz)로 폴링한다
+        # (rokey_proj_01의 force_monitor_node.py와 동일 접근, 2026-07-06 도입).
+        # 관절별 절대 임계값 + 히스테리시스(reset_below_count) 방식이라, MOVING
+        # 중이든 STANDBY든 상관없이 항상 동작한다 - "최근 평균 대비 변화량(delta)"
+        # 으로 판단하던 이전 방식은 정지 상태에서만 유효하고 이동 중엔 자세 변화
+        # 자체로 오탐이 나서(2026-07-06 확인) 이 방식으로 완전히 대체했다.
+        self.declare_parameter(
+            'safety.external_torque.drfl_lib_path',
+            '/home/youngjin/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so')
+        self.declare_parameter('safety.external_torque.robot_ip', '192.168.1.100')
+        self.declare_parameter('safety.external_torque.robot_port', 12345)
+        self.declare_parameter('safety.external_torque.direct_poll_hz', 100.0)
+        _declare_double_array(
+            self, 'safety.external_torque.direct_threshold_nm',
+            [15.0, 15.0, 12.0, 10.0, 10.0, 10.0])
+        self.declare_parameter('safety.external_torque.direct_reset_below_count', 20)
         self.declare_parameter('safety.fault_stop_mode', 1)  # DR_QSTOP: Quick stop Cat.2
         self.declare_parameter('safety.state_poll_period_s', 0.1)
         self.declare_parameter('gripper_poll_period_s', 0.5)
@@ -288,6 +305,7 @@ class RobotControlNode(Node, TaskExecutor):
         상태로 조용히 dry_run처럼 동작하지 않는다).
         """
         self._doosan = None
+        self._drfl_force_monitor = None
         if not self.hardware_enabled:
             return
         try:
@@ -298,6 +316,47 @@ class RobotControlNode(Node, TaskExecutor):
             fault_msg = String()
             fault_msg.data = f'{FaultPrefix.FAULT}DoosanDriver 초기화 실패: {exc}'
             self.pub_fault.publish(fault_msg)
+            return
+        self._init_drfl_force_monitor()
+
+    def _init_drfl_force_monitor(self):
+        """MOVING 중에도 동작하는 보조 외력 감지 레이어를 시작한다 (drfl_force_monitor
+        참고). 이 레이어는 안전상 "있으면 더 좋은" 보조 수단이지 필수 경로가 아니므로,
+        연결 실패해도 FAULT를 선언하지 않는다 - 기존 STANDBY delta 체크와 두산 자체
+        안전시스템은 이것과 무관하게 그대로 동작한다."""
+        try:
+            thresholds = self.get_parameter(
+                'safety.external_torque.direct_threshold_nm').value
+            self._drfl_force_monitor = DrflForceMonitor(
+                lib_path=self.get_parameter('safety.external_torque.drfl_lib_path').value,
+                robot_ip=self.get_parameter('safety.external_torque.robot_ip').value,
+                robot_port=int(self.get_parameter('safety.external_torque.robot_port').value),
+                thresholds_nm=thresholds,
+                on_triggered=self._on_drfl_force_triggered,
+                poll_hz=self.get_parameter('safety.external_torque.direct_poll_hz').value,
+                reset_below_count=self.get_parameter(
+                    'safety.external_torque.direct_reset_below_count').value,
+            )
+            self._drfl_force_monitor.start()
+        except Exception as exc:
+            self.get_logger().error(
+                f'DRFL 직접 외력 감지 초기화 실패 - 이 보조 레이어만 비활성화됩니다: {exc}')
+            self._drfl_force_monitor = None
+
+    def _on_drfl_force_triggered(self, joint_index, value, threshold):
+        """DrflForceMonitor의 백그라운드 쓰레드에서 직접 호출된다 (ROS2 executor
+        쓰레드가 아니다). declare_fault/publish 호출은 doosan_driver의 다른 동기
+        호출들과 마찬가지로 어느 쓰레드에서 불러도 안전하다 - _wait_for_future가
+        executor를 spin하지 않고 단순 폴링만 하므로 서로 경합하지 않는다."""
+        reason = (
+            f'{FaultPrefix.FAULT}예상하지 못한 외력이 감지되었습니다(이동 중 포함 직접 감지) '
+            f'(joint={joint_index + 1}, 값={value:.1f} Nm, 기준={threshold:.1f} Nm).')
+        self.safety_monitor.declare_fault(reason)
+
+    def destroy_node(self):
+        if getattr(self, '_drfl_force_monitor', None) is not None:
+            self._drfl_force_monitor.stop()
+        super().destroy_node()
 
     # ---- goal 수락/취소 ----
 
@@ -390,9 +449,12 @@ def main(args=None):
     executor.add_node(node)
     try:
         executor.spin()
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

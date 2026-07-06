@@ -87,6 +87,10 @@ class SafetyMonitor:
         }
 
     def check_fault(self, sample):
+        """robot_state(두산 자체 안전 상태)만 확인한다. 외력 감지는 이제 이 폴링
+        경로가 아니라 DrflForceMonitor(독립 쓰레드, ROS 서비스를 거치지 않는 직접
+        연결)가 전담한다 - MOVING 중에도 동작해야 해서 여기서는 뺐다(2026-07-06,
+        옛 delta/baseline 방식 제거)."""
         if not isinstance(sample, dict):
             return None
         code = sample.get('robot_state')
@@ -103,14 +107,6 @@ class SafetyMonitor:
             return (
                 f'{FaultPrefix.PROTECTIVE_STOP}보호정지 상태가 감지되었습니다 '
                 f'(robot_state={code}).')
-        torque = sample.get('ext_torque') or []
-        threshold = self.node.get_parameter(
-            'safety.external_torque_threshold_nm').value
-        if torque and max(abs(value) for value in torque) > threshold:
-            peak = max(abs(value) for value in torque)
-            return (
-                f'{FaultPrefix.FAULT}예상하지 못한 외력이 감지되었습니다 '
-                f'(ext_torque peak={peak:.1f} Nm).')
         return None
 
     @staticmethod
@@ -184,9 +180,15 @@ class SafetyMonitor:
             return response
         if robot_state == DoosanRobotState.STANDBY:
             torque = driver.get_external_torque()
-            threshold = self.node.get_parameter(
-                'safety.external_torque_threshold_nm').value
-            safe = torque is not None and max(abs(value) for value in torque) <= threshold
+            if torque is None or len(torque) != 6:
+                response.success, response.message = False, '외력 측정 실패 - 복구를 보류합니다.'
+                return response
+            # DrflForceMonitor와 같은 관절별 절대 임계값(direct_threshold_nm)을
+            # 재사용한다 - baseline/delta 방식은 제거됨(2026-07-06). 지금 이 순간
+            # 외력이 그 기준을 넘지 않아야만 정상 복구로 인정한다.
+            thresholds = self.node.get_parameter(
+                'safety.external_torque.direct_threshold_nm').value
+            safe = all(abs(value) <= threshold for value, threshold in zip(torque, thresholds))
             if safe:
                 self.state = SafetyState.NORMAL
             response.success = safe
