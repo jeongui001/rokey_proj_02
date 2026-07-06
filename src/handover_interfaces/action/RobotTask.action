@@ -1,13 +1,11 @@
-# task_type: move_named | move_pose | servo_pick | handover_hold | place_down | release_and_retry
+# task_type: move_named | servo_pick | handover_approach | handover_hold | release_and_retry
 string task_type
 string named_target
-geometry_msgs/PoseStamped target_pose
 string tool_class
 float32 grasp_width_mm
 float32 grasp_force_n
 ---
 bool success
-float32 measured_payload_kg
 float32 final_width_mm
 bool grip_detected
 string message

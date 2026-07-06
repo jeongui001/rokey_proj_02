@@ -1,6 +1,33 @@
+import math
+import os
 import time
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+
+# 카메라 프레임이 이 시간(초) 이상 없으면 "멈췄습니다"로 표시한다. 실제 카메라
+# 프레임 주기에 맞춰 조정 가능한 통신 타이밍 값이며, 하드웨어 확정값이 아니다.
+DEFAULT_CAMERA_STALE_TIMEOUT_S = 2.0
+# 위 timeout과 무관하게, 화면 갱신 자체를 확인하는 주기(ms). timeout보다 충분히
+# 짧게 유지해 멈춤 표시가 늦게 뜨지 않게 한다.
+_CAMERA_STALE_CHECK_INTERVAL_MS = 300
+
+
+def _sanitize_camera_stale_timeout_s(value):
+    """finite 양수만 허용한다.
+
+    환경변수/생성자 인자로 들어온 값이 파싱 불가능한 문자열이거나 NaN/Inf/0
+    이하이면 안전한 기본값(DEFAULT_CAMERA_STALE_TIMEOUT_S)으로 대체한다 - 잘못된
+    값 하나 때문에 GUI가 시작 중 죽거나 즉시 "멈췄습니다"만 표시하는 등 비정상
+    동작하지 않게 한다."""
+    if value is None:
+        return DEFAULT_CAMERA_STALE_TIMEOUT_S
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return DEFAULT_CAMERA_STALE_TIMEOUT_S
+    if not math.isfinite(parsed) or parsed <= 0.0:
+        return DEFAULT_CAMERA_STALE_TIMEOUT_S
+    return parsed
 
 # safety_state -> (배경색, 글자색). NORMAL은 초록, PROTECTIVE_STOP/RECOVERY_REQUIRED는
 # 주황, EMERGENCY_STOP/FAULT는 빨강. 정의되지 않은 값은 회색(기본색)으로 표시한다.
@@ -48,10 +75,14 @@ class MainWindow(QtWidgets.QMainWindow):
     connection_changed = QtCore.pyqtSignal(bool)
     camera_image_received = QtCore.pyqtSignal(bytes)
 
-    def __init__(self, ros_client):
+    def __init__(self, ros_client, camera_stale_timeout_s=None):
         super().__init__()
         self.ros_client = ros_client
         self.setWindowTitle('공구 전달 로봇 제어')
+
+        self.camera_stale_timeout_s = _sanitize_camera_stale_timeout_s(
+            camera_stale_timeout_s if camera_stale_timeout_s is not None
+            else os.environ.get('OPERATOR_GUI_CAMERA_STALE_TIMEOUT_S'))
 
         self._last_state = None
         self._last_operation_mode = None
@@ -63,14 +94,26 @@ class MainWindow(QtWidgets.QMainWindow):
         # 메시지가 배너를 바로 숨겨버리지 않도록 하는 안전장치).
         self._fault_confirmed_abnormal = False
         self._camera_image = None
+        # 마지막으로 정상 영상을 받은 시각(monotonic). None이면 아직 한 번도 받지
+        # 못한 것 - 이때는 "카메라 대기 중..."을 그대로 유지한다(멈춤으로 표시하지 않음).
+        self._last_camera_image_at = None
+        self._camera_stale = False
+        # 초기 /task/status를 받기 전에는 이동/모드 버튼을 안전하게 비활성화해 둔다.
+        self._received_first_status = False
 
         self._build_ui()
         self._wire_signals()
+        self._apply_button_policy()
 
         self._reconnect_timer = QtCore.QTimer(self)
         self._reconnect_timer.setInterval(int(self.ros_client.reconnect_interval_s * 1000))
         self._reconnect_timer.timeout.connect(self.ros_client.ensure_connected)
         self._reconnect_timer.start()
+
+        self._camera_stale_timer = QtCore.QTimer(self)
+        self._camera_stale_timer.setInterval(_CAMERA_STALE_CHECK_INTERVAL_MS)
+        self._camera_stale_timer.timeout.connect(self._check_camera_stale)
+        self._camera_stale_timer.start()
 
     # ---- UI 구성 ----
 
@@ -232,6 +275,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_operation_mode = operation_mode
 
         self._apply_safety_state(safety_state)
+        self._received_first_status = True
+        self._apply_button_policy()
 
     def _apply_safety_state(self, safety_state):
         if safety_state != self._last_safety_state:
@@ -261,6 +306,49 @@ class MainWindow(QtWidgets.QMainWindow):
             self._fault_confirmed_abnormal = False
             self.fault_banner.hide()
 
+    # ---- 버튼 활성화 정책 (UI 편의 기능 - 실제 안전 판단은 task_manager/robot_control 담당) ----
+
+    def _apply_button_policy(self):
+        """현재 상태에 맞게 이동/모드 버튼을 활성화·비활성화한다.
+
+        이 정책은 화면 편의 기능일 뿐이다 - 실제로 어떤 명령을 받아들일지는
+        task_manager/robot_control이 최종 판단한다(예: MANUAL이 아닐 때 pose 이동
+        명령을 보내도 task_manager가 거부한다). 여기서는 사용자가 애초에 거부될
+        명령을 누르지 않도록 안내할 뿐이다.
+
+        - 초기 /task/status를 아직 받지 못했으면 이동/모드 버튼을 모두 비활성화한다.
+        - safety_state가 NORMAL이 아니면 AUTO/MANUAL 전환과 pose 이동 버튼을
+          비활성화한다(복구 요청 버튼은 그대로 유지한다).
+        - 작업이 진행 중(state != IDLE)이면 중복 명령을 막기 위해 이동/모드 버튼을
+          비활성화한다.
+        - MANUAL 모드가 아니면 pose 이동 버튼을 비활성화한다(AUTO/MANUAL 전환
+          버튼 자체는 현재 모드와 무관하게 위 조건만 만족하면 활성 상태를 유지한다 -
+          이미 그 모드로 전환해도 task_manager가 안전하게 무시한다).
+        - 작업 중단(STOP)과 복구 요청(RESET) 버튼은 이 정책과 무관하게 항상
+          활성화된 상태로 둔다.
+        """
+        if not self._received_first_status:
+            for button in (self.auto_button, self.manual_button, self.home_button,
+                           self.front_button, self.up_button, self.down_button,
+                           self.watch_button):
+                button.setEnabled(False)
+            return
+
+        normal = self._last_safety_state == 'NORMAL'
+        busy = self._last_state not in (None, 'IDLE')
+        is_manual = self._last_operation_mode == 'MANUAL'
+
+        mode_switch_enabled = normal and not busy
+        self.auto_button.setEnabled(mode_switch_enabled)
+        self.manual_button.setEnabled(mode_switch_enabled)
+
+        pose_buttons_enabled = normal and not busy and is_manual
+        for button in (self.home_button, self.front_button, self.up_button,
+                       self.down_button, self.watch_button):
+            button.setEnabled(pose_buttons_enabled)
+
+        # stop_button/reset_button은 항상 활성화 상태를 유지한다(정책 대상에서 제외).
+
     def _update_gripper_state(self, width_mm, grip_detected):
         self.gripper_label.setText(f'그리퍼: {width_mm:.1f}mm, grip_detected={grip_detected}')
         if self._last_grip_detected is not None and grip_detected != self._last_grip_detected:
@@ -283,6 +371,10 @@ class MainWindow(QtWidgets.QMainWindow):
             f'background-color: {bg}; color: {fg}; font-weight: bold; padding: 4px;')
         self.fault_banner.show()
         self._log(f'Fault: {message}')
+        # 다음 /task/status를 기다리지 않고 즉시 이동/AUTO/MANUAL 버튼을 차단한다
+        # (safety_state는 위에서 이미 비정상으로 갱신했다). STOP/RESET은 정책 대상이
+        # 아니므로 그대로 활성 상태를 유지한다.
+        self._apply_button_policy()
 
     def _update_connection_status(self, connected):
         if connected:
@@ -300,9 +392,30 @@ class MainWindow(QtWidgets.QMainWindow):
         if image.isNull():
             return
         self._camera_image = image
+        self._last_camera_image_at = time.monotonic()
+        if self._camera_stale:
+            # 새 영상이 다시 도착했으니 "멈춤" 표시를 자동으로 해제한다.
+            self._camera_stale = False
+            self._log('카메라 영상이 다시 수신되기 시작했습니다.')
         self._render_camera_pixmap()
 
+    def _check_camera_stale(self):
+        """QTimer가 주기적으로 호출한다(GUI 메인 스레드) - ROS 콜백 스레드에서 직접
+        위젯을 건드리지 않고, 여기서만 카메라 라벨을 갱신한다."""
+        if self._last_camera_image_at is None:
+            return  # 아직 한 번도 영상을 받지 못함 - "카메라 대기 중..." 문구를 유지한다.
+        if self._camera_stale:
+            return
+        elapsed = time.monotonic() - self._last_camera_image_at
+        if elapsed > self.camera_stale_timeout_s:
+            self._camera_stale = True
+            self.camera_label.setPixmap(QtGui.QPixmap())
+            self.camera_label.setText('카메라 영상이 멈췄습니다.')
+            self._log('카메라 영상이 멈췄습니다.')
+
     def _render_camera_pixmap(self):
+        if self._camera_stale:
+            return  # 멈춘 상태에서는 마지막 프레임을 다시 그리지 않는다(텍스트 유지).
         if self._camera_image is None:
             return
         pixmap = QtGui.QPixmap.fromImage(self._camera_image)
@@ -325,6 +438,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event):
         self._reconnect_timer.stop()
+        self._camera_stale_timer.stop()
         try:
             self.ros_client.close()
         except Exception:

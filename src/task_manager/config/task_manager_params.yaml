@@ -27,60 +27,51 @@
       max_track_age_s: -1.0       # TODO(캘리브레이션 필요, 초 단위)
 
     # 공구별 grasp spec. width_mm/force_n은 servo_pick goal에 실제로 실어 보내는 값,
-    # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위,
-    # payload_min/max_kg은 선택적 payload 검증 범위다(둘 다 0 이상이어야 활성화되며,
-    # 캘리브레이션 전까지는 -1로 두어 비활성 상태로 유지한다).
+    # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위다.
     # command_parser.py의 _TOOL_KEYWORDS 값과 반드시 일치해야 한다:
     # water_bottle, spanner, driver, wrench, pliers, hammer.
+    #
+    # width_mm=80.0/force_n=30.0은 모든 공구에 우선 동일하게 적용한 테스트값이다
+    # (공구 장난감류는 조건이 넉넉하지만, 500ml 물병을 기준으로 필요한 폭/힘에 맞춤).
+    # verify_min/max_width_mm은 아직 미확정이라 -1.0으로 남겨뒀다.
     tools:
       water_bottle:
-        width_mm: -1.0              # TODO(RG2 실측 필요, mm)
-        force_n: -1.0                # TODO(RG2 실측 필요, N)
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
         verify_max_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
-        payload_min_kg: -1.0         # TODO(선택, 캘리브레이션 전까지 비활성)
-        payload_max_kg: -1.0
       spanner:
-        width_mm: -1.0
-        force_n: -1.0
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-        payload_min_kg: -1.0
-        payload_max_kg: -1.0
       driver:
-        width_mm: -1.0
-        force_n: -1.0
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-        payload_min_kg: -1.0
-        payload_max_kg: -1.0
       wrench:
-        width_mm: -1.0
-        force_n: -1.0
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-        payload_min_kg: -1.0
-        payload_max_kg: -1.0
       pliers:
-        width_mm: -1.0
-        force_n: -1.0
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-        payload_min_kg: -1.0
-        payload_max_kg: -1.0
       hammer:
-        width_mm: -1.0
-        force_n: -1.0
+        width_mm: 80.0
+        force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-        payload_min_kg: -1.0
-        payload_max_kg: -1.0
 
     # 아래는 통신/타이밍 관련 값으로, 하드웨어 캘리브레이션 값이 아니다 - 실 환경에
     # 맞게 조정 가능하다.
     detect_track_timeout_s: 5.0
     verify_grasp_max_retries: 2
     wait_pull_timeout_s: 60.0
+    wait_pull_reminder_interval_s: 10.0
     cancel_timeout_s: 5.0
     recovery_timeout_s: 5.0
     status_publish_period_s: 1.0

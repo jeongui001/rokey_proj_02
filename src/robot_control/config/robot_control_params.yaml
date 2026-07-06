@@ -15,30 +15,76 @@
     rg2_port: 502
     rg2_gripper: 'rg2'
 
+    # RG2 open/close 명령이 busy=0(완료)이 될 때까지 기다리는 통신 타임아웃/폴링
+    # 주기 - 하드웨어 캘리브레이션 값이 아니라 통신 타이밍 설정이므로 보수적인
+    # 기본값을 명시했다. 실기 환경에 맞게 조정 가능하다.
+    rg2:
+      command_timeout_s: 5.0
+      poll_interval_s: 0.05
+      # open() 완료 후 최종 폭이 "최대 폭에 도달했다"고 참고로 판단할 때 허용할
+      # 오차(mm) - 실측으로 확정된 값이 아니라 통신/기구적 오차를 감안한 여유값이다.
+      open_width_tolerance_mm: 2.0
+
     # named_poses.<name>은 실측한 6축 관절각(degree)이 준비되면 여기에 주석을 풀고
     # 채워 넣는다. 빈 배열([])을 파라미터 override로 명시하면 rclpy가 배열 타입을
     # 추론하지 못해 파라미터가 미초기화 상태로 남는 문제가 있어(ROS2 Humble 확인됨),
     # 값이 없는 named pose는 아예 이 파일에 키를 적지 않는다 - 코드 쪽 기본값([])이
     # 그대로 적용되며, 그 경우 해당 named pose로의 이동은 명확한 실패로 처리된다
     # (robot_control_node._call_move_service 참고).
-    # named_poses:
-    #   home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
-    #   front: [...]
-    #   up: [...]
-    #   down: [...]
-    #   watch: [...]
-    #   handover_safe: [...]
-    #   place_down: [...]
+    #
+    # handover_safe: 작업대 전체가 보이는 자세 - handover_approach(YOLO 손 추적 후
+    # 접근하는 서보잉)의 출발점으로 쓰인다.
+    named_poses:
+      home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+      front: [0.0, 0.0, 90.0, 0.0, 0.0, 0.0]
+      up: [0.0, 0.0, 90.0, 0.0, -90.0, 0.0]
+      down: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]  # home과 동일 자세로 확인됨(의도된 값)
+      # base 좌표 기준(참고용, 실제로는 위 관절각이 사용됨):
+      # [446.3, -215.69, 291.05, 52.87, 178.53, 51.69] (x,y,z mm / rx,ry,rz deg)
+      watch: [-27.26, 21.12, 49.15, 1.69, 109.48, -28.31]
+      # base 좌표 기준(참고용): [400.5, 27.12, 305.78, 4.82, 141, -23.12] (mm/deg)
+      handover_safe: [1.7, -25.77, 104.09, 2.31, 62.75, -27.08]
 
     move:
       vel_deg_s: 30.0
       acc_deg_s2: 30.0
-      line_vel_mm_s: 100.0
-      line_vel_deg_s: 30.0
-      line_acc_mm_s2: 100.0
-      line_acc_deg_s2: 30.0
-      ref: 0        # DR_BASE(0) | DR_TOOL(1) | DR_WORLD(2)
       timeout_s: 30.0
+
+    # hardware_enabled=false(dry-run)에서는 실측 관절값이 없는 named pose도 상태
+    # 흐름 시험을 위해 이동을 허용한다. hardware_enabled=true에서는 이 값과 무관하게
+    # 빈 named pose를 절대 허용하지 않는다 (robot_control_node._call_move_service 참고).
+    dry_run:
+      allow_unconfigured_named_poses: true
+
+    servo_pick:
+      # ToolTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
+      # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
+      tool_track_frame_id: 'base_link'
+      # TCP 위치 캐시 샘플의 나이(초)가 이 값보다 크면 오래됐다고 보고 사용하지
+      # 않는다(서비스 왕복 시간이 아니라 캐시 샘플 자체의 나이) - 하드웨어
+      # 캘리브레이션 값이 아니라 RT 루프에 맞는 통신 타이밍 설정이다.
+      tcp_pose_max_age_s: 0.2
+      # TCP 위치 캐시를 갱신하는 주기. ToolTrack 콜백마다 동기 호출하지 않고
+      # rate-limited하게 별도 타이머로 갱신해 GetCurrentPosx 호출 과부하를 막는다.
+      tcp_pose_refresh_period_s: 0.05
+      # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
+      # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlRtStream 단위,
+      # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
+      # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
+
+    # handover_safe 도착 후 작업자 손(/vision/hand_pose)에 접근하는 서보잉 - 손이
+    # 아직 정확히 확인되지 않은 상태이므로 servo_pick보다 v_max를 낮게 잡았다.
+    handover_approach:
+      hand_pose_frame_id: 'base_link'
+      stop_distance_m: 0.05  # 사용자 확정값(5cm)
+      v_max: 0.15
+      kp_xy: 1.0
+      timeout_s: 10.0
+      t_lost_s: 0.5
+      # hardware_ready는 vision_node._track_hand가 구현·검증되기 전까지 반드시
+      # false로 유지한다(hand_pose의 frame_id/orientation 의미가 아직 미확정).
+      # 기본값은 코드의 declare_parameter에 있으며 실수로 true를 적지 않기 위해
+      # 여기서는 다시 명시하지 않는다.
 
     handover_hold:
       # TODO(캘리브레이션 필요): 실제 그리퍼-TCP 장착 방향에 따라 결정해야 한다.

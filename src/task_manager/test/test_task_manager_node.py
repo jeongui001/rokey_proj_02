@@ -8,7 +8,9 @@ from std_msgs.msg import String
 from handover_interfaces.msg import ToolTrack
 from handover_interfaces.srv import SetVisionMode
 from task_manager.command_parser import Mode
-from task_manager.task_manager_node import GraspSpec, Safety, State, TaskManagerNode
+from task_manager.task_manager_node import (
+    WAIT_PULL_REMINDER_MESSAGE, GraspSpec, Safety, State, TaskManagerNode,
+)
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -29,7 +31,6 @@ class _FakeResult:
     def __init__(self, success=True, message=''):
         self.success = success
         self.message = message
-        self.measured_payload_kg = 0.0
         self.final_width_mm = 0.0
         self.grip_detected = False
 
@@ -471,6 +472,24 @@ def test_recover_future_exception_keeps_recovery_required(node):
     assert node._recovery_in_progress is False
 
 
+def test_recover_call_async_exception_keeps_recovery_required_and_allows_retry(node):
+    node.safety_state = Safety.FAULT
+
+    class _RaisingRecoverClient:
+        def service_is_ready(self):
+            return True
+
+        def call_async(self, request):
+            raise RuntimeError('recover request boom')
+
+    node.recover_client = _RaisingRecoverClient()
+    node._on_user_command(String(data='리셋'))
+
+    assert node.safety_state == Safety.RECOVERY_REQUIRED
+    assert node._recovery_in_progress is False
+    assert node._recovery_timeout_timer is None
+
+
 def test_duplicate_reset_while_recovery_in_progress_does_not_call_service_twice(node):
     node.safety_state = Safety.FAULT
     fake_client = _FakeRecoverClient(ready=True)
@@ -734,11 +753,51 @@ def test_result_future_exception_sets_fault_and_clears_flags(node):
     assert node.state == State.HOME
 
 
-# ---- NaN/Inf confidence, grasp spec 값, 부분 설정된 payload 거부 ----
+def test_result_future_exception_during_cancel_does_not_run_pending_callback(node):
+    _send_and_accept(node, 'move_named', named_target='home')
+    node.state = State.CANCELLING
+    node._set_vision_mode = lambda mode, tool_class='': None
+    callback_calls = []
+    node._cancel_pending_callback = lambda: callback_calls.append(True)
+    generation = node._goal_generation
+
+    class _RaisingFuture:
+        def result(self):
+            raise RuntimeError('result during cancel boom')
+
+    node._on_robot_result(_RaisingFuture(), generation)
+
+    assert callback_calls == []
+    assert node.safety_state == Safety.FAULT
+    assert node._cancel_pending_callback is None
+    assert node._goal_generation != generation
+
+
+def test_get_result_async_exception_sets_fault_and_clears_flags(node):
+    node._goal_in_progress = True
+    node._goal_generation += 1
+    generation = node._goal_generation
+    node._set_vision_mode = lambda mode, tool_class='': None
+
+    class _RaisingGoalHandle:
+        accepted = True
+
+        def get_result_async(self):
+            raise RuntimeError('get result boom')
+
+    node._on_goal_response(_FakeFuture(_RaisingGoalHandle()), generation)
+
+    assert node.safety_state == Safety.FAULT
+    assert node._goal_in_progress is False
+    assert node._current_goal_handle is None
+    assert node._goal_generation != generation
+
+
+# ---- NaN/Inf confidence와 grasp spec 값 거부 ----
 
 @pytest.mark.parametrize('case', [
     'confidence_nan', 'confidence_inf', 'confidence_out_of_range',
-    'grasp_spec_width_nan', 'grasp_spec_force_inf', 'partial_payload',
+    'grasp_spec_width_nan', 'grasp_spec_force_inf',
 ])
 def test_rejects_nan_inf_and_partial_config(node, case):
     if case == 'confidence_nan':
@@ -759,12 +818,6 @@ def test_rejects_nan_inf_and_partial_config(node, case):
     elif case == 'grasp_spec_force_inf':
         _configure_tool_spec(node, 'spanner', **{'tools.spanner.force_n': float('inf')})
         assert node._get_grasp_spec('spanner') is None
-    elif case == 'partial_payload':
-        _configure_tool_spec(node, 'spanner', **{
-            'tools.spanner.payload_min_kg': 0.1, 'tools.spanner.payload_max_kg': -1.0})
-        assert node._get_grasp_spec('spanner') is None
-
-
 # ---- AUTO/MANUAL 모드 전환 (취소 확인 후 전환) ----
 
 def test_mode_switch_immediate_when_idle_and_no_goal(node):
@@ -1248,8 +1301,8 @@ def test_tool_track_trigger_sends_servo_pick_goal_and_cancels_timer(node):
     node.current_tool = 'spanner'
     node._check_trigger = lambda msg: True
     node._get_grasp_spec = lambda tool_class: GraspSpec(
-        width_mm=30.0, force_n=20.0, verify_min_width_mm=25.0, verify_max_width_mm=35.0,
-        payload_min_kg=-1.0, payload_max_kg=-1.0)
+        width_mm=30.0, force_n=20.0,
+        verify_min_width_mm=25.0, verify_max_width_mm=35.0)
     node._detect_track_timer = node.create_timer(100.0, lambda: None)
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
@@ -1420,8 +1473,6 @@ def _configure_tool_spec(node, tool, **overrides):
         f'tools.{tool}.force_n': 20.0,
         f'tools.{tool}.verify_min_width_mm': 25.0,
         f'tools.{tool}.verify_max_width_mm': 35.0,
-        f'tools.{tool}.payload_min_kg': -1.0,
-        f'tools.{tool}.payload_max_kg': -1.0,
     }
     values.update(overrides)
     node.set_parameters([Parameter(name, value=value) for name, value in values.items()])
@@ -1454,40 +1505,20 @@ def test_get_grasp_spec_returns_none_when_verify_range_inverted(node):
     assert node._get_grasp_spec('spanner') is None
 
 
-def test_get_grasp_spec_returns_none_when_only_one_payload_bound_set(node):
-    # 둘 다 음수(sentinel)일 때만 조용히 비활성화한다 - 하나만 설정된 경우는
-    # 설정 오류로 취급해 None을 반환한다(추측으로 조용히 비활성화하지 않는다).
-    _configure_tool_spec(node, 'spanner', **{
-        'tools.spanner.payload_min_kg': 0.1, 'tools.spanner.payload_max_kg': -1.0})
-
-    assert node._get_grasp_spec('spanner') is None
-
-
-def test_get_grasp_spec_keeps_payload_range_when_both_set(node):
-    _configure_tool_spec(node, 'spanner', **{
-        'tools.spanner.payload_min_kg': 0.1, 'tools.spanner.payload_max_kg': 0.5})
-
-    spec = node._get_grasp_spec('spanner')
-
-    assert spec.payload_min_kg == 0.1
-    assert spec.payload_max_kg == 0.5
-
-
 # ---- _verify_grasp 실제 구현 ----
 
 def _make_spec(**overrides):
     defaults = dict(
-        width_mm=30.0, force_n=20.0, verify_min_width_mm=25.0, verify_max_width_mm=35.0,
-        payload_min_kg=-1.0, payload_max_kg=-1.0)
+        width_mm=30.0, force_n=20.0,
+        verify_min_width_mm=25.0, verify_max_width_mm=35.0)
     defaults.update(overrides)
     return GraspSpec(**defaults)
 
 
-def _grasp_result(success=True, grip_detected=True, final_width_mm=30.0, measured_payload_kg=0.3):
+def _grasp_result(success=True, grip_detected=True, final_width_mm=30.0):
     result = _FakeResult(success=success)
     result.grip_detected = grip_detected
     result.final_width_mm = final_width_mm
-    result.measured_payload_kg = measured_payload_kg
     return result
 
 
@@ -1531,25 +1562,6 @@ def test_verify_grasp_fails_on_nonfinite_width(node):
     node._active_grasp_spec = _make_spec()
 
     assert node._verify_grasp(_grasp_result(final_width_mm=float('nan'))) is False
-
-
-def test_verify_grasp_payload_check_disabled_by_default(node):
-    # payload_min/max_kg가 -1(비활성)이면 payload가 범위 밖이어도 무시한다.
-    node._active_grasp_spec = _make_spec()
-
-    assert node._verify_grasp(_grasp_result(measured_payload_kg=999.0)) is True
-
-
-def test_verify_grasp_payload_check_enabled_within_range(node):
-    node._active_grasp_spec = _make_spec(payload_min_kg=0.1, payload_max_kg=0.5)
-
-    assert node._verify_grasp(_grasp_result(measured_payload_kg=0.3)) is True
-
-
-def test_verify_grasp_payload_check_enabled_out_of_range(node):
-    node._active_grasp_spec = _make_spec(payload_min_kg=0.1, payload_max_kg=0.5)
-
-    assert node._verify_grasp(_grasp_result(measured_payload_kg=0.9)) is False
 
 
 # ---- SERVO_PICK / VERIFY_GRASP / MOVE_SAFE / WAIT_PULL / RELEASE / HOME ----
@@ -1635,17 +1647,20 @@ def test_release_and_retry_result_failure_sets_fault(node):
     assert node.safety_state == Safety.FAULT
 
 
-def test_move_safe_result_success_transitions_directly_to_wait_pull(node):
+def test_move_safe_result_success_transitions_to_approach_hand(node):
+    # handover_safe 도착 후 바로 handover_hold로 가지 않고, 먼저 손에 접근한다
+    # (handover_approach) - vision도 TRACK_HAND로 전환한다.
     node.state = State.MOVE_SAFE
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+    vision_calls = []
+    node._set_vision_mode = lambda mode, tool_class='': vision_calls.append(mode)
 
     node._handle_move_safe_result(_FakeResult(success=True))
 
-    assert node.state == State.WAIT_PULL
-    assert sent == [('handover_hold', {})]
-    assert node._wait_pull_timeout_timer is not None
-    node._wait_pull_timeout_timer.cancel()
+    assert node.state == State.APPROACH_HAND
+    assert sent == [('handover_approach', {})]
+    assert vision_calls == [SetVisionMode.Request.TRACK_HAND]
 
 
 def test_move_safe_result_failure_sets_fault(node):
@@ -1653,6 +1668,28 @@ def test_move_safe_result_failure_sets_fault(node):
     node._set_vision_mode = lambda mode, tool_class='': None
 
     node._handle_move_safe_result(_FakeResult(success=False, message='motion failed'))
+
+    assert node.safety_state == Safety.FAULT
+
+
+def test_approach_hand_result_success_transitions_to_wait_pull(node):
+    node.state = State.APPROACH_HAND
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_approach_hand_result(_FakeResult(success=True))
+
+    assert node.state == State.WAIT_PULL
+    assert sent == [('handover_hold', {})]
+    assert node._wait_pull_timeout_timer is not None
+    node._wait_pull_timeout_timer.cancel()
+
+
+def test_approach_hand_result_failure_sets_fault(node):
+    node.state = State.APPROACH_HAND
+    node._set_vision_mode = lambda mode, tool_class='': None
+
+    node._handle_approach_hand_result(_FakeResult(success=False, message='lost'))
 
     assert node.safety_state == Safety.FAULT
 
@@ -1670,19 +1707,9 @@ def test_wait_pull_result_success_goes_home(node):
     assert sent == [('move_named', {'named_target': 'home'})]
 
 
-def test_wait_pull_timeout_sends_place_down(node):
-    node.state = State.WAIT_PULL
-    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
-    sent = []
-    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
-
-    node._on_wait_pull_timeout()
-
-    assert node.state == State.RELEASE
-    assert sent == [('place_down', {'named_target': 'place_down'})]
-
-
-def test_wait_pull_timeout_cancels_handover_hold_before_sending_place_down(node):
+def test_wait_pull_timeout_does_not_cancel_and_stays_in_wait_pull(node):
+    # place_down으로 옮기지 않고, handover_hold도 취소하지 않은 채 그 자리에서
+    # 계속 들고 대기한다 - GUI 안내만 새로 발행한다.
     node.state = State.WAIT_PULL
     node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
     handover_hold_handle = _send_and_accept(node, 'handover_hold')
@@ -1690,27 +1717,53 @@ def test_wait_pull_timeout_cancels_handover_hold_before_sending_place_down(node)
 
     node._on_wait_pull_timeout()
 
-    assert handover_hold_handle.cancel_called
-    assert node.state == State.WAIT_PULL  # 취소 확인 전에는 아직 RELEASE로 전이하지 않는다
-    assert node._goal_in_progress is True
-
-    sent = []
-    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
-    handover_hold_handle.result_future.fire(_FakeResult(success=False, message='canceled'))
-
-    assert node.state == State.RELEASE
-    # place_down이 중복 goal 방지 가드에 의해 무시되지 않고 실제로 전송된다
-    assert sent == [('place_down', {'named_target': 'place_down'})]
+    assert handover_hold_handle.cancel_called is False
+    assert node.state == State.WAIT_PULL
+    assert node._last_status_detail == WAIT_PULL_REMINDER_MESSAGE
+    node._wait_pull_timeout_timer.cancel()
 
 
-def test_release_result_success_goes_home(node):
-    node.state = State.RELEASE
+def test_wait_pull_timeout_starts_repeating_reminder_timer(node):
+    node.state = State.WAIT_PULL
+    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
+    node.set_parameters([Parameter('wait_pull_reminder_interval_s', value=10.0)])
+
+    node._on_wait_pull_timeout()
+
+    assert node._wait_pull_timeout_timer is not None
+    node._wait_pull_timeout_timer.cancel()
+
+
+def test_wait_pull_reminder_republishes_message_while_still_waiting(node):
+    node.state = State.WAIT_PULL
+    node._last_status_detail = ''
+
+    node._on_wait_pull_reminder()
+
+    assert node._last_status_detail == WAIT_PULL_REMINDER_MESSAGE
+
+
+def test_wait_pull_reminder_stops_once_state_leaves_wait_pull(node):
+    node.state = State.HOME
+    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
+
+    node._on_wait_pull_reminder()
+
+    assert node._wait_pull_timeout_timer is None  # 더 이상 WAIT_PULL이 아니면 타이머를 정리한다
+
+
+def test_wait_pull_result_success_still_cancels_reminder_timer(node):
+    # pull이 확정되면(성공) 반복 안내 타이머 단계였더라도 정리되고 HOME으로 간다.
+    node.state = State.WAIT_PULL
+    node._wait_pull_timeout_timer = node.create_timer(100.0, lambda: None)
+    node._on_wait_pull_timeout()  # 반복 안내 단계로 전환
     node._set_vision_mode = lambda mode, tool_class='': None
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
 
-    node._handle_release_result(_FakeResult(success=True))
+    node._handle_wait_pull_result(_FakeResult(success=True, message='pull_detected, released'))
 
+    assert node._wait_pull_timeout_timer is None
     assert node.state == State.HOME
     assert sent == [('move_named', {'named_target': 'home'})]
 
@@ -1719,8 +1772,8 @@ def test_home_result_success_returns_to_idle(node):
     node.state = State.HOME
     node.current_tool = 'spanner'
     node._active_grasp_spec = GraspSpec(
-        width_mm=30.0, force_n=20.0, verify_min_width_mm=25.0, verify_max_width_mm=35.0,
-        payload_min_kg=-1.0, payload_max_kg=-1.0)
+        width_mm=30.0, force_n=20.0,
+        verify_min_width_mm=25.0, verify_max_width_mm=35.0)
 
     node._handle_home_result(_FakeResult(success=True))
 

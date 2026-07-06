@@ -8,8 +8,9 @@ from rclpy.parameter import Parameter
 from std_srvs.srv import Trigger
 
 from handover_interfaces.action import RobotTask
+from handover_interfaces.msg import ToolTrack
 from robot_control.robot_control_node import (
-    DoosanRobotControl, DoosanRobotState, FaultPrefix, RobotControlNode, SafetyState,
+    DoosanRobotControl, DoosanRobotState, FaultPrefix, RG2Status, RobotControlNode, SafetyState,
 )
 from robot_control.servo_loop import ServoCommand, ServoLoop
 
@@ -57,13 +58,6 @@ def _goal(task_type, named_target=''):
     return g
 
 
-def _pose_goal():
-    g = RobotTask.Goal()
-    g.task_type = 'move_pose'
-    g.target_pose = PoseStamped()
-    return g
-
-
 class _FakeDoosanDriver:
     """dsr_msgs2 없이 RobotControlNode의 오케스트레이션 로직만 검증하기 위한 가짜 드라이버."""
 
@@ -78,6 +72,7 @@ class _FakeDoosanDriver:
         self.stop_return_value = True
         self.stop_should_raise = False
         self.close_rt_session_should_raise = False
+        self.close_rt_session_should_fail = False  # 예외 없이 응답 success=false만 시뮬레이션
 
     def get_robot_state(self):
         if self.robot_state_sequence:
@@ -102,6 +97,9 @@ class _FakeDoosanDriver:
     def close_rt_session(self):
         if self.close_rt_session_should_raise:
             raise RuntimeError('stop_rt_control 통신 오류 (fake).')
+        if self.close_rt_session_should_fail:
+            return False  # 예외 없이 StopRtControl/DisconnectRtControl 응답 success=false
+        return True
 
     def stop(self, stop_mode=1):
         self.stop_calls.append(stop_mode)
@@ -140,8 +138,97 @@ def test_move_named_failure(node):
     assert result.success is False
 
 
-def test_move_named_unconfigured_named_pose_is_treated_as_failure(node):
-    # 기본 named_poses.*는 빈 리스트이므로 실제 이동을 시도하지 않고 실패해야 한다.
+def test_move_named_unconfigured_named_pose_succeeds_in_dry_run_by_default(node):
+    # dry_run.allow_unconfigured_named_poses 기본값(true)에서는 실측 관절값이 없는
+    # named pose도 dry-run 상태 흐름 시험을 위해 이동을 허용한다.
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+def test_move_named_unconfigured_named_pose_rejected_when_dry_run_flag_disabled(node):
+    node.set_parameters([Parameter('dry_run.allow_unconfigured_named_poses', value=False)])
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_move_named_unconfigured_named_pose_rejected_when_hardware_enabled(node):
+    # hardware_enabled=true에서는 dry_run.allow_unconfigured_named_poses와 무관하게
+    # 빈 named pose를 절대 허용하지 않는다.
+    node.hardware_enabled = True
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_move_named_unknown_pose_name_rejected_even_in_dry_run(node):
+    gh = FakeGoalHandle(_goal('move_named', named_target='not_a_real_pose'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+# ---- named pose 길이/finite 검사 (값이 채워져 있는 경우) ----
+
+def test_move_named_rejects_five_joint_values(node):
+    node._named_poses['watch'] = [0.0, 0.0, 90.0, 0.0, 90.0]  # 6개가 아니라 5개
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_move_named_rejects_seven_joint_values(node):
+    node._named_poses['watch'] = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0, 0.0]  # 7개
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+@pytest.mark.parametrize('bad_value', [float('nan'), float('inf'), float('-inf')])
+def test_move_named_rejects_nan_or_inf_joint_value(node, bad_value):
+    node._named_poses['watch'] = [0.0, 0.0, 90.0, bad_value, 90.0, 0.0]
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_move_named_accepts_six_finite_joint_values(node):
+    node._named_poses['watch'] = [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+    node._call_move_service = lambda **kw: True
+    gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+def test_move_named_rejects_invalid_joint_values_even_in_dry_run(node):
+    # hardware_enabled=false(dry-run)라도 값이 채워져 있다면 길이/finite 검사는
+    # 그대로 적용된다 - dry-run 허용은 "값이 아예 비어 있는" 경우에만 적용된다.
+    assert node.hardware_enabled is False
+    node._named_poses['watch'] = [0.0, 0.0, 90.0]  # 3개뿐 - 채워져 있지만 잘못됨
     gh = FakeGoalHandle(_goal('move_named', named_target='watch'))
 
     result = node._execute_move_named(gh)
@@ -234,7 +321,7 @@ def test_dry_run_move_returns_false_when_fault_occurs_during_wait(node, monkeypa
 
 def test_release_and_retry_calls_open_and_move_to_watch(node):
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
     node._call_move_service = lambda **kw: calls.append(('move', kw)) or True
     gh = FakeGoalHandle(_goal('release_and_retry'))
 
@@ -248,7 +335,7 @@ def test_release_and_retry_calls_open_and_move_to_watch(node):
 
 def test_release_and_retry_cancel_before_open_does_not_open_gripper(node):
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
     node._call_move_service = lambda **kw: calls.append(('move', kw)) or True
     gh = FakeGoalHandle(_goal('release_and_retry'))
     gh.is_cancel_requested = True
@@ -261,10 +348,38 @@ def test_release_and_retry_cancel_before_open_does_not_open_gripper(node):
     assert result.success is False
 
 
+def test_release_and_retry_rg2_canceled_during_open_ends_as_canceled_not_fault(node):
+    # 명령 전 취소 확인과 달리, RG2 open의 busy 대기 "도중"에 취소가 확인된
+    # 경우(last_status=CANCELED)에도 FAULT가 아니라 canceled()로 끝나야 한다.
+    node.rg2_client.open = lambda goal_handle=None: False
+    node.rg2_client.last_status = RG2Status.CANCELED
+    gh = FakeGoalHandle(_goal('release_and_retry'))
+
+    result = node._execute_release_and_retry(gh)
+
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.NORMAL  # FAULT로 처리되지 않았다
+
+
+def test_release_and_retry_rg2_communication_error_during_open_is_fault(node):
+    node.rg2_client.open = lambda goal_handle=None: False
+    node.rg2_client.last_status = RG2Status.COMMUNICATION_ERROR
+    gh = FakeGoalHandle(_goal('release_and_retry'))
+
+    result = node._execute_release_and_retry(gh)
+
+    assert gh.aborted is True
+    assert gh.was_canceled is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.FAULT
+
+
 def test_release_and_retry_fault_before_open_does_not_open_gripper(node):
     node.safety_state = SafetyState.FAULT
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
     node._call_move_service = lambda **kw: calls.append(('move', kw)) or True
     gh = FakeGoalHandle(_goal('release_and_retry'))
 
@@ -294,57 +409,20 @@ def test_dispatch_routes_move_named(node):
     assert result.success is True
 
 
-def test_dispatch_routes_place_down_to_move_named_handler(node):
-    node._call_move_service = lambda **kw: True
-    gh = FakeGoalHandle(_goal('place_down', named_target='place_down'))
+def test_goal_callback_rejects_move_pose_as_unknown_task_type(node):
+    # move_pose는 안 쓰는 코드로 정리되어 더 이상 지원하지 않는다 - 알 수 없는
+    # task_type으로 거부되어야 한다.
+    response = node._goal_callback(_goal('move_pose'))
 
-    result = node._execute_callback(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
+    assert response == GoalResponse.REJECT
 
 
-# ---- move_pose ----
+def test_goal_callback_rejects_place_down_as_unknown_task_type(node):
+    # place_down은 task_manager가 더 이상 사용하지 않기로 해 정리되었다 - 알 수
+    # 없는 task_type으로 거부되어야 한다.
+    response = node._goal_callback(_goal('place_down', named_target='place_down'))
 
-def test_move_pose_success(node):
-    node._call_move_service = lambda **kw: True
-    gh = FakeGoalHandle(_pose_goal())
-
-    result = node._execute_move_pose(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
-
-
-def test_move_pose_failure(node):
-    node._call_move_service = lambda **kw: False
-    gh = FakeGoalHandle(_pose_goal())
-
-    result = node._execute_move_pose(gh)
-
-    assert gh.aborted is True
-    assert result.success is False
-
-
-def test_move_pose_canceled_calls_canceled_not_abort(node):
-    node._call_move_service = lambda **kw: False
-    gh = FakeGoalHandle(_pose_goal())
-    gh.is_cancel_requested = True
-
-    result = node._execute_move_pose(gh)
-
-    assert gh.was_canceled is True
-    assert gh.aborted is False
-
-
-def test_dispatch_routes_move_pose(node):
-    node._call_move_service = lambda **kw: True
-    gh = FakeGoalHandle(_pose_goal())
-
-    result = node._execute_callback(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
+    assert response == GoalResponse.REJECT
 
 
 # ---- goal_callback / cancel_callback (Action 취소 계약) ----
@@ -408,6 +486,537 @@ def test_cancel_callback_always_accepts(node):
     assert node._cancel_callback(object()) == CancelResponse.ACCEPT
 
 
+# ---- TCP 위치 캐시 읽기 (_get_current_tcp_posx) ----
+
+def test_get_current_tcp_posx_none_when_hardware_disabled(node):
+    # hardware_enabled=false(dry_run)에서는 캐시를 읽지 않고 항상 None을 반환한다.
+    assert node.hardware_enabled is False
+    node._tcp_pose_cache = {'pos6': [1.0] * 6, 'received_at': time.monotonic()}
+
+    assert node._get_current_tcp_posx() is None
+
+
+def test_get_current_tcp_posx_none_when_cache_empty(node):
+    node.hardware_enabled = True
+    node._tcp_pose_cache = None
+
+    assert node._get_current_tcp_posx() is None
+
+
+def test_get_current_tcp_posx_returns_fresh_cache(node):
+    node.hardware_enabled = True
+    node._tcp_pose_cache = {
+        'pos6': [100.0, 200.0, 300.0, 0.0, 90.0, 0.0],
+        'received_at': time.monotonic(),
+    }
+
+    assert node._get_current_tcp_posx() == [100.0, 200.0, 300.0, 0.0, 90.0, 0.0]
+
+
+def test_get_current_tcp_posx_rejects_stale_cache(node, monkeypatch):
+    import time as time_module
+    clock = {'t': 0.0}
+    monkeypatch.setattr(time_module, 'monotonic', lambda: clock['t'])
+
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('servo_pick.tcp_pose_max_age_s', value=0.1)])
+    node._tcp_pose_cache = {'pos6': [100.0, 200.0, 300.0, 0.0, 0.0, 0.0], 'received_at': 0.0}
+
+    clock['t'] = 1.0  # max_age_s(0.1s)를 훌쩍 넘겨 캐시가 오래된 상황을 시뮬레이션
+
+    assert node._get_current_tcp_posx() is None
+
+
+# ---- TCP 위치 캐시 갱신 (_on_tcp_pose_refresh_timer) - 과부하 방지 ----
+
+def test_tcp_pose_refresh_timer_does_nothing_when_hardware_disabled(node):
+    calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            calls.append(True)
+            return [1.0] * 6
+
+    node._doosan = _FakeDoosan()  # hardware_enabled은 기본값 False로 유지
+
+    node._on_tcp_pose_refresh_timer()
+
+    assert calls == []
+    assert node._tcp_pose_cache is None
+
+
+def test_tcp_pose_refresh_timer_skips_when_servo_pick_not_active(node):
+    calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            calls.append(True)
+            return [1.0] * 6
+
+    node.hardware_enabled = True
+    node._doosan = _FakeDoosan()
+    node._tcp_tracking_active = False
+
+    node._on_tcp_pose_refresh_timer()
+
+    assert calls == []
+
+
+def test_tcp_pose_refresh_timer_skips_when_not_normal(node):
+    calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            calls.append(True)
+            return [1.0] * 6
+
+    node.hardware_enabled = True
+    node._doosan = _FakeDoosan()
+    node._tcp_tracking_active = True
+    node.safety_state = SafetyState.FAULT
+
+    node._on_tcp_pose_refresh_timer()
+
+    assert calls == []  # Fault 중에는 새 조회를 시작하지 않는다
+
+
+def test_tcp_pose_refresh_timer_updates_cache_on_success(node):
+    node.hardware_enabled = True
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [10.0, 20.0, 30.0, 0.0, 0.0, 0.0]
+
+    node._doosan = _FakeDoosan()
+    node._tcp_tracking_active = True
+
+    node._on_tcp_pose_refresh_timer()
+
+    assert node._tcp_pose_cache['pos6'] == [10.0, 20.0, 30.0, 0.0, 0.0, 0.0]
+    assert node._get_current_tcp_posx() == [10.0, 20.0, 30.0, 0.0, 0.0, 0.0]
+
+
+def test_tcp_pose_refresh_timer_does_not_reuse_stale_value_after_failed_lookup(node):
+    # 이전에 성공한 캐시가 있는 상태에서 이후 조회가 계속 실패하면, 캐시를 그대로
+    # 두어(덮어쓰지 않아) 나이가 계속 늘어나고 결국 _get_current_tcp_posx가 거부하게
+    # 한다 - 실패를 성공한 것처럼 새로 반영하지 않는다.
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('servo_pick.tcp_pose_max_age_s', value=0.0)])
+    node._tcp_tracking_active = True
+
+    class _FailingDoosan:
+        def get_current_posx(self, ref=0):
+            return None  # 서비스 미준비/timeout/success=false 등
+
+    node._doosan = _FailingDoosan()
+    node._tcp_pose_cache = {'pos6': [1.0] * 6, 'received_at': time.monotonic()}
+
+    node._on_tcp_pose_refresh_timer()
+
+    # max_age_s=0.0이므로 이미 존재하던 캐시도 신선하지 않다고 거부되어야 한다
+    # (실패한 조회가 캐시를 새로 신선하게 만들지 않았음을 함께 증명한다).
+    assert node._get_current_tcp_posx() is None
+
+
+def test_tcp_pose_refresh_timer_serializes_overlapping_requests(node):
+    # ToolTrack이 겹쳐 들어와도(예: 타이머가 재진입) 이미 요청이 진행 중이면 새
+    # GetCurrentPosx 호출을 겹쳐서 시작하지 않는다.
+    calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            calls.append(True)
+            # 요청이 아직 "진행 중"인 것처럼 재진입을 시도한다.
+            node._on_tcp_pose_refresh_timer()
+            return [1.0] * 6
+
+    node.hardware_enabled = True
+    node._doosan = _FakeDoosan()
+    node._tcp_tracking_active = True
+
+    node._on_tcp_pose_refresh_timer()
+
+    assert len(calls) == 1  # 재진입 시도는 in_flight 플래그로 걸러져 겹치지 않는다
+
+
+def test_servo_pick_execution_sets_and_clears_tcp_tracking_active(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._servo_pick_tick = lambda: ('CLOSE', None)
+    node.servo_loop.get_state = lambda: 'closing'
+    node.servo_loop.start = lambda *a, **k: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: True
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
+    node.rg2_client.get_state = lambda: (30.0, True)
+
+    observed_during_execution = {'active': None}
+
+    def fake_tick():
+        observed_during_execution['active'] = node._tcp_tracking_active
+        return ('CLOSE', None)
+
+    node._servo_pick_tick = fake_tick
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    assert node._tcp_tracking_active is False
+    node._execute_servo_pick(gh)
+
+    assert observed_during_execution['active'] is True  # 실행 중에는 True였다
+    assert node._tcp_tracking_active is False  # 종료 후에는 반드시 해제된다
+
+
+# ---- base_link ToolTrack -> TCP 오차 계산 (_compute_tool_track_tcp_offset) ----
+
+def _tool_track(frame_id='base_link', x=1.5, y=0.2, z=0.4):
+    msg = ToolTrack()
+    msg.header.frame_id = frame_id
+    msg.tool_class = 'spanner'
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.position.z = z
+    msg.pose.orientation.w = 1.0
+    msg.depth_valid = True
+    msg.approaching = True
+    msg.confidence = 0.9
+    return msg
+
+
+def test_compute_tool_track_tcp_offset_computes_object_minus_tcp(node):
+    node._get_current_tcp_posx = lambda: [500.0, 200.0, 400.0, 0.0, 90.0, 0.0]  # mm
+
+    offset = node._compute_tool_track_tcp_offset(_tool_track(x=1.5, y=0.2, z=0.4))
+
+    assert offset is not None
+    # TCP(mm) -> m 변환: 0.5, 0.2, 0.4. object(1.5, 0.2, 0.4) - tcp(0.5, 0.2, 0.4)
+    assert offset.pose.position.x == pytest.approx(1.0)
+    assert offset.pose.position.y == pytest.approx(0.0)
+    assert offset.pose.position.z == pytest.approx(0.0)
+
+
+def test_compute_tool_track_tcp_offset_rejects_wrong_frame_id(node):
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    assert node._compute_tool_track_tcp_offset(_tool_track(frame_id='camera_link')) is None
+
+
+@pytest.mark.parametrize('x,y,z', [
+    (float('nan'), 0.2, 0.4),
+    (1.5, float('inf'), 0.4),
+    (1.5, 0.2, float('-inf')),
+])
+def test_compute_tool_track_tcp_offset_rejects_nan_inf_position(node, x, y, z):
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    assert node._compute_tool_track_tcp_offset(_tool_track(x=x, y=y, z=z)) is None
+
+
+def test_compute_tool_track_tcp_offset_returns_none_when_tcp_lookup_fails(node):
+    node._get_current_tcp_posx = lambda: None
+
+    assert node._compute_tool_track_tcp_offset(_tool_track()) is None
+
+
+def test_on_tool_track_during_servo_ignores_message_when_offset_computation_fails(node):
+    node._compute_tool_track_tcp_offset = lambda msg: None
+    received = []
+    node.servo_loop.on_tool_track = lambda msg: received.append(msg)
+
+    node._on_tool_track_during_servo(_tool_track())
+
+    assert received == []
+
+
+def test_on_tool_track_during_servo_forwards_computed_offset_to_servo_loop(node):
+    computed = _tool_track()
+    node._compute_tool_track_tcp_offset = lambda msg: computed
+    received = []
+    node.servo_loop.on_tool_track = lambda msg: received.append(msg)
+
+    node._on_tool_track_during_servo(_tool_track())
+
+    assert received == [computed]
+
+
+# ---- 작업자 손 위치 -> TCP 오차 계산 (_compute_hand_pose_tcp_offset) ----
+
+def _hand_pose_msg(frame_id='base_link', x=1.5, y=0.2, z=0.4):
+    msg = PoseStamped()
+    msg.header.frame_id = frame_id
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.position.z = z
+    msg.pose.orientation.w = 1.0
+    return msg
+
+
+def test_compute_hand_pose_tcp_offset_computes_hand_minus_tcp(node):
+    node._get_current_tcp_posx = lambda: [500.0, 200.0, 400.0, 0.0, 90.0, 0.0]  # mm
+
+    offset = node._compute_hand_pose_tcp_offset(_hand_pose_msg(x=1.5, y=0.2, z=0.4))
+
+    assert offset is not None
+    assert offset.pose.position.x == pytest.approx(1.0)
+    assert offset.pose.position.y == pytest.approx(0.0)
+    assert offset.pose.position.z == pytest.approx(0.0)
+
+
+def test_compute_hand_pose_tcp_offset_rejects_wrong_frame_id(node):
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg(frame_id='camera_link')) is None
+
+
+@pytest.mark.parametrize('x,y,z', [
+    (float('nan'), 0.2, 0.4),
+    (1.5, float('inf'), 0.4),
+    (1.5, 0.2, float('-inf')),
+])
+def test_compute_hand_pose_tcp_offset_rejects_nan_inf_position(node, x, y, z):
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg(x=x, y=y, z=z)) is None
+
+
+def test_compute_hand_pose_tcp_offset_returns_none_when_tcp_lookup_fails(node):
+    node._get_current_tcp_posx = lambda: None
+
+    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg()) is None
+
+
+def test_on_hand_pose_during_approach_ignores_message_when_offset_computation_fails(node):
+    node._compute_hand_pose_tcp_offset = lambda msg: None
+    received = []
+    node.hand_approach_servo.on_hand_pose = lambda msg: received.append(msg)
+
+    node._on_hand_pose_during_approach(_hand_pose_msg())
+
+    assert received == []
+
+
+def test_on_hand_pose_during_approach_forwards_computed_offset(node):
+    computed = _hand_pose_msg()
+    node._compute_hand_pose_tcp_offset = lambda msg: computed
+    received = []
+    node.hand_approach_servo.on_hand_pose = lambda msg: received.append(msg)
+
+    node._on_hand_pose_during_approach(_hand_pose_msg())
+
+    assert received == [computed]
+
+
+# ---- handover_approach RT 발행 직전 마지막 안전 검사 ----
+
+def test_validate_handover_approach_command_rejects_nan_inf(node):
+    assert node._validate_handover_approach_command(ServoCommand(vx=float('nan'))) is False
+
+
+def test_validate_handover_approach_command_rejects_over_v_max(node):
+    node.set_parameters([Parameter('handover_approach.v_max', value=0.1)])
+
+    assert node._validate_handover_approach_command(ServoCommand(vx=0.5)) is False
+
+
+def test_validate_handover_approach_command_accepts_within_limits(node):
+    node.set_parameters([Parameter('handover_approach.v_max', value=0.2)])
+
+    assert node._validate_handover_approach_command(ServoCommand(vx=0.1, vy=-0.1, vz=0.05)) is True
+
+
+# ---- handover_approach tick ----
+
+def test_handover_approach_tick_continue(node):
+    node.hand_approach_servo.should_abort = lambda: None
+    node.hand_approach_servo.should_stop = lambda: False
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'CONTINUE'
+    assert reason is None
+
+
+def test_handover_approach_tick_stop(node):
+    node.hand_approach_servo.should_abort = lambda: None
+    node.hand_approach_servo.should_stop = lambda: True
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'STOP'
+
+
+def test_handover_approach_tick_abort(node):
+    node.hand_approach_servo.should_abort = lambda: 'diverged'
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'ABORT'
+    assert reason == 'diverged'
+
+
+# ---- handover_approach goal 거부 (hardware_ready 게이트) ----
+
+def test_goal_callback_rejects_handover_approach_when_hardware_ready_false(node):
+    node.hardware_enabled = True
+
+    response = node._goal_callback(_goal('handover_approach'))
+
+    assert response == GoalResponse.REJECT
+
+
+def test_goal_callback_accepts_handover_approach_in_dry_run(node):
+    assert node.hardware_enabled is False
+
+    response = node._goal_callback(_goal('handover_approach'))
+
+    assert response == GoalResponse.ACCEPT
+
+
+# ---- handover_approach 실행 (성공/취소/예외) ----
+
+def test_execute_handover_approach_rejected_when_hardware_ready_false(node):
+    node.hardware_enabled = True
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_execute_handover_approach_success_stops_without_gripper_action(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    ticks = iter(['CONTINUE', 'CONTINUE', 'STOP'])
+    node._handover_approach_tick = lambda: (next(ticks), None)
+    node.hand_approach_servo.step = lambda: ServoCommand()
+    node.hand_approach_servo.get_state = lambda: 'tracking'
+    node.hand_approach_servo.start = lambda: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: True
+
+    rg2_calls = []
+    node.rg2_client.open = lambda goal_handle=None: rg2_calls.append('open') or True
+    node.rg2_client.close = lambda width, force, goal_handle=None: rg2_calls.append('close') or True
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert rg2_calls == []  # 그리퍼 동작은 전혀 하지 않는다
+    assert len(gh.feedback_msgs) == 3
+
+
+def test_execute_handover_approach_aborts_on_abort_reason(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._handover_approach_tick = lambda: ('ABORT', 'lost')
+    node.hand_approach_servo.get_state = lambda: 'tracking'
+    node.hand_approach_servo.start = lambda: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: True
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert result.message == 'lost'
+
+
+def test_execute_handover_approach_cancel_mid_loop_calls_canceled_and_closes_rt_session(
+        node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node._handover_approach_tick = lambda: ('CONTINUE', None)
+    node.hand_approach_servo.step = lambda: ServoCommand()
+    node.hand_approach_servo.get_state = lambda: 'tracking'
+    node.hand_approach_servo.start = lambda: None
+    node._open_rt_session = lambda: None
+    rt_closed = []
+    node._close_rt_session = lambda: rt_closed.append(True) or True
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+    gh.is_cancel_requested = True
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+    assert rt_closed == [True]
+
+
+def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
+    node.safety_state = SafetyState.FAULT
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_execute_handover_approach_sets_and_clears_tcp_tracking_active(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    observed = {'active': None}
+
+    def fake_tick():
+        observed['active'] = node._tcp_tracking_active
+        return ('STOP', None)
+
+    node._handover_approach_tick = fake_tick
+    node.hand_approach_servo.get_state = lambda: 'arrived'
+    node.hand_approach_servo.start = lambda: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: True
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    assert node._tcp_tracking_active is False
+    node._execute_handover_approach(gh)
+
+    assert observed['active'] is True
+    assert node._tcp_tracking_active is False
+
+
+# ---- SpeedlRtStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----
+
+def test_validate_servo_command_rejects_nan_inf(node):
+    assert node._validate_servo_command(ServoCommand(vx=float('nan'))) is False
+    assert node._validate_servo_command(ServoCommand(vy=float('inf'))) is False
+
+
+def test_validate_servo_command_rejects_over_v_max(node):
+    v_max = node.get_parameter('servo.v_max').value
+    assert node._validate_servo_command(ServoCommand(vx=v_max * 10)) is False
+
+
+def test_validate_servo_command_rejects_over_descend_speed(node):
+    descend_speed = node.get_parameter('servo.descend_speed').value
+    assert node._validate_servo_command(ServoCommand(vz=-descend_speed * 10)) is False
+
+
+def test_validate_servo_command_accepts_within_limits(node):
+    v_max = node.get_parameter('servo.v_max').value
+    descend_speed = node.get_parameter('servo.descend_speed').value
+    cmd = ServoCommand(vx=v_max * 0.5, vy=-v_max * 0.5, vz=-descend_speed, yaw_rate=v_max * 0.5)
+
+    assert node._validate_servo_command(cmd) is True
+
+
 # ---- servo_pick ----
 
 def test_servo_pick_tick_continue(node):
@@ -448,9 +1057,8 @@ def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monk
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
-    node._estimate_payload = lambda: 0.31
-    node.rg2_client.close = lambda width, force: None
+    node._close_rt_session = lambda: True
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (29.4, True)
 
     gh = FakeGoalHandle(_goal('servo_pick'))
@@ -462,10 +1070,42 @@ def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monk
 
     assert gh.succeeded is True
     assert result.success is True
-    assert result.measured_payload_kg == 0.31
     assert result.final_width_mm == 29.4
     assert result.grip_detected is True
     assert len(gh.feedback_msgs) == 3
+
+
+def test_servo_pick_rg2_canceled_during_close_ends_as_canceled_not_fault(node, monkeypatch):
+    # RG2 close의 busy 대기 "도중"에 취소가 확인된 경우(last_status=CANCELED)에도
+    # FAULT가 아니라 기존 cleanup 경로(_finish_cancel)를 통해 canceled()로 끝나야 한다.
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    ticks = iter(['CONTINUE', 'CLOSE'])
+    node._servo_pick_tick = lambda: (next(ticks), None)
+    node.servo_loop.step = lambda: None
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+    node._open_rt_session = lambda: None
+    node._close_rt_session = lambda: True
+
+    def _fake_close(width, force, goal_handle=None):
+        node.rg2_client.last_status = RG2Status.CANCELED
+        return False
+
+    node.rg2_client.close = _fake_close
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.NORMAL  # FAULT로 처리되지 않았다
 
 
 def test_servo_pick_rt_cleanup_failure_after_grasp_blocks_success(node, monkeypatch):
@@ -478,7 +1118,7 @@ def test_servo_pick_rt_cleanup_failure_after_grasp_blocks_success(node, monkeypa
     node.servo_loop.start = lambda *a, **k: None
     node._open_rt_session = lambda: None
     node._close_rt_session = lambda: (_ for _ in ()).throw(RuntimeError('rt close boom'))
-    node.rg2_client.close = lambda width, force: None
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
     gh = FakeGoalHandle(_goal('servo_pick'))
@@ -503,7 +1143,7 @@ def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
+    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -525,7 +1165,7 @@ def test_execute_servo_pick_cancel_mid_loop_calls_canceled_and_closes_rt_session
     node.servo_loop.start = lambda *a, **k: None
     rt_closed = []
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: rt_closed.append(True)
+    node._close_rt_session = lambda: rt_closed.append(True) or True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -650,6 +1290,36 @@ def test_servo_pick_cancel_aborts_as_fault_when_rt_close_raises(node, monkeypatc
     assert node.safety_state == SafetyState.FAULT
 
 
+def test_servo_pick_cancel_aborts_as_fault_when_rt_close_response_unsuccessful(node, monkeypatch):
+    """필수 테스트: RT 종료(StopRtControl/DisconnectRtControl) 응답이 예외 없이
+    success=false인 경우도 실패로 취급한다(예전처럼 응답을 확인하지 않고 조용히
+    성공 취급하지 않는다)."""
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
+    fake = _FakeDoosanDriver()
+    fake.close_rt_session_should_fail = True
+    node._doosan = fake
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+    gh.is_cancel_requested = True
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.was_canceled is False
+    assert gh.aborted is True
+    assert _terminal_call_count(gh) == 1
+    assert result.success is False
+    assert node.safety_state == SafetyState.FAULT
+
+
 def test_cleanup_destroy_subscription_catches_exception(node):
     def _raise_destroy(sub):
         raise RuntimeError('destroy_subscription boom')
@@ -665,7 +1335,7 @@ def test_servo_pick_cancel_aborts_as_fault_when_subscription_removal_fails(node,
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
     node._open_rt_session = lambda: True
-    node._close_rt_session = lambda: None
+    node._close_rt_session = lambda: True
     # 실제 destroy_subscription을 건드리지 않고(테스트 종료 시 node.destroy_node()가
     # 남은 구독을 정리하려다 다시 실패하는 것을 피하기 위해) 정리 경계 wrapper만
     # 실패하도록 대체한다.
@@ -707,9 +1377,9 @@ def test_execute_servo_pick_cancel_right_before_closing_gripper_does_not_close(n
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
+    node._close_rt_session = lambda: True
     closed = []
-    node.rg2_client.close = lambda width, force: closed.append((width, force))
+    node.rg2_client.close = lambda width, force, goal_handle=None: closed.append((width, force))
 
     result = node._execute_servo_pick(gh)
 
@@ -739,7 +1409,7 @@ def test_execute_servo_pick_fault_right_before_closing_gripper_does_not_close(no
     node._open_rt_session = lambda: None
     node._close_rt_session = lambda: None
     closed = []
-    node.rg2_client.close = lambda width, force: closed.append((width, force))
+    node.rg2_client.close = lambda width, force, goal_handle=None: closed.append((width, force))
 
     result = node._execute_servo_pick(gh)
 
@@ -757,7 +1427,7 @@ def test_servo_pick_aborts_on_tracking_loss(node, monkeypatch):
                                  eps_descend=0.015, eps_grasp=0.005, n_stable=3,
                                  dt_latency=0.05, timeout_s=5.0, t_lost_s=0.0)
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
+    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -792,9 +1462,8 @@ def test_dispatch_routes_servo_pick(node, monkeypatch):
     node.servo_loop.get_state = lambda: 'closing'
     node.servo_loop.start = lambda *a, **k: None
     node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
-    node._estimate_payload = lambda: 0.3
-    node.rg2_client.close = lambda width, force: None
+    node._close_rt_session = lambda: True
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
     gh = FakeGoalHandle(_goal('servo_pick'))
@@ -834,7 +1503,7 @@ def test_servo_pick_dry_run_still_works_when_hardware_disabled(node, monkeypatch
     node._servo_pick_tick = lambda: ('CLOSE', None)
     node.servo_loop.start = lambda *a, **k: None
     node.servo_loop.get_state = lambda: 'closing'
-    node.rg2_client.close = lambda width, force: None
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
     gh = FakeGoalHandle(_goal('servo_pick'))
@@ -884,7 +1553,7 @@ def test_servo_pick_publishes_speedl_only_when_hardware_ready_and_rt_confirmed(n
     node.servo_loop.step = lambda: ServoCommand(vx=0.1)
     node.servo_loop.start = lambda *a, **k: None
     node.servo_loop.get_state = lambda: 'closing'
-    node.rg2_client.close = lambda width, force: None
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
     gh = FakeGoalHandle(_goal('servo_pick'))
@@ -914,7 +1583,7 @@ def test_handover_hold_releases_on_pull_detected(node, monkeypatch):
     node._disable_compliance = lambda: None
     node._is_pull_detected = lambda state: True
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
 
     gh = FakeGoalHandle(_goal('handover_hold'))
 
@@ -938,7 +1607,7 @@ def test_handover_hold_compliance_disable_failure_blocks_rg2_open(node, monkeypa
     node._disable_compliance = lambda: (_ for _ in ()).throw(RuntimeError('compliance boom'))
     node._is_pull_detected = lambda state: True
     opened = []
-    node.rg2_client.open = lambda: opened.append(True)
+    node.rg2_client.open = lambda goal_handle=None: opened.append(True)
 
     gh = FakeGoalHandle(_goal('handover_hold'))
 
@@ -952,6 +1621,35 @@ def test_handover_hold_compliance_disable_failure_blocks_rg2_open(node, monkeypa
     assert node.safety_state == SafetyState.FAULT
 
 
+def test_handover_hold_rg2_canceled_during_open_ends_as_canceled_not_fault(node, monkeypatch):
+    # RG2 open의 busy 대기 "도중"에 취소가 확인된 경우(last_status=CANCELED)에도
+    # FAULT가 아니라 기존 cleanup 경로(_finish_cancel)를 통해 canceled()로 끝나야 한다.
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.set_parameters([Parameter('handover_hold.pull_confirm_samples', value=1)])
+    node._latest_robot_state = {'received_at': time.monotonic(), 'sample_seq': 1}
+    node._is_fresh_robot_state = lambda state, since, max_age: True
+    node._enable_compliance = lambda: None
+    node._disable_compliance = lambda: None
+    node._is_pull_detected = lambda state: True
+
+    def _fake_open(goal_handle=None):
+        node.rg2_client.last_status = RG2Status.CANCELED
+        return False
+
+    node.rg2_client.open = _fake_open
+
+    gh = FakeGoalHandle(_goal('handover_hold'))
+
+    result = node._execute_handover_hold(gh)
+
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.NORMAL  # FAULT로 처리되지 않았다
+
+
 def test_handover_hold_canceled_does_not_open_gripper(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
@@ -961,7 +1659,7 @@ def test_handover_hold_canceled_does_not_open_gripper(node, monkeypatch):
     node._disable_compliance = lambda: None
     node._is_pull_detected = lambda state: False
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     gh.is_cancel_requested = True
@@ -982,7 +1680,7 @@ def test_handover_hold_fault_mid_loop_does_not_open_gripper(node, monkeypatch):
     node._disable_compliance = lambda: None
     node._is_pull_detected = lambda state: False
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
     node.safety_state = SafetyState.FAULT
 
     gh = FakeGoalHandle(_goal('handover_hold'))
@@ -1012,7 +1710,7 @@ def test_handover_hold_cancel_after_pull_confirmed_does_not_open_gripper(node, m
 
     node._is_pull_detected = is_pull_detected
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
 
     result = node._execute_handover_hold(gh)
 
@@ -1039,7 +1737,7 @@ def test_handover_hold_fault_after_pull_confirmed_does_not_open_gripper(node, mo
 
     node._is_pull_detected = is_pull_detected
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
 
     result = node._execute_handover_hold(gh)
 
@@ -1076,7 +1774,7 @@ def test_handover_hold_cancel_aborts_as_fault_when_move_stop_returns_false(node)
     node._enable_compliance = lambda: None
     node._disable_compliance = lambda: None
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
     published = []
     node.pub_fault.publish = published.append
 
@@ -1099,7 +1797,7 @@ def test_handover_hold_cancel_aborts_as_fault_when_compliance_disable_raises(nod
     node._enable_compliance = lambda: None
     node._disable_compliance = lambda: (_ for _ in ()).throw(RuntimeError('compliance boom'))
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     gh.is_cancel_requested = True
@@ -1199,7 +1897,7 @@ def test_handover_hold_requires_consecutive_pull_samples(node, monkeypatch):
     pattern = iter([True, True, False, True, True, True])
     node._is_pull_detected = lambda state: next(pattern)
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     poll_count = {'n': 0}
@@ -1236,7 +1934,7 @@ def test_handover_hold_distinct_new_samples_required_to_open(node, monkeypatch):
 
     node._is_pull_detected = is_pull_detected
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     poll_count = {'n': 0}
@@ -1277,7 +1975,7 @@ def test_handover_hold_same_sample_seq_counted_only_once(node, monkeypatch):
 
     node._is_pull_detected = is_pull_detected
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     poll_count = {'n': 0}
@@ -1321,7 +2019,7 @@ def test_handover_hold_stale_sample_does_not_confirm_pull(node, monkeypatch):
     node._latest_robot_state = {'received_at': 0.01, 'sample_seq': 1}
     node._is_pull_detected = lambda state: True
     calls = []
-    node.rg2_client.open = lambda: calls.append('open')
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open')
 
     poll_count = {'n': 0}
 
@@ -1361,7 +2059,7 @@ def test_handover_hold_stale_sample_resets_pull_count_to_zero(node, monkeypatch)
 
     node._is_pull_detected = is_pull_detected
     opened = []
-    node.rg2_client.open = lambda: opened.append(True)
+    node.rg2_client.open = lambda goal_handle=None: opened.append(True)
 
     gh = FakeGoalHandle(_goal('handover_hold'))
     step = {'n': 0}
@@ -1400,7 +2098,7 @@ def test_dispatch_routes_handover_hold(node, monkeypatch):
     node._enable_compliance = lambda: None
     node._disable_compliance = lambda: None
     node._is_pull_detected = lambda state: True
-    node.rg2_client.open = lambda: None
+    node.rg2_client.open = lambda goal_handle=None: True
 
     gh = FakeGoalHandle(_goal('handover_hold'))
 
@@ -1496,7 +2194,7 @@ def test_default_handover_hold_ref_is_base(node):
 
 def test_state_poll_timer_never_opens_gripper(node):
     opened = []
-    node.rg2_client.open = lambda: opened.append(True)
+    node.rg2_client.open = lambda goal_handle=None: opened.append(True)
     node._read_robot_state = lambda: {
         'robot_state': DoosanRobotState.STANDBY, 'ext_torque': [0.0] * 6,
         'tool_force': [0.0, 0.0, 100.0, 0.0, 0.0, 0.0]}

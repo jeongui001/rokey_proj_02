@@ -4,7 +4,7 @@ import pytest
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import Qt
 
-from operator_gui.main_window import MainWindow
+from operator_gui.main_window import DEFAULT_CAMERA_STALE_TIMEOUT_S, MainWindow
 
 
 class _FakeRosClient:
@@ -92,6 +92,11 @@ def test_task_state_change_is_logged_but_first_report_is_not(window, qtbot):
     ('reset_button', '리셋'),
 ])
 def test_fixed_command_buttons_publish_expected_text(window, qtbot, button_attr, expected_text):
+    # 초기 /task/status를 받기 전에는 이동/모드 버튼이 비활성화되므로, 먼저 정상
+    # 상태(MANUAL/NORMAL/IDLE)를 수신한 것으로 시뮬레이션한다.
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+
     button = getattr(window, button_attr)
     qtbot.mouseClick(button, Qt.LeftButton)
 
@@ -128,6 +133,8 @@ def test_command_blocked_when_not_connected(qtbot):
     win = MainWindow(ros_client)
     qtbot.addWidget(win)
     win.show()
+    with qtbot.waitSignal(win.task_status_received, timeout=1000):
+        win.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
 
     qtbot.mouseClick(win.home_button, Qt.LeftButton)
 
@@ -158,6 +165,26 @@ def test_fault_banner_shows_message(window, qtbot):
 
     assert window.fault_banner.isVisible()
     assert 'torque anomaly' in window.fault_banner.text()
+
+
+def test_fault_immediately_disables_move_and_mode_buttons_without_waiting_for_status(window, qtbot):
+    # 1) MANUAL/NORMAL/IDLE로 pose 버튼이 활성화된 상태를 준비한다.
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+    assert window.home_button.isEnabled() is True
+    assert window.auto_button.isEnabled() is True
+
+    # 2) /task/status 추가 메시지 없이 /robot/fault만 직접 수신한다.
+    with qtbot.waitSignal(window.fault_received, timeout=1000):
+        window.ros_client.on_fault('torque anomaly')
+
+    # 3) 다음 /task/status를 기다리지 않고 즉시 이동/모드 버튼이 비활성화되어야 한다.
+    for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
+                 'up_button', 'down_button', 'watch_button'):
+        assert getattr(window, attr).isEnabled() is False, attr
+    # 4) STOP/RESET은 그대로 활성 상태를 유지한다.
+    assert window.stop_button.isEnabled() is True
+    assert window.reset_button.isEnabled() is True
 
 
 def test_fault_banner_persists_until_normal_status_received(window, qtbot):
@@ -270,6 +297,164 @@ def test_camera_image_from_background_thread_updates_ui_via_signal(window, qtbot
 def test_ui_works_without_camera_image(window):
     # Vision 토픽이 아직 없어도 UI는 정상적으로 뜬다.
     assert window.camera_label.text() == '카메라 대기 중...'
+
+
+# ---- 카메라 영상 끊김 표시/복구 ----
+
+def test_camera_shows_stale_message_after_timeout(window, qtbot):
+    with qtbot.waitSignal(window.camera_image_received, timeout=1000):
+        window.ros_client.on_camera_image(_png_bytes())
+    assert not window.camera_label.pixmap().isNull()
+
+    window.camera_stale_timeout_s = 0.01
+    window._last_camera_image_at -= 1.0  # 시간이 흐른 것처럼 시뮬레이션
+
+    window._check_camera_stale()
+
+    assert window._camera_stale is True
+    assert window.camera_label.text() == '카메라 영상이 멈췄습니다.'
+
+
+def test_camera_stale_check_does_not_fire_before_any_image_received(window):
+    # 아직 한 번도 영상을 받지 못한 상태에서는 "대기 중..." 문구를 그대로 유지한다.
+    window.camera_stale_timeout_s = 0.01
+
+    window._check_camera_stale()
+
+    assert window._camera_stale is False
+    assert window.camera_label.text() == '카메라 대기 중...'
+
+
+def test_camera_recovers_automatically_after_new_image(window, qtbot):
+    window.camera_stale_timeout_s = 0.01
+    with qtbot.waitSignal(window.camera_image_received, timeout=1000):
+        window.ros_client.on_camera_image(_png_bytes())
+    window._last_camera_image_at -= 1.0
+    window._check_camera_stale()
+    assert window._camera_stale is True
+
+    with qtbot.waitSignal(window.camera_image_received, timeout=1000):
+        window.ros_client.on_camera_image(_png_bytes())
+
+    assert window._camera_stale is False
+    assert not window.camera_label.pixmap().isNull()
+
+
+def test_camera_stale_timeout_from_env_var(monkeypatch, qtbot):
+    monkeypatch.setenv('OPERATOR_GUI_CAMERA_STALE_TIMEOUT_S', '5.5')
+    ros_client = _FakeRosClient()
+    win = MainWindow(ros_client)
+    qtbot.addWidget(win)
+
+    assert win.camera_stale_timeout_s == 5.5
+
+
+def test_camera_stale_timeout_constructor_arg_overrides_env(monkeypatch, qtbot):
+    monkeypatch.setenv('OPERATOR_GUI_CAMERA_STALE_TIMEOUT_S', '5.5')
+    ros_client = _FakeRosClient()
+    win = MainWindow(ros_client, camera_stale_timeout_s=0.3)
+    qtbot.addWidget(win)
+
+    assert win.camera_stale_timeout_s == 0.3
+
+
+# ---- camera_stale_timeout_s 잘못된 입력값 방어 (finite 양수만 허용) ----
+
+@pytest.mark.parametrize('bad_env_value', ['not-a-number', 'nan', 'inf', '0', '-1.0'])
+def test_camera_stale_timeout_falls_back_to_default_on_invalid_env_var(
+        monkeypatch, qtbot, bad_env_value):
+    monkeypatch.setenv('OPERATOR_GUI_CAMERA_STALE_TIMEOUT_S', bad_env_value)
+    ros_client = _FakeRosClient()
+
+    win = MainWindow(ros_client)  # 잘못된 환경변수 하나 때문에 죽지 않아야 한다
+    qtbot.addWidget(win)
+
+    assert win.camera_stale_timeout_s == DEFAULT_CAMERA_STALE_TIMEOUT_S
+
+
+@pytest.mark.parametrize('bad_value', [float('nan'), float('inf'), 0.0, -1.0])
+def test_camera_stale_timeout_falls_back_to_default_on_invalid_constructor_arg(
+        qtbot, bad_value):
+    ros_client = _FakeRosClient()
+
+    win = MainWindow(ros_client, camera_stale_timeout_s=bad_value)
+    qtbot.addWidget(win)
+
+    assert win.camera_stale_timeout_s == DEFAULT_CAMERA_STALE_TIMEOUT_S
+
+
+def test_camera_stale_timeout_accepts_valid_positive_value(qtbot):
+    ros_client = _FakeRosClient()
+
+    win = MainWindow(ros_client, camera_stale_timeout_s=1.5)
+    qtbot.addWidget(win)
+
+    assert win.camera_stale_timeout_s == 1.5
+
+
+# ---- 상태에 따른 버튼 활성화 정책 (UI 편의 기능) ----
+
+def test_move_and_mode_buttons_disabled_before_initial_status(qtbot):
+    ros_client = _FakeRosClient()
+    win = MainWindow(ros_client)
+    qtbot.addWidget(win)
+    win.show()
+
+    for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
+                 'up_button', 'down_button', 'watch_button'):
+        assert getattr(win, attr).isEnabled() is False, attr
+    assert win.stop_button.isEnabled() is True
+    assert win.reset_button.isEnabled() is True
+
+
+@pytest.mark.parametrize('safety_state', [
+    'PROTECTIVE_STOP', 'EMERGENCY_STOP', 'FAULT', 'RECOVERY_REQUIRED',
+])
+def test_move_and_mode_buttons_disabled_when_not_normal(window, qtbot, safety_state):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', safety_state)
+
+    for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
+                 'up_button', 'down_button', 'watch_button'):
+        assert getattr(window, attr).isEnabled() is False, attr
+    # 복구 요청(RESET)과 작업 중단(STOP)은 비정상 상태에서도 항상 눌러야 한다.
+    assert window.stop_button.isEnabled() is True
+    assert window.reset_button.isEnabled() is True
+
+
+def test_pose_buttons_enabled_only_in_manual_mode(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+
+    for attr in ('home_button', 'front_button', 'up_button', 'down_button', 'watch_button'):
+        assert getattr(window, attr).isEnabled() is False, attr
+
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+
+    for attr in ('home_button', 'front_button', 'up_button', 'down_button', 'watch_button'):
+        assert getattr(window, attr).isEnabled() is True, attr
+
+
+def test_move_and_mode_buttons_disabled_while_action_in_progress(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('MOVE_TO_WATCH', '', 'MANUAL', 'NORMAL')
+
+    for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
+                 'up_button', 'down_button', 'watch_button'):
+        assert getattr(window, attr).isEnabled() is False, attr
+    assert window.stop_button.isEnabled() is True
+    assert window.reset_button.isEnabled() is True
+
+
+def test_stop_and_reset_buttons_always_enabled_regardless_of_state(window, qtbot):
+    # 작업 중단(STOP)과 복구 요청(RESET)은 서로 다른 목적이지만 둘 다 버튼 정책과
+    # 무관하게 항상 눌러야 한다.
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('SERVO_PICK', '', 'AUTO', 'FAULT')
+
+    assert window.stop_button.isEnabled() is True
+    assert window.reset_button.isEnabled() is True
 
 
 # ---- 종료 시 정리 ----

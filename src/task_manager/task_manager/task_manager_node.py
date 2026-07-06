@@ -24,6 +24,7 @@ class State:
     SERVO_PICK = 'SERVO_PICK'
     VERIFY_GRASP = 'VERIFY_GRASP'
     MOVE_SAFE = 'MOVE_SAFE'
+    APPROACH_HAND = 'APPROACH_HAND'
     WAIT_PULL = 'WAIT_PULL'
     RELEASE = 'RELEASE'
     HOME = 'HOME'
@@ -56,13 +57,17 @@ SAFETY_PRIORITY = {
 # command_parser._TOOL_KEYWORDS의 값과 반드시 일치해야 하는 tool_class 목록.
 SUPPORTED_TOOL_CLASSES = ('water_bottle', 'spanner', 'driver', 'wrench', 'pliers', 'hammer')
 
+# WAIT_PULL 타임아웃 이후 반복 안내 문구 - place_down으로 옮기지 않고 그 자리에서
+# 계속 들고 대기하면서 GUI에 반복 표시한다. TTS 등 음성 안내는 아직 구현하지 않았다
+# (추후 별도 작업).
+WAIT_PULL_REMINDER_MESSAGE = '도구를 가져가세요.'
+
 # _get_grasp_spec()이 반환하는 공구별 grasp 스펙. servo_pick에 보낼 값(width_mm,
-# force_n)과 VERIFY_GRASP에서 결과를 검증할 때 쓰는 값(verify_min/max_width_mm,
-# payload_min/max_kg)을 함께 묶어, servo_pick을 보낼 때 사용한 스펙을 그대로
+# force_n)과 VERIFY_GRASP에서 결과를 검증할 때 쓰는 값(verify_min/max_width_mm)을
+# 함께 묶어, servo_pick을 보낼 때 사용한 스펙을 그대로
 # 검증에도 재사용할 수 있게 한다 (_on_tool_track/_verify_grasp 참고).
 GraspSpec = namedtuple('GraspSpec', [
     'width_mm', 'force_n', 'verify_min_width_mm', 'verify_max_width_mm',
-    'payload_min_kg', 'payload_max_kg',
 ])
 
 
@@ -73,6 +78,10 @@ class TaskManagerNode(Node):
         self.declare_parameter('detect_track_timeout_s', 5.0)
         self.declare_parameter('verify_grasp_max_retries', 2)
         self.declare_parameter('wait_pull_timeout_s', 60.0)
+        # wait_pull_timeout_s가 지난 뒤에도 handover_hold를 취소하지 않고 계속 들고
+        # 대기하면서, 이 간격으로 GUI 안내(WAIT_PULL_REMINDER_MESSAGE)를 반복
+        # 재발행한다 (_on_wait_pull_timeout/_on_wait_pull_reminder 참고).
+        self.declare_parameter('wait_pull_reminder_interval_s', 10.0)
         self.declare_parameter('cancel_timeout_s', 5.0)
         # /robot/recover 응답을 무한정 기다리지 않기 위한 순수 통신 타임아웃이다.
         # 이 기본값은 안전 동작(언제 NORMAL로 전환하는지 등)을 바꾸지 않는다 - 응답이
@@ -103,8 +112,6 @@ class TaskManagerNode(Node):
             self.declare_parameter(f'tools.{_tool}.force_n', -1.0)
             self.declare_parameter(f'tools.{_tool}.verify_min_width_mm', -1.0)
             self.declare_parameter(f'tools.{_tool}.verify_max_width_mm', -1.0)
-            self.declare_parameter(f'tools.{_tool}.payload_min_kg', -1.0)
-            self.declare_parameter(f'tools.{_tool}.payload_max_kg', -1.0)
 
         self.state = State.IDLE
         self.operation_mode = Mode.MANUAL
@@ -289,6 +296,9 @@ class TaskManagerNode(Node):
         self._stop_cancel_timeout_timer()
         self._cancel_pending_callback = None
         self._goal_generation += 1
+        self._recovery_generation += 1
+        self._recovery_in_progress = False
+        self._stop_recovery_timeout_timer()
         self.safety_state = Safety.FAULT
         self._set_vision_mode(SetVisionMode.Request.OFF)
         self._publish_status(
@@ -413,7 +423,14 @@ class TaskManagerNode(Node):
                 detail='robot_control /robot/recover 서비스가 아직 준비되지 않았습니다 - '
                        'RECOVERY_REQUIRED 상태를 유지합니다.')
             return
-        future = self.recover_client.call_async(Trigger.Request())
+        try:
+            future = self.recover_client.call_async(Trigger.Request())
+        except Exception as exc:
+            self._recovery_in_progress = False
+            self._publish_status(
+                detail=f'/robot/recover 요청 예외: {exc} - RECOVERY_REQUIRED 유지, '
+                       '자동 재시작하지 않습니다.')
+            return
         future.add_done_callback(lambda f: self._on_recover_response(f, generation))
         self._start_recovery_timeout_timer(generation)
 
@@ -555,8 +572,8 @@ class TaskManagerNode(Node):
 
     # ---- RobotTask 액션 goal 송신/수신 ----
 
-    def _send_robot_goal(self, task_type, named_target='', target_pose=None,
-                          tool_class='', grasp_width_mm=0.0, grasp_force_n=0.0):
+    def _send_robot_goal(self, task_type, named_target='', tool_class='',
+                         grasp_width_mm=0.0, grasp_force_n=0.0):
         if self._goal_in_progress:
             self.get_logger().warn(f'{task_type} 요청 무시 - 이미 진행 중인 goal이 있습니다.')
             return
@@ -566,8 +583,6 @@ class TaskManagerNode(Node):
         goal = RobotTask.Goal()
         goal.task_type = task_type
         goal.named_target = named_target
-        if target_pose is not None:
-            goal.target_pose = target_pose
         goal.tool_class = tool_class
         goal.grasp_width_mm = grasp_width_mm
         goal.grasp_force_n = grasp_force_n
@@ -611,12 +626,22 @@ class TaskManagerNode(Node):
             except Exception as exc:
                 self._handle_action_future_exception(exc, 'cancel_goal_async')
                 return
-        result_future = goal_handle.get_result_async()
+        try:
+            result_future = goal_handle.get_result_async()
+        except Exception as exc:
+            self._handle_action_future_exception(exc, 'get_result_async')
+            return
         result_future.add_done_callback(lambda f: self._on_robot_result(f, generation))
 
     def _on_robot_result(self, future, generation):
         if generation != self._goal_generation:
             return  # 취소/대체된 이전 세대 goal의 결과 - 상태에 반영하지 않는다
+        # Future 예외는 취소 완료 증거가 아니므로 pending callback보다 먼저 확인한다.
+        try:
+            response = future.result()
+        except Exception as exc:
+            self._handle_action_future_exception(exc, 'robot result')
+            return
         self._goal_in_progress = False
         self._current_goal_handle = None
         if self._cancel_pending_callback is not None:
@@ -625,11 +650,6 @@ class TaskManagerNode(Node):
             self._cancel_pending_callback = None
             callback()
             self._maybe_start_recovery()
-            return
-        try:
-            response = future.result()
-        except Exception as exc:
-            self._handle_action_future_exception(exc, 'robot result')
             return
         result = response.result
         if self.state == State.MOVE_TO_WATCH:
@@ -640,10 +660,10 @@ class TaskManagerNode(Node):
             self._handle_release_and_retry_result(result)
         elif self.state == State.MOVE_SAFE:
             self._handle_move_safe_result(result)
+        elif self.state == State.APPROACH_HAND:
+            self._handle_approach_hand_result(result)
         elif self.state == State.WAIT_PULL:
             self._handle_wait_pull_result(result)
-        elif self.state == State.RELEASE:
-            self._handle_release_result(result)
         elif self.state == State.HOME:
             self._handle_home_result(result)
         elif self.state == State.MANUAL_MOVE:
@@ -718,12 +738,9 @@ class TaskManagerNode(Node):
         force_n = float(self.get_parameter(f'{prefix}.force_n').value)
         verify_min_width_mm = float(self.get_parameter(f'{prefix}.verify_min_width_mm').value)
         verify_max_width_mm = float(self.get_parameter(f'{prefix}.verify_max_width_mm').value)
-        payload_min_kg = float(self.get_parameter(f'{prefix}.payload_min_kg').value)
-        payload_max_kg = float(self.get_parameter(f'{prefix}.payload_max_kg').value)
 
         if not all(math.isfinite(v) for v in (
-                width_mm, force_n, verify_min_width_mm, verify_max_width_mm,
-                payload_min_kg, payload_max_kg)):
+                width_mm, force_n, verify_min_width_mm, verify_max_width_mm)):
             return None  # NaN/Inf가 하나라도 있으면 신뢰할 수 없다
 
         if width_mm <= 0.0 or force_n <= 0.0:
@@ -733,20 +750,10 @@ class TaskManagerNode(Node):
         if verify_min_width_mm > verify_max_width_mm:
             return None  # 설정 오류
 
-        # payload_min/max_kg는 둘 다 음수(sentinel)일 때만 검증을 비활성화한다.
-        # 둘 중 하나만 설정된 경우는 조용히 비활성화하지 않고 설정 오류로 취급한다.
-        if payload_min_kg < 0.0 and payload_max_kg < 0.0:
-            payload_min_kg = -1.0
-            payload_max_kg = -1.0
-        elif payload_min_kg < 0.0 or payload_max_kg < 0.0:
-            return None  # 하나만 설정됨 - 설정 오류
-        elif payload_min_kg > payload_max_kg:
-            return None  # 설정 오류
-
         return GraspSpec(
             width_mm=width_mm, force_n=force_n,
-            verify_min_width_mm=verify_min_width_mm, verify_max_width_mm=verify_max_width_mm,
-            payload_min_kg=payload_min_kg, payload_max_kg=payload_max_kg)
+            verify_min_width_mm=verify_min_width_mm,
+            verify_max_width_mm=verify_max_width_mm)
 
     def _on_tool_track(self, msg):
         if self.state != State.DETECT_TRACK:
@@ -776,7 +783,7 @@ class TaskManagerNode(Node):
             grasp_width_mm=spec.width_mm, grasp_force_n=spec.force_n)
 
     def _verify_grasp(self, result) -> bool:
-        """grip_detected/final_width_mm/(선택적)payload로 파지 성공 여부를 검증한다.
+        """grip_detected와 final_width_mm로 파지 성공 여부를 검증한다.
 
         servo_pick을 보낼 때 사용한 grasp spec(self._active_grasp_spec)을 그대로
         재사용한다 - spec이 없으면(예: 재시작 등으로 유실) 검증을 성공으로 간주하지
@@ -795,13 +802,6 @@ class TaskManagerNode(Node):
         if not (spec.verify_min_width_mm <= result.final_width_mm <= spec.verify_max_width_mm):
             return False
 
-        payload_verification_enabled = spec.payload_min_kg >= 0.0 and spec.payload_max_kg >= 0.0
-        if payload_verification_enabled:
-            if not math.isfinite(result.measured_payload_kg):
-                return False
-            if not (spec.payload_min_kg <= result.measured_payload_kg <= spec.payload_max_kg):
-                return False
-
         return True
 
     def _handle_servo_pick_result(self, result):
@@ -815,7 +815,7 @@ class TaskManagerNode(Node):
         self._set_state(State.VERIFY_GRASP)
         verified = self._safe_call(self._verify_grasp, result, default=False)
         if verified:
-            self._set_state(State.MOVE_SAFE)
+            self._set_state(State.MOVE_SAFE, detail=f'{self.current_tool} 파지 완료')
             self._send_robot_goal('move_named', named_target='handover_safe')
             return
         self._verify_grasp_retries += 1
@@ -838,6 +838,16 @@ class TaskManagerNode(Node):
 
     def _handle_move_safe_result(self, result):
         if result.success:
+            # handover_safe 도착 - 작업대가 보이는 자세에서 YOLO로 손을 찾아 접근한다
+            # (robot_control의 handover_approach, servo_pick과 같은 PBVS 패턴).
+            self._set_state(State.APPROACH_HAND, detail='작업자를 찾는 중')
+            self._set_vision_mode(SetVisionMode.Request.TRACK_HAND)
+            self._send_robot_goal('handover_approach')
+        else:
+            self._enter_fault(result.message)
+
+    def _handle_approach_hand_result(self, result):
+        if result.success:
             self._set_state(State.WAIT_PULL)
             timeout_s = self.get_parameter('wait_pull_timeout_s').value
             self._wait_pull_timeout_timer = self.create_timer(timeout_s, self._on_wait_pull_timeout)
@@ -846,17 +856,35 @@ class TaskManagerNode(Node):
             self._enter_fault(result.message)
 
     def _on_wait_pull_timeout(self):
+        """wait_pull_timeout_s가 지나도 사람이 도구를 가져가지 않은 경우.
+
+        handover_hold를 취소하거나 place_down으로 옮기지 않는다 - 로봇은 그
+        자리에서 계속 들고 대기하고, 대신 GUI에 반복 안내만 보낸다
+        (wait_pull_reminder_interval_s 간격). 실제로 가져가면(pull 확정) 기존
+        _handle_wait_pull_result 성공 경로가 그대로 HOME으로 전이시킨다.
+        TODO(추후 구현): TTS 등 음성 안내는 아직 만들지 않았다 - 지금은
+        /task/status.detail을 통해 GUI에 텍스트로만 표시한다.
+        """
         self._wait_pull_timeout_timer.cancel()
         self._wait_pull_timeout_timer = None
         if self.state != State.WAIT_PULL:
             return
-        # handover_hold goal이 아직 실행 중일 수 있으므로 place_down을 바로 보내지 않고,
-        # 취소를 요청한 뒤 결과(취소 확인)를 받은 다음에만 RELEASE로 전이한다.
-        self._request_cancel(self._start_release_after_wait_pull_timeout)
+        self._publish_status(detail=WAIT_PULL_REMINDER_MESSAGE)
+        reminder_interval_s = self.get_parameter('wait_pull_reminder_interval_s').value
+        self._wait_pull_timeout_timer = self.create_timer(
+            reminder_interval_s, self._on_wait_pull_reminder)
 
-    def _start_release_after_wait_pull_timeout(self):
-        self._set_state(State.RELEASE, detail='wait_pull timeout - handover_hold 취소 후 place_down')
-        self._send_robot_goal('place_down', named_target='place_down')
+    def _on_wait_pull_reminder(self):
+        """_on_wait_pull_timeout 이후 반복 호출되는 안내 타이머(주기적)."""
+        if self.state != State.WAIT_PULL:
+            # pull이 확정되어 이미 다른 상태로 전이했다면 타이머를 정리한다
+            # (일반적으로는 _handle_wait_pull_result가 먼저 취소하지만, 방어적으로
+            # 한 번 더 확인한다).
+            if self._wait_pull_timeout_timer is not None:
+                self._wait_pull_timeout_timer.cancel()
+                self._wait_pull_timeout_timer = None
+            return
+        self._publish_status(detail=WAIT_PULL_REMINDER_MESSAGE)
 
     def _handle_wait_pull_result(self, result):
         if self._wait_pull_timeout_timer is not None:
@@ -865,16 +893,7 @@ class TaskManagerNode(Node):
         if result.success:
             # RELEASE는 robot_control이 handover_hold 안에서 이미 개방을 완료했음을
             # 표시하기 위한 경유 상태 - 별도 goal 없이 바로 HOME으로 넘어간다.
-            self._set_state(State.RELEASE, detail=result.message)
-            self._set_state(State.HOME)
-            self._set_vision_mode(SetVisionMode.Request.OFF)
-            self._send_robot_goal('move_named', named_target='home')
-        else:
-            self._enter_fault(result.message)
-
-    def _handle_release_result(self, result):
-        # WAIT_PULL 타임아웃 후 보낸 place_down goal의 결과 처리
-        if result.success:
+            self._set_state(State.RELEASE, detail='작업자에게 전달 완료')
             self._set_state(State.HOME)
             self._set_vision_mode(SetVisionMode.Request.OFF)
             self._send_robot_goal('move_named', named_target='home')
