@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'robot_control_node = robot_control.robot_control_node:main',
+            'probe_speedl_stream = robot_control.tools.probe_speedl_stream:main',
         ],
     },
 )
