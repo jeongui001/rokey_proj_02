@@ -155,9 +155,6 @@ class VisionNode(Node):
         track.pose.position.y = position[1]
         track.pose.position.z = position[2]
         track.pose.orientation.w = 1.0   # yaw는 1차 구현 범위 밖 - identity 고정
-        track.velocity.x = velocity[0]
-        track.velocity.y = velocity[1]
-        track.velocity.z = 0.0           # 상태에 vz 없음 (등속 모델은 x,y 평면만 가정)
         track.depth_valid = bool(depth_valid)
         track.approaching = bool(is_approaching(
             (position[0], position[1]), velocity, self.approach_ref_xy))
