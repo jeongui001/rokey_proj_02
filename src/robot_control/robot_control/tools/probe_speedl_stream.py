@@ -8,6 +8,8 @@ RT 세션(ConnectRtControl/StartRtControl) 없이 dsr_msgs2의 speedl_stream 토
 함수라 자동 테스트 대상이다.
 """
 
+import argparse
+import sys
 from collections import namedtuple
 
 AXIS_INDEX = {'x': 0, 'y': 1, 'z': 2}
@@ -38,3 +40,40 @@ def build_phase_plan(
         segments.append(PhaseSegment('pause', f'phase3_pause_{i}', pause_s, 0))
 
     return segments
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            'speedl_stream(비-RT) 서보잉 실현가능성 실측 검증 도구 - '
+            '실제 로봇이 움직입니다.'))
+    parser.add_argument('--robot-id', default='dsr01')
+    parser.add_argument('--axis', default='x', choices=list(AXIS_INDEX))
+    parser.add_argument('--vel-mm-s', type=float, default=20.0)
+    parser.add_argument('--acc-trans-mm-s2', type=float, default=100.0)
+    parser.add_argument('--acc-rot-deg-s2', type=float, default=100.0)
+    parser.add_argument('--phase-duration-s', type=float, default=3.0)
+    parser.add_argument('--osc-period-s', type=float, default=1.0)
+    parser.add_argument('--osc-duration-s', type=float, default=4.0)
+    parser.add_argument(
+        '--pause-durations-s', type=float, nargs='+', default=[0.5, 1.0, 2.0])
+    parser.add_argument('--period-s', type=float, default=0.02)
+    parser.add_argument('--rg2-ip', default='192.168.1.1')
+    parser.add_argument('--rg2-port', type=int, default=502)
+    parser.add_argument('--rg2-gripper', default='rg2')
+    parser.add_argument('--grasp-width-mm', type=float, required=True)
+    parser.add_argument('--grasp-force-n', type=float, required=True)
+    return parser.parse_args(argv)
+
+
+def _confirm_or_exit():
+    print('=' * 70)
+    print('경고: 이 스크립트는 실제 로봇을 speedl_stream(비-RT)으로 움직입니다.')
+    print('Enable 스위치/펜던트를 손에 쥔 상태에서만 계속하세요.')
+    print('단위 가정(mm/s, deg/s)이 틀렸을 가능성이 있으니 1단계 시작 직후')
+    print('몇 초는 특히 주의 깊게 관찰하세요.')
+    print('=' * 70)
+    answer = input("계속하려면 'yes'를 입력하세요: ").strip().lower()
+    if answer != 'yes':
+        print('취소되었습니다.')
+        sys.exit(0)
