@@ -184,6 +184,7 @@ def test_set_state_publishes_json_status_with_mode_and_safety(node):
         'detail': 'hello',
         'operation_mode': Mode.MANUAL,
         'safety_state': Safety.NORMAL,
+        'resumable': False,
     }
 
 
@@ -206,10 +207,11 @@ def test_status_publish_timer_republishes_full_four_fields(node):
 
     assert len(published) == 1
     payload = json.loads(published[0].data)
-    assert set(payload.keys()) == {'state', 'detail', 'operation_mode', 'safety_state'}
+    assert set(payload.keys()) == {
+        'state', 'detail', 'operation_mode', 'safety_state', 'resumable'}
     assert payload == {
         'state': State.IDLE, 'detail': '', 'operation_mode': Mode.MANUAL,
-        'safety_state': Safety.NORMAL,
+        'safety_state': Safety.NORMAL, 'resumable': False,
     }
 
 
@@ -1852,3 +1854,228 @@ def test_home_result_failure_sets_fault(node):
     node._handle_home_result(_FakeResult(success=False, message='motion failed'))
 
     assert node.safety_state == Safety.FAULT
+
+
+# ---- test_mode.allow_manual_fetch ----
+
+def test_fetch_tool_rejected_in_manual_mode_by_default(node):
+    node.operation_mode = Mode.MANUAL
+    node.set_parameters([Parameter('auto.config_ready', value=True)])
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_fetch_tool('spanner')
+
+    assert sent == []
+    assert node.state == State.IDLE
+
+
+def test_fetch_tool_allowed_in_manual_mode_when_flag_enabled(node):
+    node.operation_mode = Mode.MANUAL
+    node.set_parameters([
+        Parameter('auto.config_ready', value=True),
+        Parameter('test_mode.allow_manual_fetch', value=True),
+    ])
+    node._start_after_vision_mode = lambda mode, tool_class, expected_state, on_success: on_success()
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_fetch_tool('spanner')
+
+    assert node.current_tool == 'spanner'
+    assert sent == [('move_named', {'named_target': 'watch'})]
+
+
+# ---- 재개(resume) ----
+
+def test_capture_resume_snapshot_continue_states(node):
+    node.current_tool = 'spanner'
+    node._active_grasp_spec = _make_spec()
+    for state in (State.MOVE_SAFE, State.APPROACH_HAND, State.WAIT_PULL):
+        node.state = state
+        node._capture_resume_snapshot()
+        assert node._resume_kind == 'continue'
+        assert node._resume_state == state
+        assert node._resume_tool == 'spanner'
+        assert node._resume_grasp_spec is not None
+
+
+def test_capture_resume_snapshot_retry_pick_states(node):
+    node.current_tool = 'spanner'
+    node._active_grasp_spec = _make_spec()
+    for state in (State.SERVO_PICK, State.VERIFY_GRASP):
+        node.state = state
+        node._capture_resume_snapshot()
+        assert node._resume_kind == 'retry_pick'
+        assert node._resume_state == state
+        assert node._resume_tool == 'spanner'
+        assert node._resume_grasp_spec is None
+
+
+def test_capture_resume_snapshot_none_for_other_states(node):
+    node.current_tool = 'spanner'
+    node.state = State.DETECT_TRACK
+    node._capture_resume_snapshot()
+
+    assert node._resume_kind is None
+    assert node._resume_state is None
+    assert node._resume_tool is None
+    assert node._resume_grasp_spec is None
+
+
+def test_enter_fault_captures_resume_snapshot_before_state_change(node):
+    node.state = State.WAIT_PULL
+    node.current_tool = 'wrench'
+    node._active_grasp_spec = _make_spec()
+
+    node._enter_fault('FAULT: 예상하지 못한 외력')
+
+    assert node._resume_kind == 'continue'
+    assert node._resume_state == State.WAIT_PULL
+    assert node._resume_tool == 'wrench'
+
+
+def test_resumable_field_true_only_when_normal_idle_and_snapshot_present(node):
+    node.state = State.WAIT_PULL
+    node.current_tool = 'wrench'
+    node._active_grasp_spec = _make_spec()
+    node._enter_fault('FAULT: 예상하지 못한 외력')
+
+    # FAULT 상태이고 state도 아직 IDLE이 아니다(_enter_fault는 state를 바꾸지 않음).
+    published = []
+    node.pub_status.publish = published.append
+    node._publish_status(detail='')
+    assert json.loads(published[-1].data)['resumable'] is False
+
+    # 안전상태만 NORMAL로 돌아왔지만 state가 여전히 WAIT_PULL이면 아직 재개 불가.
+    node.safety_state = Safety.NORMAL
+    node._publish_status(detail='')
+    assert json.loads(published[-1].data)['resumable'] is False
+
+    # state까지 IDLE이 되면 그제서야 재개 가능하다고 보고한다.
+    node.state = State.IDLE
+    node._publish_status(detail='')
+    assert json.loads(published[-1].data)['resumable'] is True
+
+
+def test_handle_resume_rejected_when_not_normal(node):
+    node.safety_state = Safety.FAULT
+    node._resume_kind = 'continue'
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert sent == []
+    assert node._resume_kind == 'continue'  # 스냅샷은 그대로 보존된다
+
+
+def test_handle_resume_rejected_when_not_idle(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.MOVE_TO_WATCH
+    node._resume_kind = 'continue'
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert sent == []
+
+
+def test_handle_resume_no_snapshot_does_nothing(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert sent == []
+
+
+def test_handle_resume_continue_wait_pull(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    node._resume_kind = 'continue'
+    node._resume_state = State.WAIT_PULL
+    node._resume_tool = 'wrench'
+    node._resume_grasp_spec = _make_spec()
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert node.state == State.WAIT_PULL
+    assert node.current_tool == 'wrench'
+    assert node._active_grasp_spec is not None
+    assert sent == [('handover_hold', {})]
+    assert node._resume_kind is None  # 1회성 - 사용 후 스냅샷을 지운다
+    node._wait_pull_timeout_timer.cancel()
+
+
+def test_handle_resume_continue_move_safe(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    node._resume_kind = 'continue'
+    node._resume_state = State.MOVE_SAFE
+    node._resume_tool = 'spanner'
+    node._resume_grasp_spec = _make_spec()
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert node.state == State.MOVE_SAFE
+    assert sent == [('move_named', {'named_target': 'handover_safe'})]
+
+
+def test_handle_resume_retry_pick_sends_release_and_retry(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    node.set_parameters([Parameter('verify_grasp_max_retries', value=2)])
+    node._verify_grasp_retries = 0
+    node._resume_kind = 'retry_pick'
+    node._resume_state = State.SERVO_PICK
+    node._resume_tool = 'hammer'
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert node.state == State.VERIFY_GRASP
+    assert node.current_tool == 'hammer'
+    assert sent == [('release_and_retry', {})]
+    assert node._verify_grasp_retries == 1
+
+
+def test_handle_resume_retry_pick_exhausted_enters_fault(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    node.set_parameters([Parameter('verify_grasp_max_retries', value=0)])
+    node._verify_grasp_retries = 0
+    node._resume_kind = 'retry_pick'
+    node._resume_state = State.VERIFY_GRASP
+    node._resume_tool = 'hammer'
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_resume()
+
+    assert sent == []
+    assert node.safety_state == Safety.FAULT
+    assert node.current_tool is None
+
+
+def test_home_result_success_clears_stale_resume_snapshot(node):
+    node.state = State.HOME
+    node._resume_kind = 'continue'
+    node._resume_state = State.WAIT_PULL
+    node._resume_tool = 'spanner'
+    node._resume_grasp_spec = _make_spec()
+
+    node._handle_home_result(_FakeResult(success=True))
+
+    assert node._resume_kind is None
+    assert node._resume_state is None
+    assert node._resume_tool is None
+    assert node._resume_grasp_spec is None

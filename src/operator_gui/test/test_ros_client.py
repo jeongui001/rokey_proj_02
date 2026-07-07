@@ -22,8 +22,8 @@ class _FakeOwner:
         self.gripper_state_calls = []
         self.fault_calls = []
         self.camera_image_calls = []
-        self.on_task_status = lambda state, detail, mode, safety: (
-            self.task_status_calls.append((state, detail, mode, safety)))
+        self.on_task_status = lambda state, detail, mode, safety, resumable: (
+            self.task_status_calls.append((state, detail, mode, safety, resumable)))
         self.on_gripper_state = lambda width, grip: self.gripper_state_calls.append((width, grip))
         self.on_fault = lambda msg: self.fault_calls.append(msg)
         self.on_camera_image = lambda data: self.camera_image_calls.append(data)
@@ -66,7 +66,7 @@ def test_task_status_callback_parses_json(node, owner, peer):
              '"operation_mode": "AUTO", "safety_state": "NORMAL"}'))
 
     assert _spin_until(node, lambda: owner.task_status_calls)
-    assert owner.task_status_calls == [('IDLE', 'ready', 'AUTO', 'NORMAL')]
+    assert owner.task_status_calls == [('IDLE', 'ready', 'AUTO', 'NORMAL', False)]
 
 
 def test_gripper_state_callback_forwards_fields(node, owner, peer):
@@ -152,8 +152,8 @@ def test_ensure_connected_restarts_dead_spin_thread(client):
 
 def test_subscribe_all_and_receive_task_status(client, peer):
     received = []
-    client.on_task_status = lambda state, detail, mode, safety: received.append(
-        (state, detail, mode, safety))
+    client.on_task_status = lambda state, detail, mode, safety, resumable: received.append(
+        (state, detail, mode, safety, resumable))
     client.subscribe_all()
     client.connect()
 
@@ -167,7 +167,7 @@ def test_subscribe_all_and_receive_task_status(client, peer):
     while time.monotonic() < deadline and not received:
         time.sleep(0.05)
 
-    assert received == [('IDLE', 'ready', 'AUTO', 'NORMAL')]
+    assert received == [('IDLE', 'ready', 'AUTO', 'NORMAL', False)]
 
 
 def test_publish_command_via_client(client, peer):

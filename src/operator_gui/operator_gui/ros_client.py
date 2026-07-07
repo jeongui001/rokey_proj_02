@@ -63,7 +63,8 @@ class _OperatorGuiNode(Node):
             return
         self._owner.on_task_status(
             payload.get('state', ''), payload.get('detail', ''),
-            payload.get('operation_mode', ''), payload.get('safety_state', ''))
+            payload.get('operation_mode', ''), payload.get('safety_state', ''),
+            bool(payload.get('resumable', False)))
 
     def _on_gripper_state(self, msg):
         if self._owner.on_gripper_state is None:
@@ -131,7 +132,7 @@ class RosClient:
             'OPERATOR_GUI_CAMERA_TOPIC', DEFAULT_CAMERA_TOPIC)
         self.reconnect_interval_s = reconnect_interval_s
 
-        self.on_task_status = None        # (state, detail, operation_mode, safety_state)
+        self.on_task_status = None        # (state, detail, operation_mode, safety_state, resumable)
         self.on_gripper_state = None       # (width_mm, grip_detected)
         self.on_fault = None               # (message)
         self.on_camera_image = None        # (image_bytes)

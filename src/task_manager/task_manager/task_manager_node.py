@@ -50,6 +50,11 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 실제 물체 가져오기 goal은 보내지 않는다 (_handle_fetch_tool 참고).
         self.declare_parameter('auto.config_ready', False)
 
+        # 임시 테스트 전용 게이트 - true일 때만 MANUAL 모드에서도 fetch_tool 명령을
+        # 허용한다(_handle_fetch_tool 참고). 기본값 false에서는 기존과 동일하게
+        # AUTO 모드에서만 공구 전달 명령이 동작한다.
+        self.declare_parameter('test_mode.allow_manual_fetch', False)
+
         # DETECT_TRACK 트리거 조건. 실제 캘리브레이션 전에는 -1/빈 문자열(미설정)로
         # 두어 _check_trigger가 항상 False를 반환하도록 한다 (fail-closed).
         self.declare_parameter('trigger.min_confidence', -1.0)
@@ -96,6 +101,17 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         self._recovery_timeout_owner_generation = None
         # 완전히 동일한 Fault 메시지의 반복 발행을 dedup하기 위한 마지막 detail.
         self._last_fault_detail = None
+        # "재개" 스냅샷 - FAULT 진입 시점의 상태를 저장해 두었다가, 복구(NORMAL) 후
+        # 명시적 "재개" 명령이 오면 이어서 진행할지 판단한다 (_capture_resume_snapshot/
+        # _handle_resume 참고). _resume_kind는 'continue'(MOVE_SAFE/APPROACH_HAND/
+        # WAIT_PULL - 파지가 이미 검증된 뒤라 그대로 이어감) 또는 'retry_pick'
+        # (SERVO_PICK/VERIFY_GRASP - 그리퍼 상태가 불확실하므로 release_and_retry로
+        # 안전하게 열고 DETECT_TRACK부터 다시 시작) 중 하나이거나, 재개할 게 없으면
+        # None이다.
+        self._resume_kind = None
+        self._resume_state = None
+        self._resume_tool = None
+        self._resume_grasp_spec = None
         # 가장 최근에 발행한 detail - 상태 재발행 타이머가 state/detail을 임의로
         # 바꾸지 않고 마지막 값을 그대로 다시 내보내기 위해 저장해 둔다.
         self._last_status_detail = ''
@@ -138,6 +154,13 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
             'detail': detail,
             'operation_mode': self.operation_mode,
             'safety_state': self.safety_state,
+            # GUI가 "재개" 버튼을 정확히 언제 활성화할지 판단하는 데 쓴다 - 재개할
+            # 스냅샷이 있고, 지금 당장 안전하게 재개를 시작할 수 있는 상태일 때만
+            # true다 (_handle_resume의 실제 가드와 동일한 조건).
+            'resumable': (
+                self._resume_kind is not None
+                and self.safety_state == Safety.NORMAL
+                and self.state == State.IDLE),
         }, ensure_ascii=False)
         self.pub_status.publish(msg)
 

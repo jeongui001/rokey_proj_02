@@ -120,6 +120,20 @@ class TaskExecutor:
             return False
         return success
 
+    def _is_gripper_already_open(self) -> bool:
+        """그리퍼가 이미 완전히 열린 폭이면 True. get_state() 통신 자체가 실패해
+        0.0을 반환하는 경우까지 "이미 열림"으로 착각하면 안 되므로, 상태 조회가
+        불확실할 때는 False를 반환해 open()을 그대로 시도하게 한다."""
+        if not self.hardware_enabled:
+            return False  # dry-run에서는 매번 그대로 시도해도 비용이 없다
+        gripper = self.rg2_client.gripper
+        if gripper not in self.rg2_client.MAX_WIDTH_MM:
+            return False
+        width_mm, _ = self.rg2_client.get_state()
+        max_width = self.rg2_client.MAX_WIDTH_MM[gripper]
+        tolerance = self.get_parameter('rg2.open_width_tolerance_mm').value
+        return width_mm >= max_width - tolerance
+
     def _execute_move_named(self, goal_handle):
         result = RobotTask.Result()
         if self.safety_state != SafetyState.NORMAL:
@@ -127,10 +141,43 @@ class TaskExecutor:
             result.success = False
             result.message = f'move_named rejected - safety_state={self.safety_state}'
             return result
+        named_target = goal_handle.request.named_target
         try:
+            if named_target == 'home':
+                # 홈으로 이동하기 전에는 다음 작업을 위해 그리퍼가 열린 상태임을
+                # 보장한다 - 이전에 어떤 경로로 왔든(수동 이동, pick 중단, 검증
+                # 실패 등) 그리퍼가 물체를 쥔 채로 홈에 도착하지 않도록 하는
+                # 안전/리셋 동작이다(_execute_release_and_retry의 RG2 open 처리와
+                # 동일한 패턴). 이미 열려있으면 불필요한 재통신을 피해 생략한다.
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    result.success = False
+                    result.message = 'move_named(home) canceled before opening gripper'
+                    return result
+                if self.safety_state != SafetyState.NORMAL:
+                    goal_handle.abort()
+                    result.success = False
+                    result.message = (
+                        f'move_named(home) aborted before opening gripper - '
+                        f'safety_state={self.safety_state}')
+                    return result
+                if not self._is_gripper_already_open():
+                    if not self.rg2_client.open(goal_handle=goal_handle):
+                        if self.rg2_client.last_status == RG2Status.CANCELED:
+                            goal_handle.canceled()
+                            result.success = False
+                            result.message = 'move_named(home) canceled during RG2 open'
+                            return result
+                        detail = (
+                            f'move_named(home) RG2 open 실패'
+                            f'(status={self.rg2_client.last_status}) - 안전을 위해 FAULT 처리')
+                        self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                        goal_handle.abort()
+                        result.success = False
+                        result.message = detail
+                        return result
             success = self._call_move_service(
-                goal_handle=goal_handle,
-                named_target=goal_handle.request.named_target)
+                goal_handle=goal_handle, named_target=named_target)
         except Exception as exc:  # 통신 오류 등 예외 발생 시 성공을 반환하지 않는다
             self.get_logger().error(f'move_named 실행 중 예외: {exc}')
             goal_handle.abort()
@@ -549,9 +596,12 @@ class TaskExecutor:
             return False
         axis = int(self.get_parameter('handover_hold.pull_axis_index').value)
         if axis < 0 or axis > 2:
+            # handover_hold.poll_interval_s(기본 0.05s)마다 호출되므로 throttle
+            # 없이는 로그가 초당 수십 줄씩 쏟아진다.
             self.get_logger().warn(
                 'handover_hold.pull_axis_index 미설정(또는 모멘트 축 지정) - '
-                '당김 감지를 비활성화합니다 (힘 성분 0,1,2만 허용).')
+                '당김 감지를 비활성화합니다 (힘 성분 0,1,2만 허용).',
+                throttle_duration_sec=1.0)
             return False
         tool_force = robot_state.get('tool_force')
         if not tool_force:

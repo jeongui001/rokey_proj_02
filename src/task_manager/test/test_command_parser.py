@@ -11,6 +11,10 @@ def test_reset_keyword():
     assert parse_command('초기화 해줘') == {'type': Command.RESET}
 
 
+def test_resume_keyword():
+    assert parse_command('재개') == {'type': Command.RESUME}
+
+
 def test_manual_move_keywords():
     assert parse_command('홈으로 가') == {'type': Command.MOVE_NAMED, 'named_target': 'home'}
     assert parse_command('정면을 봐') == {'type': Command.MOVE_NAMED, 'named_target': 'front'}

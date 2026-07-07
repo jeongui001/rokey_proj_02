@@ -27,6 +27,10 @@ class SafetyRecovery:
         return Safety.FAULT
 
     def _enter_fault(self, detail, safety_state=Safety.FAULT):
+        # self.state가 아직 바뀌기 전(이 아래 어떤 코드도 self.state를 직접 바꾸지
+        # 않는다 - _request_cancel(lambda: None)의 콜백도 no-op이다)에 재개용
+        # 스냅샷을 남긴다 (_capture_resume_snapshot 참고).
+        self._capture_resume_snapshot()
         # 새로운 Fault는 복구 진행보다 항상 우선한다 - 진행 중이던 복구 요청(취소
         # 대기, 서비스 응답 대기, 또는 응답 타임아웃 타이머)이 있었다면 모두
         # 무효화한다. generation을 올려두면 이미 보낸 /robot/recover 요청의 지연
@@ -78,6 +82,8 @@ class SafetyRecovery:
             self._handle_manual_move(command['named_target'])
         elif cmd_type == Command.FETCH_TOOL:
             self._handle_fetch_tool(command['tool'])
+        elif cmd_type == Command.RESUME:
+            self._handle_resume()
         else:
             self._publish_status(detail='명령을 이해하지 못했습니다. 다시 말씀해주세요.')
 

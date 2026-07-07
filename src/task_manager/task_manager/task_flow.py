@@ -5,14 +5,105 @@ from handover_interfaces.srv import SetVisionMode
 from task_manager.command_parser import Mode
 from task_manager.task_models import (
     GraspSpec,
+    Safety,
     State,
     SUPPORTED_TOOL_CLASSES,
     WAIT_PULL_REMINDER_MESSAGE,
 )
 
 
+# 재개(resume) 가능 상태 분류. 그리퍼가 이미 검증된 물체를 쥐고 있다는 게 확실한
+# 구간(_RESUME_CONTINUE_STATES)은 하던 goal을 그대로 이어서 보낸다. 반대로 지금
+# 그리퍼가 정확히 어떤 상태인지 확신할 수 없는 구간(_RESUME_RETRY_PICK_STATES,
+# 접근~하강~닫기 도중이거나 방금 닫혀 검증이 안 끝난 상태)은 절대 그대로 이어가지
+# 않고, release_and_retry와 동일하게 그리퍼를 강제로 열고 watch로 돌아가
+# DETECT_TRACK부터 다시 시작한다(_verify_grasp_retries에 포함되어, 반복되면
+# 결국 수동 확인을 요구한다). 나머지 상태(IDLE/MOVE_TO_WATCH/DETECT_TRACK/HOME/
+# MANUAL_MOVE/CANCELLING)는 재개 개념 자체가 없다 - 물체를 안 쥐고 있거나
+# 사용자가 직접 제어 중이거나 전환 중이라, 그냥 원래 하던 명령을 다시 보내면 된다.
+_RESUME_CONTINUE_STATES = (State.MOVE_SAFE, State.APPROACH_HAND, State.WAIT_PULL)
+_RESUME_RETRY_PICK_STATES = (State.SERVO_PICK, State.VERIFY_GRASP)
+
+
 class TaskFlow:
     """MANUAL 이동과 AUTO 공구 전달 순서를 관리하는 mixin."""
+
+    def _capture_resume_snapshot(self):
+        """FAULT 진입 직전(아직 self.state가 바뀌기 전) 호출된다 - _enter_fault와
+        _handle_action_future_exception 양쪽에서 공유한다."""
+        if self.state in _RESUME_CONTINUE_STATES:
+            self._resume_kind = 'continue'
+            self._resume_state = self.state
+            self._resume_tool = self.current_tool
+            self._resume_grasp_spec = self._active_grasp_spec
+        elif self.state in _RESUME_RETRY_PICK_STATES:
+            self._resume_kind = 'retry_pick'
+            self._resume_state = self.state
+            self._resume_tool = self.current_tool
+            self._resume_grasp_spec = None
+        else:
+            self._resume_kind = None
+            self._resume_state = None
+            self._resume_tool = None
+            self._resume_grasp_spec = None
+
+    def _handle_resume(self):
+        """"재개" 명령(/user_command/text) 처리. 안전상태 NORMAL + state IDLE +
+        저장된 재개 스냅샷이 있을 때만 진행한다 - 그 외에는 명확한 사유를 GUI에
+        보고하고 아무 것도 하지 않는다(자동 재시작 금지)."""
+        if self.safety_state != Safety.NORMAL:
+            self._publish_status(detail='재개 불가 - 안전상태가 NORMAL이 아닙니다.')
+            return
+        if self.state != State.IDLE:
+            self._publish_status(detail='재개 불가 - 이미 다른 작업이 진행 중입니다.')
+            return
+        if self._resume_kind is None:
+            self._publish_status(detail='재개할 이전 작업이 없습니다.')
+            return
+
+        kind = self._resume_kind
+        tool = self._resume_tool
+        grasp_spec = self._resume_grasp_spec
+        resume_state = self._resume_state
+        # 재개는 1회성이다 - 실행을 시작하는 시점에 스냅샷을 지워 중복 재개를 막는다.
+        self._resume_kind = None
+        self._resume_state = None
+        self._resume_tool = None
+        self._resume_grasp_spec = None
+
+        self.current_tool = tool
+        if kind == 'continue':
+            self._active_grasp_spec = grasp_spec
+            if resume_state == State.MOVE_SAFE:
+                self._set_state(State.MOVE_SAFE, detail=f'{tool} 재개 - handover_safe로 이동')
+                self._send_robot_goal('move_named', named_target='handover_safe')
+            elif resume_state == State.APPROACH_HAND:
+                self._set_state(State.APPROACH_HAND, detail=f'{tool} 재개 - 작업자를 찾는 중')
+                self._start_after_vision_mode(
+                    SetVisionMode.Request.TRACK_HAND, '',
+                    State.APPROACH_HAND,
+                    lambda: self._send_robot_goal('handover_approach'))
+            elif resume_state == State.WAIT_PULL:
+                self._set_state(State.WAIT_PULL, detail=f'{tool} 재개 - 당김 대기')
+                timeout_s = self.get_parameter('wait_pull_timeout_s').value
+                self._wait_pull_timeout_timer = self.create_timer(
+                    timeout_s, self._on_wait_pull_timeout)
+                self._send_robot_goal('handover_hold')
+            return
+
+        # kind == 'retry_pick': SERVO_PICK/VERIFY_GRASP 중단 - 그리퍼 상태가
+        # 불확실하므로 release_and_retry와 동일하게 안전하게 열고 watch로 돌아가
+        # DETECT_TRACK부터 다시 시작한다. 기존 verify_grasp 재시도 횟수에 포함시켜,
+        # 반복되면 결국 수동 확인을 요구한다(_handle_servo_pick_result와 동일 정책).
+        self._verify_grasp_retries += 1
+        max_retries = self.get_parameter('verify_grasp_max_retries').value
+        if self._verify_grasp_retries > max_retries:
+            self.current_tool = None
+            self._enter_fault(
+                '재개 재시도 초과 - 파지 상태가 불확실합니다. 수동 점검이 필요합니다.')
+            return
+        self._set_state(State.VERIFY_GRASP, detail=f'{tool} 재개 - 안전하게 그리퍼 열고 재시도')
+        self._send_robot_goal('release_and_retry')
 
     def _handle_mode_switch(self, mode):
         if self.state == State.IDLE and not self._goal_in_progress:
@@ -50,7 +141,9 @@ class TaskFlow:
         self._send_robot_goal('move_named', named_target=named_target)
 
     def _handle_fetch_tool(self, tool):
-        if self.operation_mode != Mode.AUTO:
+        allow_manual_fetch = bool(self.get_parameter('test_mode.allow_manual_fetch').value)
+        is_allowed_manual = allow_manual_fetch and self.operation_mode == Mode.MANUAL
+        if self.operation_mode != Mode.AUTO and not is_allowed_manual:
             self._publish_status(detail='공구 전달 명령은 AUTO 모드에서만 지원됩니다.')
             return
         if not bool(self.get_parameter('auto.config_ready').value):
@@ -353,6 +446,12 @@ class TaskFlow:
             detail = f'DONE tool={self.current_tool}'
             self.current_tool = None
             self._active_grasp_spec = None
+            # 정상적으로 한 사이클을 완주했다 - 남아있을 수 있는 오래된 재개
+            # 스냅샷(예: 이번 사이클 이전의 FAULT 기록)을 정리한다.
+            self._resume_kind = None
+            self._resume_state = None
+            self._resume_tool = None
+            self._resume_grasp_spec = None
             self._set_state(State.IDLE, detail=detail)
         else:
             self._enter_fault(result.message)

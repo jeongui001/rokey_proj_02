@@ -12,11 +12,13 @@ class Command:
     MODE_SWITCH = 'mode_switch'
     FETCH_TOOL = 'fetch_tool'
     RESET = 'reset'
+    RESUME = 'resume'
     UNKNOWN = 'unknown'
 
 
 _STOP_KEYWORDS = ('멈춰', '정지')
 _RESET_KEYWORDS = ('리셋', '초기화')
+_RESUME_KEYWORDS = ('재개',)
 
 # MANUAL 이동 명령: 발화에 포함된 구문 -> named_target
 _MANUAL_MOVE_KEYWORDS = {
@@ -64,6 +66,9 @@ def parse_command(text: str) -> dict:
 
     if any(keyword in stripped for keyword in _RESET_KEYWORDS):
         return {'type': Command.RESET}
+
+    if any(keyword in stripped for keyword in _RESUME_KEYWORDS):
+        return {'type': Command.RESUME}
 
     for phrase, named_target in _MANUAL_MOVE_KEYWORDS.items():
         if phrase in stripped:

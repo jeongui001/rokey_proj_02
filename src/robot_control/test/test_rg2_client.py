@@ -307,6 +307,9 @@ def test_close_stops_waiting_when_node_safety_state_not_normal(monkeypatch):
                 'rg2.command_timeout_s': 5.0,
                 'rg2.poll_interval_s': 0.01,
                 'rg2.open_width_tolerance_mm': 2.0,
+                'rg2.connect_timeout_s': 2.0,
+                'rg2.communication_retry_count': 0,
+                'rg2.communication_retry_backoff_s': 0.5,
             }
             return _Param(values[name])
 
@@ -401,6 +404,109 @@ def test_close_fails_when_final_state_read_returns_no_registers(monkeypatch):
 
     assert result is False
     assert client.last_status == RG2Status.COMMUNICATION_ERROR
+
+
+# ---- COMMUNICATION_ERROR 자동 재시도 ----
+
+def _make_fake_node(retry_count=0, backoff_s=0.0, safety_state='NORMAL'):
+    class _Param:
+        def __init__(self, value):
+            self.value = value
+
+    class _Logger:
+        def __init__(self):
+            self.warnings = []
+
+        def warn(self, msg, *a, **k):
+            self.warnings.append(msg)
+
+    class _FakeNode:
+        def __init__(self):
+            self.safety_state = safety_state
+            self.logger = _Logger()
+
+        def get_parameter(self, name):
+            values = {
+                'rg2.command_timeout_s': 5.0,
+                'rg2.poll_interval_s': 0.01,
+                'rg2.open_width_tolerance_mm': 2.0,
+                'rg2.connect_timeout_s': 2.0,
+                'rg2.communication_retry_count': retry_count,
+                'rg2.communication_retry_backoff_s': backoff_s,
+            }
+            return _Param(values[name])
+
+        def get_logger(self):
+            return self.logger
+
+    return _FakeNode()
+
+
+def test_close_retries_once_on_communication_error_and_succeeds(monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    class _FlakyClient(_FakeModbusClient):
+        def __init__(self):
+            super().__init__(read_busy_values=[0, 0])
+            self._connect_calls = 0
+
+        def connect(self):
+            self._connect_calls += 1
+            return self._connect_calls > 1  # 첫 연결만 실패, 이후 성공
+
+    fake = _install_fake(monkeypatch, _FlakyClient())
+    node = _make_fake_node(retry_count=2, backoff_s=0.0)
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True, node=node)
+    result = client.close(width_mm=30.0, force_n=20.0)
+
+    assert result is True
+    assert client.last_status == RG2Status.SUCCESS
+    assert len(fake.write_calls) == 1  # 실패한 첫 시도는 쓰기까지 가지도 못했다
+    assert len(node.logger.warnings) == 1  # 재시도 1번만 있었다
+
+
+def test_close_gives_up_after_exhausting_retries(monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _install_fake(monkeypatch, _FakeModbusClient(connect_ok=False))
+    node = _make_fake_node(retry_count=2, backoff_s=0.0)
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True, node=node)
+    result = client.close(width_mm=30.0, force_n=20.0)
+
+    assert result is False
+    assert client.last_status == RG2Status.COMMUNICATION_ERROR
+    assert len(node.logger.warnings) == 2  # retry_count=2만큼 재시도했다
+
+
+def test_close_does_not_retry_when_canceled(monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _install_fake(monkeypatch, _FakeModbusClient())
+    node = _make_fake_node(retry_count=2, backoff_s=0.0)
+    gh = _FakeGoalHandle(cancel_after=1)  # 첫 확인부터 취소된 상태
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True, node=node)
+    result = client.close(width_mm=30.0, force_n=20.0, goal_handle=gh)
+
+    assert result is False
+    assert client.last_status == RG2Status.CANCELED
+    assert node.logger.warnings == []  # CANCELED는 재시도 대상이 아니다
+
+
+def test_close_without_retry_configured_fails_immediately(monkeypatch):
+    # node 없이(기존 테스트들과 동일) 생성하면 기본 재시도 횟수가 0이라 기존
+    # 동작(즉시 실패)이 그대로 유지된다.
+    fake = _install_fake(monkeypatch, _FakeModbusClient(connect_ok=False))
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True)
+    result = client.close(width_mm=30.0, force_n=20.0)
+
+    assert result is False
+    assert client.last_status == RG2Status.COMMUNICATION_ERROR
+    assert fake.write_calls == []
 
 
 # ---- get_state 안전화 ----
