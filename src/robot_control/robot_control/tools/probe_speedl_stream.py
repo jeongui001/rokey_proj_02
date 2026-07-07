@@ -137,6 +137,8 @@ def _run_phase_segments(
                 pub, speedl_stream_cls, axis, vel_mm_s, acc, period_s, segment,
                 stop_event)
         else:
+            print('정지 명령 1회 발행 후 침묵 - 로봇이 멈춘 채 유지되는지 관찰하세요.')
+            _publish_zero(pub, speedl_stream_cls, acc, period_s, repeats=1)
             print(f'발행 중단 {segment.duration_s:.2f}s - 로봇 반응을 관찰하세요.')
             ok = _sleep_ticked(stop_event, segment.duration_s)
         if not ok:
