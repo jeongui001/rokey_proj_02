@@ -1,9 +1,9 @@
+import math
 import time
 
 import numpy as np
 
 from robot_control.kalman import KalmanXYZV
-
 
 class ServoState:
     TRACKING = 'tracking'
@@ -21,6 +21,23 @@ class ServoCommand:
         self.vy = vy
         self.vz = vz
         self.yaw_rate = yaw_rate
+
+
+def _clip(value, limit):
+    if limit <= 0:
+        return 0.0
+    if value > limit:
+        return limit
+    if value < -limit:
+        return -limit
+    return value
+
+
+def _yaw_from_quaternion(orientation) -> float:
+    """geometry_msgs/Quaternion에서 yaw(rad)만 추출한다 (ToolTrack.msg 주석: orientation에는
+    yaw만 의미 있게 반영됨을 전제로 한다)."""
+    x, y, z, w = orientation.x, orientation.y, orientation.z, orientation.w
+    return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 class ServoLoop:
@@ -199,4 +216,104 @@ class ServoLoop:
             return 'diverging'
         # 참고: "공구가 방향 전환하여 시야 이탈 예상"(2.8절)은 판정 기준이 모호해
         # 과설계 우려가 있으므로 1차 구현 범위에서 제외했다. 실측 후 필요하면 추가한다.
+        return None
+
+
+class HandApproachState:
+    TRACKING = 'tracking'
+    ARRIVED = 'arrived'
+
+
+class HandApproachServo:
+    """작업자 손에 접근하는 PBVS 서보 루프.
+
+    ServoLoop과 같은 P 제어(부호 계약: v = +Kp*error) 패턴을 재사용하지만 목표가
+    "손"이고, 정지 조건이 xy/z 2단계가 아니라 **3D 유클리드 거리 하나**뿐이라는
+    점이 다르다. 그리퍼 동작은 전혀 하지 않는다 - 정지 조건에 도달하면 속도 0으로
+    멈추고, 그 다음은 (task_manager가 이어서 보내는) handover_hold가 당김을
+    기다린다.
+
+    좌표 계약은 ServoLoop와 동일하다: 입력 msg.pose.position은 반드시
+    "손 위치 - 현재 TCP 위치" 오차(base_link 프레임, m)여야 한다
+    (robot_control_node._compute_hand_pose_tcp_offset이 계산해서 넘긴다).
+
+    /vision/hand_pose는 plain geometry_msgs/PoseStamped라 ToolTrack과 달리
+    depth_valid/confidence 필드가 없다 - "추적 유실"은 메시지 수신 최신성
+    (t_lost_s)만으로 판단한다. orientation(손이 향한 방향)도 아직 의미가 정의돼
+    있지 않아 yaw 명령은 만들지 않는다(항상 0).
+    """
+
+    def __init__(self, kp_xy, v_max, timeout_s, t_lost_s, stop_distance_m,
+                 diverge_factor=1.2, diverge_window=3):
+        self.kp_xy = kp_xy
+        self.v_max = v_max
+        self.timeout_s = timeout_s
+        self.t_lost_s = t_lost_s
+        self.stop_distance_m = stop_distance_m
+        self.diverge_factor = diverge_factor
+        self.diverge_window = diverge_window
+        self._state = HandApproachState.TRACKING
+        self._start_time = None
+        self._last_update_time = None
+        self._latest_msg = None
+        self._error_history = []
+
+    def start(self) -> None:
+        now = time.monotonic()
+        self._state = HandApproachState.TRACKING
+        self._start_time = now
+        self._last_update_time = now
+        self._latest_msg = None
+        self._error_history = []
+
+    def _distance(self, msg) -> float:
+        pos = msg.pose.position
+        return math.sqrt(pos.x ** 2 + pos.y ** 2 + pos.z ** 2)
+
+    def on_hand_pose(self, msg) -> None:
+        self._latest_msg = msg
+        self._last_update_time = time.monotonic()
+        distance = self._distance(msg)
+        self._error_history.append(distance)
+        if len(self._error_history) > self.diverge_window:
+            self._error_history.pop(0)
+        self._state = (
+            HandApproachState.ARRIVED if distance <= self.stop_distance_m
+            else HandApproachState.TRACKING)
+
+    def step(self):
+        """입력 position은 (손 위치 - 현재 TCP) 오차이므로, 오차를 줄이는 방향으로
+        속도를 낸다: v = +Kp * error (ServoLoop.step()과 동일한 부호 계약). 손을
+        향한 회전(yaw)은 orientation 의미가 정의돼 있지 않아 만들지 않는다."""
+        if self._latest_msg is None:
+            return ServoCommand()
+        pos = self._latest_msg.pose.position
+        vx = _clip(self.kp_xy * pos.x, self.v_max)
+        vy = _clip(self.kp_xy * pos.y, self.v_max)
+        vz = _clip(self.kp_xy * pos.z, self.v_max)
+        return ServoCommand(vx=vx, vy=vy, vz=vz, yaw_rate=0.0)
+
+    def get_state(self) -> str:
+        return self._state
+
+    def should_stop(self) -> bool:
+        """3D 유클리드 거리가 stop_distance_m 이내면 접근을 멈춘다(그리퍼 동작 없음)."""
+        if self._latest_msg is None:
+            return False
+        return self._distance(self._latest_msg) <= self.stop_distance_m
+
+    def should_abort(self):
+        now = time.monotonic()
+        if self._start_time is not None and (now - self._start_time) > self.timeout_s:
+            return 'timeout'
+        if self._last_update_time is not None and (now - self._last_update_time) > self.t_lost_s:
+            return 'lost'
+        if len(self._error_history) == self.diverge_window:
+            strictly_increasing = all(
+                self._error_history[i] < self._error_history[i + 1]
+                for i in range(len(self._error_history) - 1)
+            )
+            if strictly_increasing and (
+                    self._error_history[-1] > self._error_history[0] * self.diverge_factor):
+                return 'diverged'
         return None

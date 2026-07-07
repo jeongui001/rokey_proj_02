@@ -1,0 +1,6 @@
+# hardware_enabled=true일 때만 실제로 사용되는 pip 의존성.
+# dry_run(hardware_enabled=false, 기본값)에서는 두 라이브러리가 없어도
+# robot_control_node가 정상적으로 기동된다 (지연 임포트 - RG2Client._ensure_connected,
+# RobotControlNode._pose_stamped_to_posx 참고).
+scipy      # move_pose 자세(quaternion) -> Doosan movel 입력(ZYZ Euler) 변환에 사용
+pymodbus   # OnRobot RG2 그리퍼를 Modbus TCP(Tool Changer)로 제어하는 데 사용

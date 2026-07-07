@@ -13,6 +13,7 @@ setup(
             'launch/task_manager.launch.py',
             'launch/handover_system.launch.py',
         ]),
+        ('share/' + package_name + '/config', ['config/task_manager_params.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

@@ -1,6 +1,14 @@
 import time
+
 import pytest
-from robot_control.servo_loop import ServoLoop, ServoState, ServoCommand
+from geometry_msgs.msg import PoseStamped
+from robot_control.servo_loop import (
+    HandApproachServo,
+    HandApproachState,
+    ServoCommand,
+    ServoLoop,
+    ServoState,
+)
 
 
 class FakeHeader:
@@ -41,6 +49,21 @@ def _make_loop(**overrides):
                   z_close=0.02, diverge_n=5, cov_threshold=0.5)
     kwargs.update(overrides)
     return ServoLoop(**kwargs)
+
+
+def _make_hand_servo(**overrides):
+    kwargs = dict(kp_xy=1.0, v_max=0.15, timeout_s=5.0, t_lost_s=0.3, stop_distance_m=0.05)
+    kwargs.update(overrides)
+    return HandApproachServo(**kwargs)
+
+
+def _hand_pose(x=0.0, y=0.0, z=0.0):
+    msg = PoseStamped()
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.position.z = z
+    msg.pose.orientation.w = 1.0
+    return msg
 
 
 def test_initial_state_is_tracking():
@@ -134,3 +157,120 @@ def test_should_abort_none_when_healthy():
     loop.start('spanner', 30.0, 20.0)
     loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
     assert loop.should_abort() is None
+
+
+# ==== HandApproachServo (handover_approach) ====
+
+def test_hand_approach_initial_state_is_tracking():
+    servo = _make_hand_servo()
+    servo.start()
+
+    assert servo.get_state() == HandApproachState.TRACKING
+
+
+def test_hand_approach_step_with_no_pose_yet_returns_zero_command():
+    servo = _make_hand_servo()
+    servo.start()
+
+    cmd = servo.step()
+
+    assert cmd.vx == 0.0 and cmd.vy == 0.0 and cmd.vz == 0.0 and cmd.yaw_rate == 0.0
+
+
+def test_hand_approach_step_commands_velocity_toward_positive_error():
+    servo = _make_hand_servo()
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=0.1, y=0.05, z=0.02))
+
+    cmd = servo.step()
+
+    assert cmd.vx > 0.0
+    assert cmd.vy > 0.0
+    assert cmd.vz > 0.0
+    assert cmd.yaw_rate == 0.0  # orientation 의미 미정의 - 항상 0
+
+
+def test_hand_approach_step_commands_velocity_toward_negative_error():
+    servo = _make_hand_servo()
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=-0.1, y=-0.05, z=-0.02))
+
+    cmd = servo.step()
+
+    assert cmd.vx < 0.0
+    assert cmd.vy < 0.0
+    assert cmd.vz < 0.0
+
+
+def test_hand_approach_step_clips_velocity_to_v_max():
+    servo = _make_hand_servo(v_max=0.2)
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=10.0, y=0.0, z=0.0))
+
+    cmd = servo.step()
+
+    assert cmd.vx == pytest.approx(0.2)
+
+
+def test_hand_approach_should_stop_within_distance():
+    servo = _make_hand_servo(stop_distance_m=0.05)
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=0.03, y=0.0, z=0.0))  # 3D 거리 0.03m < 0.05m
+
+    assert servo.should_stop() is True
+    assert servo.get_state() == HandApproachState.ARRIVED
+
+
+def test_hand_approach_should_not_stop_outside_distance():
+    servo = _make_hand_servo(stop_distance_m=0.05)
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=0.1, y=0.1, z=0.1))  # 3D 거리 > 0.05m
+
+    assert servo.should_stop() is False
+    assert servo.get_state() == HandApproachState.TRACKING
+
+
+def test_hand_approach_should_stop_false_before_any_pose():
+    servo = _make_hand_servo()
+    servo.start()
+
+    assert servo.should_stop() is False
+
+
+def test_hand_approach_should_abort_timeout():
+    servo = _make_hand_servo(timeout_s=0.01)
+    servo.start()
+    time.sleep(0.02)
+
+    assert servo.should_abort() == 'timeout'
+
+
+def test_hand_approach_should_abort_lost_when_no_update_within_t_lost():
+    servo = _make_hand_servo(timeout_s=5.0, t_lost_s=0.01)
+    servo.start()
+    servo.on_hand_pose(_hand_pose(x=0.2, y=0.0, z=0.0))
+    time.sleep(0.02)
+
+    assert servo.should_abort() == 'lost'
+
+
+def test_hand_approach_should_abort_diverged_when_error_grows():
+    servo = _make_hand_servo(diverge_window=3, diverge_factor=1.2)
+    servo.start()
+
+    servo.on_hand_pose(_hand_pose(x=0.01, y=0.0, z=0.0))
+    servo.on_hand_pose(_hand_pose(x=0.02, y=0.0, z=0.0))
+    servo.on_hand_pose(_hand_pose(x=0.05, y=0.0, z=0.0))
+
+    assert servo.should_abort() == 'diverged'
+
+
+def test_hand_approach_should_abort_none_when_converging():
+    servo = _make_hand_servo(diverge_window=3, diverge_factor=1.2, timeout_s=5.0, t_lost_s=5.0)
+    servo.start()
+
+    servo.on_hand_pose(_hand_pose(x=0.2, y=0.0, z=0.0))
+    servo.on_hand_pose(_hand_pose(x=0.1, y=0.0, z=0.0))
+    servo.on_hand_pose(_hand_pose(x=0.06, y=0.0, z=0.0))
+
+    assert servo.should_abort() is None

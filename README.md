@@ -4,12 +4,12 @@
 ## 설치
 
 ```bash
-# ROS2 패키지 의존성 (rosbridge_server, realsense2_camera 등)
+# ROS2 패키지 의존성 (realsense2_camera 등)
 rosdep install --from-paths src --ignore-src -y
 
-# handover_ui(PyQt) pip 의존성
-pip install -r src/handover_ui/requirements.txt
-pip install -r src/handover_ui/test-requirements.txt  # 테스트 실행 시에만 필요
+# operator_gui(PyQt) pip 의존성
+pip install -r src/operator_gui/requirements.txt
+pip install -r src/operator_gui/test-requirements.txt  # 테스트 실행 시에만 필요
 
 colcon build --symlink-install
 ```

@@ -2,10 +2,11 @@ import time
 
 import pytest
 import rclpy
+from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 
 from handover_interfaces.msg import GripperState
-from handover_ui.ros_client import RosClient, _HandoverUiNode
+from operator_gui.ros_client import DEFAULT_CAMERA_TOPIC, RosClient, _OperatorGuiNode
 
 
 @pytest.fixture(scope='module', autouse=True)
@@ -20,9 +21,12 @@ class _FakeOwner:
         self.task_status_calls = []
         self.gripper_state_calls = []
         self.fault_calls = []
-        self.on_task_status = lambda state, detail: self.task_status_calls.append((state, detail))
+        self.camera_image_calls = []
+        self.on_task_status = lambda state, detail, mode, safety: (
+            self.task_status_calls.append((state, detail, mode, safety)))
         self.on_gripper_state = lambda width, grip: self.gripper_state_calls.append((width, grip))
         self.on_fault = lambda msg: self.fault_calls.append(msg)
+        self.on_camera_image = lambda data: self.camera_image_calls.append(data)
 
 
 @pytest.fixture
@@ -32,7 +36,7 @@ def owner():
 
 @pytest.fixture
 def node(owner):
-    n = _HandoverUiNode(owner)
+    n = _OperatorGuiNode(owner, DEFAULT_CAMERA_TOPIC)
     n.subscribe_all()
     yield n
     n.destroy_node()
@@ -57,10 +61,12 @@ def _spin_until(spin_target, predicate, timeout_s=3.0):
 def test_task_status_callback_parses_json(node, owner, peer):
     pub = peer.create_publisher(String, '/task/status', 10)
     time.sleep(0.3)
-    pub.publish(String(data='{"state": "IDLE", "detail": "ready"}'))
+    pub.publish(String(
+        data='{"state": "IDLE", "detail": "ready", '
+             '"operation_mode": "AUTO", "safety_state": "NORMAL"}'))
 
     assert _spin_until(node, lambda: owner.task_status_calls)
-    assert owner.task_status_calls == [('IDLE', 'ready')]
+    assert owner.task_status_calls == [('IDLE', 'ready', 'AUTO', 'NORMAL')]
 
 
 def test_gripper_state_callback_forwards_fields(node, owner, peer):
@@ -81,15 +87,31 @@ def test_fault_callback_forwards_message(node, owner, peer):
     assert owner.fault_calls == ['torque anomaly']
 
 
+def test_camera_image_callback_forwards_raw_bytes(node, owner, peer):
+    pub = peer.create_publisher(CompressedImage, DEFAULT_CAMERA_TOPIC, 10)
+    time.sleep(0.3)
+    msg = CompressedImage()
+    msg.format = 'jpeg'
+    msg.data = [1, 2, 3, 4]
+    pub.publish(msg)
+
+    assert _spin_until(node, lambda: owner.camera_image_calls)
+    assert owner.camera_image_calls == [bytes([1, 2, 3, 4])]
+
+
 def test_publish_command_sends_message(node, peer):
     received = []
     peer.create_subscription(String, '/user_command/text', lambda m: received.append(m.data), 10)
     time.sleep(0.3)
 
-    node.publish_command('스패너 갖다줘')
+    assert node.publish_command('스패너 갖다줘') is True
 
     assert _spin_until(peer, lambda: received)
     assert received == ['스패너 갖다줘']
+
+
+def test_publish_command_rejects_empty_text(node):
+    assert node.publish_command('   ') is False
 
 
 @pytest.fixture
@@ -107,21 +129,45 @@ def test_connect_starts_and_close_stops_spin_thread(client):
     assert client.is_connected() is False
 
 
+def test_connect_notifies_connection_changed(client):
+    received = []
+    client.on_connection_changed = lambda connected: received.append(connected)
+
+    client.connect()
+
+    assert received == [True]
+
+
+def test_ensure_connected_restarts_dead_spin_thread(client):
+    received = []
+    client.on_connection_changed = lambda connected: received.append(connected)
+    client.connect()
+    client._spin_thread.stop()
+
+    client.ensure_connected()
+
+    assert client.is_connected() is True
+    assert received == [True, False, True]
+
+
 def test_subscribe_all_and_receive_task_status(client, peer):
     received = []
-    client.on_task_status = lambda state, detail: received.append((state, detail))
+    client.on_task_status = lambda state, detail, mode, safety: received.append(
+        (state, detail, mode, safety))
     client.subscribe_all()
     client.connect()
 
     pub = peer.create_publisher(String, '/task/status', 10)
     time.sleep(0.3)
-    pub.publish(String(data='{"state": "IDLE", "detail": "ready"}'))
+    pub.publish(String(
+        data='{"state": "IDLE", "detail": "ready", '
+             '"operation_mode": "AUTO", "safety_state": "NORMAL"}'))
 
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline and not received:
         time.sleep(0.05)
 
-    assert received == [('IDLE', 'ready')]
+    assert received == [('IDLE', 'ready', 'AUTO', 'NORMAL')]
 
 
 def test_publish_command_via_client(client, peer):
@@ -131,7 +177,7 @@ def test_publish_command_via_client(client, peer):
     client.connect()
     time.sleep(0.3)
 
-    client.publish_command('스패너 갖다줘')
+    assert client.publish_command('스패너 갖다줘') is True
 
     assert _spin_until(peer, lambda: received)
     assert received == ['스패너 갖다줘']

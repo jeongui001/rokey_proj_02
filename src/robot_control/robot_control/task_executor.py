@@ -1,0 +1,720 @@
+import math
+import time
+
+import rclpy
+from geometry_msgs.msg import PoseStamped
+
+from handover_interfaces.action import RobotTask
+from handover_interfaces.msg import ToolTrack
+
+from robot_control.rg2_client import RG2Status
+from robot_control.safety_monitor import FaultPrefix, SafetyState
+
+
+class TaskExecutor:
+    """RobotTask 5종을 실행하는 RobotControlNode용 mixin."""
+
+    def _cleanup_stop_motion(self) -> bool:
+        """M0609 MoveStop 정지를 시도한다. 실패/예외 시에도 절대 상위로 전파하지 않는다."""
+        if not self.hardware_enabled or self._doosan is None:
+            return True
+        stop_mode = self.get_parameter('safety.fault_stop_mode').value
+        try:
+            return bool(self._doosan.stop(stop_mode))
+        except Exception as exc:
+            self.get_logger().error(f'MoveStop cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_close_rt_session(self) -> bool:
+        """RT 세션 stop/disconnect (_close_rt_session 경계). _close_rt_session이
+        실제로 확인한 성공 여부(bool)를 그대로 전달한다 - 예외 발생 시에도 절대
+        상위로 전파하지 않는다."""
+        try:
+            return bool(self._close_rt_session())
+        except Exception as exc:
+            self.get_logger().error(f'RT 세션 종료 cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_disable_compliance(self) -> bool:
+        """compliance 해제 (_disable_compliance 경계). 실패/예외 시에도 절대 상위로
+        전파하지 않는다."""
+        try:
+            self._disable_compliance()
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'compliance 해제 cleanup 중 예외: {exc}')
+            return False
+
+    def _cleanup_destroy_subscription(self, sub) -> bool:
+        """servo_pick 중 임시로 만든 ToolTrack subscription을 제거한다."""
+        if sub is None:
+            return True
+        try:
+            self.destroy_subscription(sub)
+            return True
+        except Exception as exc:
+            self.get_logger().error(f'subscription 제거 cleanup 중 예외: {exc}')
+            return False
+
+    def _dry_run_move(self, goal_handle) -> bool:
+        duration_s = self.get_parameter('move.dry_run_duration_s').value
+        poll_interval_s = max(self.get_parameter('move.poll_interval_s').value, 0.001)
+        deadline = time.monotonic() + duration_s
+        while time.monotonic() < deadline:
+            if goal_handle is not None and goal_handle.is_cancel_requested:
+                return False
+            if self.safety_state != SafetyState.NORMAL:
+                return False
+            time.sleep(min(poll_interval_s, max(deadline - time.monotonic(), 0.0)))
+        return True
+
+    def _move_joint(self, goal_handle, pos_deg6, vel, acc) -> bool:
+        if not self.hardware_enabled:
+            return self._dry_run_move(goal_handle)
+        if self._doosan is None:
+            self.get_logger().error('DoosanDriver가 초기화되지 않았습니다 - move_joint 실패')
+            return False
+        return self._doosan.move_joint(
+            goal_handle, pos_deg6, vel, acc,
+            radius_mm=self.get_parameter('move.blend_radius_mm').value,
+            sync_type=self.get_parameter('move.sync_type').value,
+            poll_interval_s=self.get_parameter('move.poll_interval_s').value,
+            timeout_s=self.get_parameter('move.timeout_s').value)
+
+    def _call_move_service(self, goal_handle=None, named_target='') -> bool:
+        """고정 자세(movej) 이동을 수행한다."""
+        if named_target:
+            if named_target not in self._named_poses:
+                self.get_logger().error(
+                    f"알 수 없는 named pose '{named_target}' - 이동을 거부합니다 "
+                    '(hardware_enabled 여부와 무관하게 dry-run에서도 거부됨).')
+                return False
+            pos = self._named_poses.get(named_target)
+            if not pos:
+                allow_dry_run = bool(
+                    self.get_parameter('dry_run.allow_unconfigured_named_poses').value)
+                if self.hardware_enabled or not allow_dry_run:
+                    # hardware_enabled=true에서는 dry_run.allow_unconfigured_named_poses와
+                    # 무관하게 빈 pose를 절대 허용하지 않는다.
+                    self.get_logger().error(
+                        f"named pose '{named_target}'의 관절값이 설정되지 않았습니다 "
+                        f"(파라미터 named_poses.{named_target}). 이동을 수행하지 않습니다.")
+                    return False
+                self.get_logger().info(
+                    f"[dry_run] named pose '{named_target}' 관절값 미설정 - "
+                    'dry_run.allow_unconfigured_named_poses=true라서 dry-run 이동을 진행합니다.')
+            else:
+                # 값이 채워져 있다면(비어있지 않다면) hardware_enabled/dry-run 여부와
+                # 무관하게 6개의 finite 숫자인지 검사한다 - 실제 관절 제한값은 근거가
+                # 없어 추측하지 않지만, 개수/NaN·Inf는 여기서 확실히 걸러낸다.
+                if len(pos) != 6 or not all(
+                        isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and math.isfinite(v) for v in pos):
+                    self.get_logger().error(
+                        f"named pose '{named_target}'의 관절값이 유효하지 않습니다 "
+                        f"(정확히 6개의 finite 숫자여야 함, 현재 값={pos}) - 이동을 거부합니다.")
+                    return False
+            vel = self.get_parameter('move.vel_deg_s').value
+            acc = self.get_parameter('move.acc_deg_s2').value
+            success = self._move_joint(goal_handle, pos, vel, acc)
+        else:
+            self.get_logger().error('_call_move_service: named_target이 필요합니다.')
+            return False
+        # 이동 함수가 반환된 직후에도 안전상태를 다시 확인한다 - 이동 서비스가 성공
+        # 응답을 반환하는 순간과 거의 동시에 Fault가 발생하는 경합으로 인해 Action이
+        # 성공 처리되지 않도록 막는다.
+        if success and self.safety_state != SafetyState.NORMAL:
+            self.get_logger().warn(
+                f'이동 완료 직후 안전상태 비정상({self.safety_state}) 감지 - 성공으로 처리하지 않습니다.')
+            return False
+        return success
+
+    def _execute_move_named(self, goal_handle):
+        result = RobotTask.Result()
+        if self.safety_state != SafetyState.NORMAL:
+            goal_handle.abort()
+            result.success = False
+            result.message = f'move_named rejected - safety_state={self.safety_state}'
+            return result
+        try:
+            success = self._call_move_service(
+                goal_handle=goal_handle,
+                named_target=goal_handle.request.named_target)
+        except Exception as exc:  # 통신 오류 등 예외 발생 시 성공을 반환하지 않는다
+            self.get_logger().error(f'move_named 실행 중 예외: {exc}')
+            goal_handle.abort()
+            result.success = False
+            result.message = f'move_named exception: {exc}'
+            return result
+        if not success and goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            result.success = False
+            result.message = f'move_named({goal_handle.request.named_target}) canceled'
+            return result
+        if success:
+            goal_handle.succeed()
+            result.success = True
+        else:
+            goal_handle.abort()
+            result.success = False
+            result.message = f'move_named({goal_handle.request.named_target}) failed'
+        return result
+
+    def _execute_release_and_retry(self, goal_handle):
+        result = RobotTask.Result()
+        if self.safety_state != SafetyState.NORMAL:
+            goal_handle.abort()
+            result.success = False
+            result.message = f'release_and_retry rejected - safety_state={self.safety_state}'
+            return result
+        try:
+            # RG2를 실제로 열기 직전에 취소/안전 상태를 다시 확인한다 - 그 사이 취소나
+            # Fault가 발생했다면 그리퍼를 열지 않는다.
+            if goal_handle.is_cancel_requested:
+                goal_handle.canceled()
+                result.success = False
+                result.message = 'release_and_retry canceled before opening gripper'
+                return result
+            if self.safety_state != SafetyState.NORMAL:
+                goal_handle.abort()
+                result.success = False
+                result.message = (
+                    f'release_and_retry aborted before opening gripper - '
+                    f'safety_state={self.safety_state}')
+                return result
+            open_ok = self.rg2_client.open(goal_handle=goal_handle)
+            if not open_ok:
+                if self.rg2_client.last_status == RG2Status.CANCELED:
+                    # 실행 중 취소가 정상적으로 확인되어 command=8(stop)으로 멈췄다 -
+                    # FAULT가 아니라 canceled()로 마무리한다.
+                    goal_handle.canceled()
+                    result.success = False
+                    result.message = 'release_and_retry canceled during RG2 open'
+                    return result
+                # RG2 open 실패(잘못된 설정/통신 오류/busy timeout) - 물체를 놓쳤는지
+                # 불확실한 채로 이동을 계속하지 않는다.
+                detail = (
+                    f'release_and_retry RG2 open 실패'
+                    f'(status={self.rg2_client.last_status}) - 안전을 위해 FAULT 처리')
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                goal_handle.abort()
+                result.success = False
+                result.message = detail
+                return result
+            success = self._call_move_service(
+                goal_handle=goal_handle, named_target='watch')
+        except Exception as exc:
+            self.get_logger().error(f'release_and_retry 실행 중 예외: {exc}')
+            goal_handle.abort()
+            result.success = False
+            result.message = f'release_and_retry exception: {exc}'
+            return result
+        if not success and goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+            result.success = False
+            result.message = 'release_and_retry canceled'
+            return result
+        if success:
+            goal_handle.succeed()
+            result.success = True
+            result.message = 'released, returned to watch'
+        else:
+            goal_handle.abort()
+            result.success = False
+            result.message = 'release_and_retry failed to return to watch'
+        return result
+
+    # ---- servo_pick ----
+
+    def _open_rt_session(self) -> bool:
+        """RT 세션을 열고, 실제로 시작이 확인된 경우에만 True를 반환한다."""
+        if not self.hardware_enabled:
+            self.get_logger().info('[dry_run] RT 세션 오픈 생략')
+            return True
+        if self._doosan is None:
+            raise RuntimeError('DoosanDriver가 초기화되지 않았습니다.')
+        return self._doosan.open_rt_session()
+
+    def _close_rt_session(self) -> bool:
+        if not self.hardware_enabled:
+            self.get_logger().info('[dry_run] RT 세션 종료 생략')
+            return True
+        if self._doosan is None:
+            return True  # 정리할 DoosanDriver 자체가 없음 - idempotent하게 성공 취급
+        return bool(self._doosan.close_rt_session())
+
+    def _servo_pick_tick(self):
+        abort_reason = self.servo_loop.should_abort()
+        if abort_reason is not None:
+            return ('ABORT', abort_reason)
+        if self.servo_loop.should_close():
+            return ('CLOSE', None)
+        return ('CONTINUE', None)
+
+    def _servo_pick_step(self):
+        """칼만 ServoLoop.step(tcp_pose, now)에 필요한 현재 TCP 위치를 캐시에서
+        읽어 넘긴다. 캐시가 아직 없거나 오래됐으면(_get_current_tcp_posx가 None을
+        반환) 이번 틱은 명령을 계산하지 않고 건너뛴다 - 임의의 기본 좌표로
+        제어식을 계산하지 않기 위함이다. _get_current_tcp_posx()는 mm 단위이므로
+        ServoLoop(m 단위, ToolTrack과 동일)에 맞게 변환한다."""
+        tcp_pose_mm = self._get_current_tcp_posx()
+        if tcp_pose_mm is None:
+            return None
+        tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
+        return self.servo_loop.step(tcp_pose_m, time.monotonic())
+
+    def _get_current_tcp_posx(self):
+        """캐시된 최신 TCP 위치를 [x,y,z,rx,ry,rz](mm/deg)로 반환한다.
+
+        실제 GetCurrentPosx 서비스 호출은 이 함수가 아니라 rate-limited된
+        _on_tcp_pose_refresh_timer가 별도로 수행하고 결과를 self._tcp_pose_cache에
+        저장한다 - ToolTrack 콜백(60Hz일 수 있음)마다 동기 서비스 호출을 하면 여러
+        요청이 겹쳐 executor 스레드를 점유해 안전상태/E-Stop polling이 늦어질 수
+        있기 때문이다. 이 함수는 캐시만 읽으므로 절대 블로킹하지 않는다.
+
+        hardware_enabled=false에서는 캐시가 애초에 채워지지 않으므로 항상 None을
+        반환한다. 캐시가 없거나 servo_pick.tcp_pose_max_age_s보다 오래됐으면(=조회
+        실패가 계속돼 오래된 값을 무한정 재사용하게 되는 경우 포함) None을 반환해
+        호출측이 임의의 기본 좌표를 쓰지 않게 한다."""
+        if not self.hardware_enabled:
+            return None
+        cache = self._tcp_pose_cache
+        if cache is None:
+            return None
+        max_age_s = self.get_parameter('servo_pick.tcp_pose_max_age_s').value
+        age_s = time.monotonic() - cache['received_at']
+        if age_s > max_age_s:
+            return None
+        return cache['pos6']
+
+    def _on_tcp_pose_refresh_timer(self):
+        """TCP 위치 캐시를 rate-limited하게 갱신한다(GetCurrentPosx 호출 과부하 방지).
+
+        - 한 번에 하나의 요청만 허용한다(_tcp_pose_request_in_flight로 직렬화).
+        - servo_pick 또는 handover_approach가 실제로 실행 중일 때만 갱신한다
+          (불필요한 조회를 피한다).
+        - safety_state가 NORMAL이 아니거나 rclpy가 종료 중이면 새 조회를 시작하지 않는다.
+        - 조회 실패 시 기존 캐시를 덮어쓰지 않는다 - 캐시의 나이가 계속 늘어나
+          _get_current_tcp_posx()의 신선도 검사가 자연히 오래된 값을 거부하게 한다
+          (실패했다고 이전 값을 성공한 것처럼 재사용하지 않는다).
+        """
+        if not rclpy.ok():
+            return
+        if not self.hardware_enabled or self._doosan is None:
+            return
+        if self.safety_state != SafetyState.NORMAL:
+            return
+        if not self._tcp_tracking_active:
+            return
+        if self._tcp_pose_request_in_flight:
+            return  # 이미 진행 중인 요청이 있음 - 겹쳐서 새로 호출하지 않는다
+        self._tcp_pose_request_in_flight = True
+        try:
+            pos6 = self._doosan.get_current_posx(ref=0)  # DR_BASE
+            if pos6 is not None:
+                self._tcp_pose_cache = {'pos6': pos6, 'received_at': time.monotonic()}
+        finally:
+            self._tcp_pose_request_in_flight = False
+
+    def _tcp_position_error(self, message, expected_frame):
+        if message.header.frame_id != expected_frame:
+            self.get_logger().error(
+                f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
+            return None
+        position = message.pose.position
+        if not all(math.isfinite(value) for value in (
+                position.x, position.y, position.z)):
+            return None
+        tcp = self._get_current_tcp_posx()
+        if tcp is None:
+            return None
+        return (
+            position.x - tcp[0] / 1000.0,
+            position.y - tcp[1] / 1000.0,
+            position.z - tcp[2] / 1000.0,
+        )
+
+    def _validate_tool_track_message(self, message) -> bool:
+        """servo_loop(칼만 ServoLoop)는 msg.pose.position을 base_link 기준 절대
+        목표 위치로 직접 필터에 흘려보내므로(TCP 오차로 변환하지 않음), 여기서는
+        frame_id/NaN만 확인한다."""
+        expected_frame = self.get_parameter('servo_pick.tool_track_frame_id').value
+        if message.header.frame_id != expected_frame:
+            self.get_logger().error(
+                f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
+            return False
+        position = message.pose.position
+        return all(math.isfinite(value) for value in (
+            position.x, position.y, position.z))
+
+    def _validate_servo_command(self, cmd) -> bool:
+        """RT 속도 명령을 실제로 발행하기 직전 마지막 안전 검사. ServoLoop.step()이
+        내부적으로 이미 _clip으로 속도를 제한하지만, 발행 경계에서 NaN/Inf와 제한을
+        한 번 더 확인해 유효하지 않은 값이 그대로 RT로 나가지 않게 한다."""
+        values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
+        if not all(math.isfinite(v) for v in values):
+            return False
+        tol = 1e-6
+        v_max = abs(self.get_parameter('servo.v_max').value)
+        descend_speed = abs(self.get_parameter('servo.descend_speed').value)
+        if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol:
+            return False
+        if abs(cmd.vz) > descend_speed + tol:
+            return False
+        return True
+
+    def _on_tool_track_during_servo(self, msg):
+        if not self._validate_tool_track_message(msg):
+            # frame_id 불일치 또는 NaN/Inf - 이번 프레임은 유실된 것처럼 취급한다
+            # (ServoLoop.should_abort의 t_lost_s가 결국 감지한다).
+            return
+        self.servo_loop.on_tool_track(msg)
+
+    def _run_rt_tracking(
+            self, goal_handle, *, name, message_type, topic, callback,
+            servo, step, tick, validate_command, ready_parameter, period_parameter):
+        """물체·손 추적이 공통으로 사용하는 RT 실행/취소/정리 루프.
+
+        step: 인자 없이 호출해 이번 틱의 ServoCommand(또는 아직 계산할 수 없으면
+        None)를 반환하는 콜러블 - servo_pick(칼만 ServoLoop, TCP pose 필요)과
+        handover_approach(HandApproachServo, 내부 상태만 사용)가 서로 다른
+        step() 시그니처를 쓰므로 호출부에서 클로저로 그 차이를 흡수한다."""
+        subscription = None
+        rt_attempted = False
+        outcome = 'ABORT'
+        detail = f'{name} aborted'
+        self._tcp_tracking_active = True
+        try:
+            rt_attempted = True
+            rt_confirmed = self._open_rt_session()
+            if self.hardware_enabled and not rt_confirmed:
+                outcome, detail = 'ABORT', f'{name} aborted - RT 세션 시작 실패'
+            else:
+                subscription = self.create_subscription(
+                    message_type, topic, callback, 10,
+                    callback_group=self.sensor_callback_group)
+                ready = bool(self.get_parameter(ready_parameter).value)
+                period = float(self.get_parameter(period_parameter).value)
+
+                while rclpy.ok():
+                    if goal_handle.is_cancel_requested:
+                        if not self._cleanup_stop_motion():
+                            detail = f'{name} 취소 중 MoveStop 실패'
+                            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                            outcome = 'FAULT'
+                        else:
+                            outcome, detail = 'CANCELED', f'{name} canceled'
+                        break
+                    if self.safety_state != SafetyState.NORMAL:
+                        outcome = 'ABORT'
+                        detail = f'{name} aborted - safety_state={self.safety_state}'
+                        break
+
+                    state, reason = tick()
+                    feedback = RobotTask.Feedback()
+                    feedback.state = servo.get_state()
+                    goal_handle.publish_feedback(feedback)
+                    if state == 'ABORT':
+                        outcome, detail = 'ABORT', reason
+                        break
+                    if state in ('CLOSE', 'STOP'):
+                        outcome, detail = 'ARRIVED', ''
+                        break
+
+                    command = step()
+                    if command is not None and (
+                            self.hardware_enabled and ready and rt_confirmed
+                            and self._doosan is not None):
+                        if not validate_command(command):
+                            outcome = 'ABORT'
+                            detail = f'{name} aborted - invalid RT velocity command'
+                            break
+                        self._doosan.publish_speedl_rt(command)
+                    time.sleep(period)
+                else:
+                    self._cleanup_stop_motion()
+                    outcome, detail = 'ABORT', f'{name} aborted - rclpy 종료 중'
+        except Exception as exc:
+            self.get_logger().error(f'{name} 실행 중 예외: {exc}')
+            stop_ok = self._cleanup_stop_motion()
+            if goal_handle.is_cancel_requested and stop_ok:
+                outcome, detail = 'CANCELED', f'{name} canceled after exception: {exc}'
+            else:
+                outcome, detail = 'ABORT', f'{name} exception: {exc}'
+                if not stop_ok:
+                    self._declare_fault(
+                        f'{FaultPrefix.FAULT}{name} 예외 처리 중 MoveStop 실패: {exc}')
+                    outcome = 'FAULT'
+        finally:
+            sub_ok = self._cleanup_destroy_subscription(subscription)
+            rt_ok = self._cleanup_close_rt_session() if rt_attempted else True
+            self._tcp_tracking_active = False
+            if not (sub_ok and rt_ok):
+                detail = (
+                    f'{name} cleanup 실패 '
+                    f'(subscription={sub_ok}, rt_session={rt_ok})')
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                outcome = 'FAULT'
+        return outcome, detail
+
+    @staticmethod
+    def _finish_tracking_result(goal_handle, outcome, detail):
+        result = RobotTask.Result()
+        result.success = outcome == 'ARRIVED'
+        result.message = detail
+        if outcome == 'ARRIVED':
+            goal_handle.succeed()
+        elif outcome == 'CANCELED':
+            goal_handle.canceled()
+        else:
+            goal_handle.abort()
+        return result
+
+    def _execute_servo_pick(self, goal_handle):
+        if self.safety_state != SafetyState.NORMAL:
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                f'servo_pick rejected - safety_state={self.safety_state}')
+        if (self.hardware_enabled
+                and not self.get_parameter('servo_pick.hardware_ready').value):
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                'servo_pick rejected - servo_pick.hardware_ready=false')
+
+        request = goal_handle.request
+        self.servo_loop.start(
+            request.tool_class, request.grasp_width_mm, request.grasp_force_n)
+        outcome, detail = self._run_rt_tracking(
+            goal_handle,
+            name='servo_pick',
+            message_type=ToolTrack,
+            topic='/vision/tool_track',
+            callback=self._on_tool_track_during_servo,
+            servo=self.servo_loop,
+            step=self._servo_pick_step,
+            tick=self._servo_pick_tick,
+            validate_command=self._validate_servo_command,
+            ready_parameter='servo_pick.hardware_ready',
+            period_parameter='servo_pick.rt_control_period_s')
+        if outcome != 'ARRIVED':
+            return self._finish_tracking_result(goal_handle, outcome, detail)
+
+        if goal_handle.is_cancel_requested:
+            self._cleanup_stop_motion()
+            return self._finish_tracking_result(
+                goal_handle, 'CANCELED', 'servo_pick canceled before RG2 close')
+        if self.safety_state != SafetyState.NORMAL:
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                f'servo_pick aborted - safety_state={self.safety_state}')
+
+        if not self.rg2_client.close(
+                request.grasp_width_mm, request.grasp_force_n,
+                goal_handle=goal_handle):
+            if self.rg2_client.last_status == RG2Status.CANCELED:
+                self._cleanup_stop_motion()
+                return self._finish_tracking_result(
+                    goal_handle, 'CANCELED', 'servo_pick canceled during RG2 close')
+            detail = f'servo_pick RG2 close 실패(status={self.rg2_client.last_status})'
+            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+            return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+
+        width_mm, grip_detected = self.rg2_client.get_state()
+        result = self._finish_tracking_result(goal_handle, 'ARRIVED', '')
+        result.final_width_mm = width_mm
+        result.grip_detected = grip_detected
+        return result
+
+    # ---- handover_approach (handover_safe 이후 작업자 손에 접근) ----
+
+    def _compute_hand_pose_tcp_offset(self, message):
+        error = self._tcp_position_error(
+            message,
+            self.get_parameter('handover_approach.hand_pose_frame_id').value)
+        if error is None:
+            return None
+        offset = PoseStamped()
+        offset.header = message.header
+        offset.pose.position.x, offset.pose.position.y, offset.pose.position.z = error
+        offset.pose.orientation = message.pose.orientation
+        return offset
+
+    def _validate_handover_approach_command(self, cmd) -> bool:
+        """RT 속도 명령을 실제로 발행하기 직전 마지막 안전 검사(_validate_servo_command와
+        동일한 목적). HandApproachServo는 3축 모두 같은 v_max로 클립하므로 여기서도
+        축 구분 없이 하나의 한계로 검사한다."""
+        values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
+        if not all(math.isfinite(v) for v in values):
+            return False
+        tol = 1e-6
+        v_max = abs(self.get_parameter('handover_approach.v_max').value)
+        return all(abs(v) <= v_max + tol for v in values)
+
+    def _on_hand_pose_during_approach(self, msg):
+        offset_msg = self._compute_hand_pose_tcp_offset(msg)
+        if offset_msg is None:
+            # frame_id 불일치, NaN/Inf, TCP 조회 실패/신선도 미달 - 이번 프레임은
+            # 유실된 것처럼 취급한다(HandApproachServo.should_abort의 t_lost_s가 감지한다).
+            return
+        self.hand_approach_servo.on_hand_pose(offset_msg)
+
+    def _handover_approach_tick(self):
+        abort_reason = self.hand_approach_servo.should_abort()
+        if abort_reason is not None:
+            return ('ABORT', abort_reason)
+        if self.hand_approach_servo.should_stop():
+            return ('STOP', None)
+        return ('CONTINUE', None)
+
+    def _execute_handover_approach(self, goal_handle):
+        if self.safety_state != SafetyState.NORMAL:
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                f'handover_approach rejected - safety_state={self.safety_state}')
+        if (self.hardware_enabled
+                and not self.get_parameter('handover_approach.hardware_ready').value):
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                'handover_approach rejected - handover_approach.hardware_ready=false')
+
+        self.hand_approach_servo.start()
+        outcome, detail = self._run_rt_tracking(
+            goal_handle,
+            name='handover_approach',
+            message_type=PoseStamped,
+            topic='/vision/hand_pose',
+            callback=self._on_hand_pose_during_approach,
+            servo=self.hand_approach_servo,
+            step=self.hand_approach_servo.step,
+            tick=self._handover_approach_tick,
+            validate_command=self._validate_handover_approach_command,
+            ready_parameter='handover_approach.hardware_ready',
+            period_parameter='handover_approach.rt_control_period_s')
+        if outcome == 'ARRIVED':
+            detail = 'handover_approach arrived'
+        return self._finish_tracking_result(goal_handle, outcome, detail)
+
+    # ---- handover_hold ----
+
+    def _enable_compliance(self) -> None:
+        if not self.hardware_enabled:
+            self.get_logger().info('[dry_run] compliance 모드 on 생략')
+            return
+        if self._doosan is None:
+            raise RuntimeError('DoosanDriver가 초기화되지 않았습니다.')
+        self._doosan.enable_compliance()
+
+    def _disable_compliance(self) -> None:
+        if not self.hardware_enabled:
+            self.get_logger().info('[dry_run] compliance 모드 off 생략')
+            return
+        if self._doosan is None:
+            return
+        self._doosan.disable_compliance()
+
+    def _is_pull_detected(self, robot_state) -> bool:
+        """robot_state의 tool_force에서 전달 방향(pull_axis_index) 성분만 확인해
+        판정한다. 다른 축의 힘/토크는 무시하므로, handover_hold 중 임의 방향의
+        접촉을 당김으로 오판하지 않는다 (요구사항: 전달 방향의 당김만 정상 전달).
+
+        pull_axis_index는 tool_force의 힘 성분(0=x,1=y,2=z)만 허용한다. 3~5(모멘트,
+        Nm)는 힘 임계값(pull_force_threshold_n, N)과 단위가 달라 비교 대상이 아니므로
+        허용하지 않는다.
+
+        TODO: pull_axis_index/pull_direction_sign/pull_force_threshold_n은 실제
+        그리퍼-TCP 장착 방향과 전달 자세에 따라 달라지는 캘리브레이션 값이다.
+        하드웨어 셋업 전에는 임의로 축을 추측하지 않기 위해 기본값을 -1(미설정)로
+        두었고, 이 경우 항상 False를 반환해 오탐(당김 오판)을 방지한다.
+        """
+        if not isinstance(robot_state, dict):
+            return False
+        axis = int(self.get_parameter('handover_hold.pull_axis_index').value)
+        if axis < 0 or axis > 2:
+            self.get_logger().warn(
+                'handover_hold.pull_axis_index 미설정(또는 모멘트 축 지정) - '
+                '당김 감지를 비활성화합니다 (힘 성분 0,1,2만 허용).')
+            return False
+        tool_force = robot_state.get('tool_force')
+        if not tool_force:
+            return False
+        sign = self.get_parameter('handover_hold.pull_direction_sign').value
+        threshold_n = self.get_parameter('handover_hold.pull_force_threshold_n').value
+        component = sign * tool_force[axis]
+        return component > threshold_n
+
+    @staticmethod
+    def _is_fresh_robot_state(robot_state, since_monotonic: float, max_age_s: float) -> bool:
+        """robot_state 샘플이 since_monotonic(예: handover_hold 시작 시각) 이후에
+        수신됐고, 수신된 지 max_age_s 이내인 경우에만 신선하다고 판단한다.
+        handover_hold 시작 전의 오래된 샘플을 당김 판정에 사용하지 않기 위함이다."""
+        if not isinstance(robot_state, dict):
+            return False
+        received_at = robot_state.get('received_at')
+        if received_at is None or received_at < since_monotonic:
+            return False
+        return (time.monotonic() - received_at) <= max_age_s
+
+    def _execute_handover_hold(self, goal_handle):
+        if self.safety_state != SafetyState.NORMAL:
+            return self._finish_tracking_result(
+                goal_handle, 'ABORT',
+                f'handover_hold rejected - safety_state={self.safety_state}')
+
+        compliance_on = False
+        try:
+            self._enable_compliance()
+            compliance_on = True
+            outcome = self.safety_monitor.wait_for_pull(
+                goal_handle, self._is_pull_detected, self._is_fresh_robot_state)
+            if outcome == 'CANCELED':
+                stop_ok = self._cleanup_stop_motion()
+                compliance_ok = self._cleanup_disable_compliance()
+                compliance_on = False
+                if stop_ok and compliance_ok:
+                    return self._finish_tracking_result(
+                        goal_handle, 'CANCELED', 'handover_hold canceled')
+                detail = (
+                    'handover_hold 취소 cleanup 실패 '
+                    f'(move_stop={stop_ok}, compliance={compliance_ok})')
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+            if outcome != 'PULLED':
+                return self._finish_tracking_result(
+                    goal_handle, 'ABORT', f'handover_hold {outcome.lower()}')
+
+            compliance_ok = self._cleanup_disable_compliance()
+            compliance_on = False
+            if not compliance_ok:
+                detail = 'handover_hold compliance 해제 실패 - RG2를 열지 않습니다.'
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+            if goal_handle.is_cancel_requested:
+                self._cleanup_stop_motion()
+                return self._finish_tracking_result(
+                    goal_handle, 'CANCELED',
+                    'handover_hold canceled before RG2 open')
+            if self.safety_state != SafetyState.NORMAL:
+                return self._finish_tracking_result(
+                    goal_handle, 'ABORT',
+                    f'handover_hold aborted - safety_state={self.safety_state}')
+
+            if not self.rg2_client.open(goal_handle=goal_handle):
+                if self.rg2_client.last_status == RG2Status.CANCELED:
+                    self._cleanup_stop_motion()
+                    return self._finish_tracking_result(
+                        goal_handle, 'CANCELED',
+                        'handover_hold canceled during RG2 open')
+                detail = f'handover_hold RG2 open 실패(status={self.rg2_client.last_status})'
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+            return self._finish_tracking_result(
+                goal_handle, 'ARRIVED', 'pull_detected, released')
+        except Exception as exc:
+            self.get_logger().error(f'handover_hold 실행 중 예외: {exc}')
+            self._cleanup_stop_motion()
+            outcome = 'CANCELED' if goal_handle.is_cancel_requested else 'ABORT'
+            return self._finish_tracking_result(
+                goal_handle, outcome, f'handover_hold exception: {exc}')
+        finally:
+            if compliance_on:
+                self._cleanup_disable_compliance()

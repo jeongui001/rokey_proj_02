@@ -9,6 +9,7 @@
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>
   <depend>handover_interfaces</depend>
 
@@ -16,7 +17,7 @@
   <exec_depend>stt_node</exec_depend>
   <exec_depend>vision_node</exec_depend>
   <exec_depend>robot_control</exec_depend>
-  <exec_depend>handover_ui</exec_depend>
+  <exec_depend>operator_gui</exec_depend>
 
   <test_depend>python3-pytest</test_depend>
 

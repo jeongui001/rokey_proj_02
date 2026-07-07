@@ -1,0 +1,131 @@
+# robot_control 노드 파라미터 템플릿.
+#
+# named_poses.*는 절대 추측한 값을 채워 넣지 않았다 - 실제 M0609로 각 자세에서
+# get_current_posj (dsr_msgs2/srv/aux_control/GetCurrentPosj) 등을 이용해 실측한
+# 관절각(degree, [j1,j2,j3,j4,j5,j6]) 6개를 직접 채워야 한다.
+# 값이 비어 있으면(기본값) 해당 named pose로의 이동은 항상 실패로 처리된다
+# (robot_control_node._call_move_service 참고).
+/**:
+  ros__parameters:
+    hardware_enabled: false  # 실제 M0609/RG2를 사용하려면 true로 명시적으로 설정
+
+    robot_id: 'dsr01'  # launch의 namespace와 일치해야 함 (DoosanBootcamp 예제 관례)
+
+    rg2_ip: '192.168.1.1'
+    rg2_port: 502
+    rg2_gripper: 'rg2'
+
+    # RG2 open/close 명령이 busy=0(완료)이 될 때까지 기다리는 통신 타임아웃/폴링
+    # 주기 - 하드웨어 캘리브레이션 값이 아니라 통신 타이밍 설정이므로 보수적인
+    # 기본값을 명시했다. 실기 환경에 맞게 조정 가능하다.
+    rg2:
+      command_timeout_s: 5.0
+      poll_interval_s: 0.05
+      # open() 완료 후 최종 폭이 "최대 폭에 도달했다"고 참고로 판단할 때 허용할
+      # 오차(mm) - 실측으로 확정된 값이 아니라 통신/기구적 오차를 감안한 여유값이다.
+      open_width_tolerance_mm: 2.0
+
+    # named_poses.<name>은 실측한 6축 관절각(degree)이 준비되면 여기에 주석을 풀고
+    # 채워 넣는다. 빈 배열([])을 파라미터 override로 명시하면 rclpy가 배열 타입을
+    # 추론하지 못해 파라미터가 미초기화 상태로 남는 문제가 있어(ROS2 Humble 확인됨),
+    # 값이 없는 named pose는 아예 이 파일에 키를 적지 않는다 - 코드 쪽 기본값([])이
+    # 그대로 적용되며, 그 경우 해당 named pose로의 이동은 명확한 실패로 처리된다
+    # (robot_control_node._call_move_service 참고).
+    #
+    # handover_safe: 작업대 전체가 보이는 자세 - handover_approach(YOLO 손 추적 후
+    # 접근하는 서보잉)의 출발점으로 쓰인다.
+    named_poses:
+      home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
+      front: [0.0, 0.0, 90.0, 0.0, 0.0, 0.0]
+      up: [0.0, 0.0, 90.0, 0.0, -90.0, 0.0]
+      down: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]  # home과 동일 자세로 확인됨(의도된 값)
+      # base 좌표 기준(참고용, 실제로는 위 관절각이 사용됨):
+      # [446.3, -215.69, 291.05, 52.87, 178.53, 51.69] (x,y,z mm / rx,ry,rz deg)
+      watch: [-27.26, 21.12, 49.15, 1.69, 109.48, -28.31]
+      # base 좌표 기준(참고용): [400.5, 27.12, 305.78, 4.82, 141, -23.12] (mm/deg)
+      handover_safe: [1.7, -25.77, 104.09, 2.31, 62.75, -27.08]
+
+    move:
+      vel_deg_s: 30.0
+      acc_deg_s2: 30.0
+      timeout_s: 30.0
+
+    # hardware_enabled=false(dry-run)에서는 실측 관절값이 없는 named pose도 상태
+    # 흐름 시험을 위해 이동을 허용한다. hardware_enabled=true에서는 이 값과 무관하게
+    # 빈 named pose를 절대 허용하지 않는다 (robot_control_node._call_move_service 참고).
+    dry_run:
+      allow_unconfigured_named_poses: true
+
+    servo_pick:
+      # ToolTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
+      # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
+      tool_track_frame_id: 'base_link'
+      # TCP 위치 캐시 샘플의 나이(초)가 이 값보다 크면 오래됐다고 보고 사용하지
+      # 않는다(서비스 왕복 시간이 아니라 캐시 샘플 자체의 나이) - 하드웨어
+      # 캘리브레이션 값이 아니라 RT 루프에 맞는 통신 타이밍 설정이다.
+      tcp_pose_max_age_s: 0.2
+      # TCP 위치 캐시를 갱신하는 주기. ToolTrack 콜백마다 동기 호출하지 않고
+      # rate-limited하게 별도 타이머로 갱신해 GetCurrentPosx 호출 과부하를 막는다.
+      tcp_pose_refresh_period_s: 0.05
+      # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
+      # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlRtStream 단위,
+      # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
+      # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
+
+    # handover_safe 도착 후 작업자 손(/vision/hand_pose)에 접근하는 서보잉 - 손이
+    # 아직 정확히 확인되지 않은 상태이므로 servo_pick보다 v_max를 낮게 잡았다.
+    handover_approach:
+      hand_pose_frame_id: 'base_link'
+      stop_distance_m: 0.05  # 사용자 확정값(5cm)
+      v_max: 0.15
+      kp_xy: 1.0
+      timeout_s: 10.0
+      t_lost_s: 0.5
+      # hardware_ready는 vision_node._track_hand가 구현·검증되기 전까지 반드시
+      # false로 유지한다(hand_pose의 frame_id/orientation 의미가 아직 미확정).
+      # 기본값은 코드의 declare_parameter에 있으며 실수로 true를 적지 않기 위해
+      # 여기서는 다시 명시하지 않는다.
+
+    handover_hold:
+      # TODO(캘리브레이션 필요): 실제 그리퍼-TCP 장착 방향에 따라 결정해야 한다.
+      # 미설정(-1)이면 당김 감지가 항상 비활성화된다(오탐 방지가 기본값).
+      pull_axis_index: -1     # 0=x,1=y,2=z,3=rx,4=ry,5=rz (tool_force 기준)
+      pull_direction_sign: 1  # 1 또는 -1
+      pull_force_threshold_n: 15.0
+
+    safety:
+      # 외력 감지는 dsr_msgs2 ROS 서비스가 아니라 DRFL 라이브러리(libdsr_hardware2.so)에
+      # ctypes로 직접 연결해서 감지한다 (rokey_proj_01의 force_monitor_node.py와
+      # 동일 접근, 2026-07-06 도입). ROS2 executor와 무관한 독립 쓰레드에서 고주기로
+      # 폴링하기 때문에 로봇이 MOVING 중이어도 실시간으로 잡힌다.
+      #
+      # 예전에는 "최근 평균 대비 관절별 변화량(delta)"으로 판단했는데, 그 방식은
+      # 정지 상태에서만 유효했다(자세마다 중력보상 잔차가 달라, 이동 중엔 자세
+      # 변화 자체로 baseline이 안 맞아 접촉 없이도 오탐이 났다 - 2026-07-06 확인).
+      # DRFL 직접 연결은 두산 하드웨어 반응 속도와 격차를 줄이기 위해 도입한 것이라,
+      # 굳이 delta 방식과 병행할 이유가 없어 이걸로 완전히 대체했다 - 이제 관절별
+      # "절대 임계값" 하나만 넘으면 FAULT다 (MOVING/STANDBY 구분 없음).
+      #
+      # direct_threshold_nm(J1~J6) 시작값은 M0609 관절별 정격 토크 비율(URDF 기준
+      # J1/J2=163, J3=96, J4~J6=50 Nm)을 참고해 베이스 쪽은 둔감하게, 사람 손이 닿기
+      # 쉬운 손목 쪽(J4~J6)은 예민하게 잡은 추정값이다 - 아직 관절별 실측(정지 시
+      # 변화 폭 / 접촉 시 변화 폭) 전이라 재조정이 필요하다. 한번 넘으면 FAULT가
+      # 뜨고, 그 뒤로 연속 direct_reset_below_count번 미만이어야(히스테리시스)
+      # "다시 안전해졌다"고 본다 - 임계값 근처에서 깜빡이지 않게 하기 위함이다.
+      #
+      # drfl_lib_path/robot_ip/robot_port는 이 PC의 cobot_ws 설치 경로와
+      # roboton(dsr_bringup2) 실행 인자에 맞춘 값이다 - 다른 환경이면 경로/IP를
+      # 맞게 바꿔야 한다.
+      external_torque:
+        drfl_lib_path: '/home/youngjin/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
+        robot_ip: '192.168.1.100'
+        robot_port: 12345
+        direct_poll_hz: 100.0
+        direct_threshold_nm: [15.0, 15.0, 12.0, 10.0, 10.0, 10.0]  # TODO: 관절별 실기 캘리브레이션 필요
+        direct_reset_below_count: 20
+      fault_stop_mode: 1  # TODO(전문가 검토 필요): MoveStop stop_mode 0~3 중 선택
+      # DRFL 직접 연결 도입 전에는 이 폴링 주기 자체를 줄여서 두산 자체 반응
+      # 속도와 격차를 줄이려 했으나(0.1 -> 0.02), 외력 감지를 DrflForceMonitor로
+      # 완전히 옮기면서 그 이유가 없어져 기본값(0.1)으로 되돌렸다 - 이 폴링은 이제
+      # robot_state(두산 자체 안전 상태) 확인과 /task/status 갱신 용도로만 쓰인다.
+      state_poll_period_s: 0.1

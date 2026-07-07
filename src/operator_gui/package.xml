@@ -1,18 +1,22 @@
 <?xml version="1.0"?>
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
-  <name>handover_ui</name>
+  <name>operator_gui</name>
   <version>0.0.1</version>
-  <description>PyQt 데스크톱 UI - rclpy로 ROS2에 직접 접속해 /task/status, /gripper/state, /robot/fault 표시 및 /user_command/text 입력</description>
+  <description>PyQt 오퍼레이터 GUI - rclpy로 ROS2에 직접 접속해 /task/status, /gripper/state,
+    /robot/fault, 카메라(CompressedImage)를 표시하고 /user_command/text로 명령을 발행한다.</description>
   <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
   <license>MIT</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
   <depend>handover_interfaces</depend>
 
   <!-- PyQt5, pytest-qt는 ROS 패키지가 아니라 pip 의존성.
-       requirements.txt(런타임) / test-requirements.txt(테스트) 참고 -->
+       requirements.txt(런타임) / test-requirements.txt(테스트) 참고:
+       pip install -r src/operator_gui/requirements.txt
+       pip install -r src/operator_gui/test-requirements.txt  # 테스트 실행 시에만 필요 -->
 
   <test_depend>python3-pytest</test_depend>
 
