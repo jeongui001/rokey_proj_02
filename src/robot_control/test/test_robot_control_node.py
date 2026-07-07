@@ -66,13 +66,10 @@ class _FakeDoosanDriver:
         self.set_robot_control_calls = []
         self.ext_torque = [0.0] * 6
         self.tool_force = [0.0] * 6
-        self.open_rt_session_should_fail = False
         self.publish_calls = []
         self.stop_calls = []
         self.stop_return_value = True
         self.stop_should_raise = False
-        self.close_rt_session_should_raise = False
-        self.close_rt_session_should_fail = False  # 예외 없이 응답 success=false만 시뮬레이션
 
     def get_robot_state(self):
         if self.robot_state_sequence:
@@ -89,25 +86,13 @@ class _FakeDoosanDriver:
     def get_tool_force(self, ref=0):
         return self.tool_force
 
-    def open_rt_session(self):
-        if self.open_rt_session_should_fail:
-            raise RuntimeError('start_rt_control이 실패했습니다 (fake).')
-        return True
-
-    def close_rt_session(self):
-        if self.close_rt_session_should_raise:
-            raise RuntimeError('stop_rt_control 통신 오류 (fake).')
-        if self.close_rt_session_should_fail:
-            return False  # 예외 없이 StopRtControl/DisconnectRtControl 응답 success=false
-        return True
-
     def stop(self, stop_mode=1):
         self.stop_calls.append(stop_mode)
         if self.stop_should_raise:
             raise RuntimeError('move_stop 통신 오류 (fake).')
         return self.stop_return_value
 
-    def publish_speedl_rt(self, cmd):
+    def publish_speedl(self, cmd, *, accel_param_prefix, period_param_name):
         self.publish_calls.append(cmd)
 
 
@@ -646,8 +631,6 @@ def test_servo_pick_execution_sets_and_clears_tcp_tracking_active(node, monkeypa
     node._servo_pick_tick = lambda: ('CLOSE', None)
     node.servo_loop.get_state = lambda: 'closing'
     node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
     node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
@@ -880,8 +863,6 @@ def test_execute_handover_approach_success_stops_without_gripper_action(node, mo
     node.hand_approach_servo.step = lambda: ServoCommand()
     node.hand_approach_servo.get_state = lambda: 'tracking'
     node.hand_approach_servo.start = lambda: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     rg2_calls = []
     node.rg2_client.open = lambda goal_handle=None: rg2_calls.append('open') or True
@@ -904,8 +885,6 @@ def test_execute_handover_approach_aborts_on_abort_reason(node, monkeypatch):
     node._handover_approach_tick = lambda: ('ABORT', 'lost')
     node.hand_approach_servo.get_state = lambda: 'tracking'
     node.hand_approach_servo.start = lambda: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('handover_approach'))
 
@@ -916,8 +895,7 @@ def test_execute_handover_approach_aborts_on_abort_reason(node, monkeypatch):
     assert result.message == 'lost'
 
 
-def test_execute_handover_approach_cancel_mid_loop_calls_canceled_and_closes_rt_session(
-        node, monkeypatch):
+def test_execute_handover_approach_cancel_mid_loop_calls_canceled(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
@@ -925,9 +903,6 @@ def test_execute_handover_approach_cancel_mid_loop_calls_canceled_and_closes_rt_
     node.hand_approach_servo.step = lambda: ServoCommand()
     node.hand_approach_servo.get_state = lambda: 'tracking'
     node.hand_approach_servo.start = lambda: None
-    node._open_rt_session = lambda: None
-    rt_closed = []
-    node._close_rt_session = lambda: rt_closed.append(True) or True
 
     gh = FakeGoalHandle(_goal('handover_approach'))
     gh.is_cancel_requested = True
@@ -937,7 +912,6 @@ def test_execute_handover_approach_cancel_mid_loop_calls_canceled_and_closes_rt_
     assert gh.was_canceled is True
     assert gh.aborted is False
     assert result.success is False
-    assert rt_closed == [True]
 
 
 def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
@@ -963,8 +937,6 @@ def test_execute_handover_approach_sets_and_clears_tcp_tracking_active(node, mon
     node._handover_approach_tick = fake_tick
     node.hand_approach_servo.get_state = lambda: 'arrived'
     node.hand_approach_servo.start = lambda: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('handover_approach'))
 
@@ -975,7 +947,7 @@ def test_execute_handover_approach_sets_and_clears_tcp_tracking_active(node, mon
     assert node._tcp_tracking_active is False
 
 
-# ---- SpeedlRtStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----
+# ---- SpeedlStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----
 
 def test_validate_servo_command_rejects_nan_inf(node):
     assert node._validate_servo_command(ServoCommand(vx=float('nan'))) is False
@@ -1040,8 +1012,6 @@ def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monk
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
     node._get_current_tcp_pose = lambda: (0.0, 0.0, 0.05, 0, 0, 0)
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
     node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (29.4, True)
 
@@ -1070,8 +1040,6 @@ def test_servo_pick_rg2_canceled_during_close_ends_as_canceled_not_fault(node, m
     node.servo_loop.step = lambda: None
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     def _fake_close(width, force, goal_handle=None):
         node.rg2_client.last_status = RG2Status.CANCELED
@@ -1092,33 +1060,6 @@ def test_servo_pick_rg2_canceled_during_close_ends_as_canceled_not_fault(node, m
     assert node.safety_state == SafetyState.NORMAL  # FAULT로 처리되지 않았다
 
 
-def test_servo_pick_rt_cleanup_failure_after_grasp_blocks_success(node, monkeypatch):
-    """필수 테스트 4: 파지 후 RT 세션 종료(cleanup) 실패 시 성공 처리를 금지한다."""
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node._servo_pick_tick = lambda: ('CLOSE', None)
-    node.servo_loop.get_state = lambda: 'closing'
-    node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: (_ for _ in ()).throw(RuntimeError('rt close boom'))
-    node.rg2_client.close = lambda width, force, goal_handle=None: True
-    node.rg2_client.get_state = lambda: (30.0, True)
-
-    gh = FakeGoalHandle(_goal('servo_pick'))
-    gh.request.tool_class = 'spanner'
-    gh.request.grasp_width_mm = 30.0
-    gh.request.grasp_force_n = 20.0
-
-    result = node._execute_servo_pick(gh)
-
-    assert gh.succeeded is False
-    assert gh.aborted is True
-    assert _terminal_call_count(gh) == 1
-    assert result.success is False
-    assert node.safety_state == SafetyState.FAULT
-
-
 def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
@@ -1126,8 +1067,6 @@ def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
     node._servo_pick_tick = lambda: ('ABORT', 'diverged')
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -1141,15 +1080,12 @@ def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
     assert result.message == 'diverged'
 
 
-def test_execute_servo_pick_cancel_mid_loop_calls_canceled_and_closes_rt_session(node, monkeypatch):
+def test_execute_servo_pick_cancel_mid_loop_calls_canceled(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
-    rt_closed = []
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: rt_closed.append(True) or True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -1162,7 +1098,6 @@ def test_execute_servo_pick_cancel_mid_loop_calls_canceled_and_closes_rt_session
     assert gh.was_canceled is True
     assert gh.aborted is False
     assert result.success is False
-    assert rt_closed == [True]  # finally에서 RT 세션 정리됨
 
 
 def test_execute_servo_pick_cancel_calls_real_move_stop_when_hardware_enabled(node, monkeypatch):
@@ -1189,7 +1124,7 @@ def test_execute_servo_pick_cancel_calls_real_move_stop_when_hardware_enabled(no
     assert fake.stop_calls == [node.get_parameter('safety.fault_stop_mode').value]
 
 
-# ---- servo_pick: cleanup(MoveStop/RT/subscription) 실패 시 취소 성공으로 가장하지 않음 ----
+# ---- servo_pick: cleanup(MoveStop/subscription) 실패 시 취소 성공으로 가장하지 않음 ----
 
 def test_servo_pick_cancel_aborts_as_fault_when_move_stop_returns_false(node, monkeypatch):
     import time as time_module
@@ -1250,60 +1185,6 @@ def test_servo_pick_cancel_aborts_as_fault_when_move_stop_raises(node, monkeypat
     assert node.safety_state == SafetyState.FAULT
 
 
-def test_servo_pick_cancel_aborts_as_fault_when_rt_close_raises(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node._open_rt_session = lambda: True
-    node._close_rt_session = lambda: (_ for _ in ()).throw(RuntimeError('rt close boom'))
-    node.servo_loop.get_state = lambda: 'tracking'
-    node.servo_loop.start = lambda *a, **k: None
-
-    gh = FakeGoalHandle(_goal('servo_pick'))
-    gh.request.tool_class = 'spanner'
-    gh.request.grasp_width_mm = 30.0
-    gh.request.grasp_force_n = 20.0
-    gh.is_cancel_requested = True
-
-    result = node._execute_servo_pick(gh)
-
-    assert gh.was_canceled is False
-    assert gh.aborted is True
-    assert _terminal_call_count(gh) == 1
-    assert result.success is False
-    assert node.safety_state == SafetyState.FAULT
-
-
-def test_servo_pick_cancel_aborts_as_fault_when_rt_close_response_unsuccessful(node, monkeypatch):
-    """필수 테스트: RT 종료(StopRtControl/DisconnectRtControl) 응답이 예외 없이
-    success=false인 경우도 실패로 취급한다(예전처럼 응답을 확인하지 않고 조용히
-    성공 취급하지 않는다)."""
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node.hardware_enabled = True
-    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
-    fake = _FakeDoosanDriver()
-    fake.close_rt_session_should_fail = True
-    node._doosan = fake
-    node.servo_loop.get_state = lambda: 'tracking'
-    node.servo_loop.start = lambda *a, **k: None
-
-    gh = FakeGoalHandle(_goal('servo_pick'))
-    gh.request.tool_class = 'spanner'
-    gh.request.grasp_width_mm = 30.0
-    gh.request.grasp_force_n = 20.0
-    gh.is_cancel_requested = True
-
-    result = node._execute_servo_pick(gh)
-
-    assert gh.was_canceled is False
-    assert gh.aborted is True
-    assert _terminal_call_count(gh) == 1
-    assert result.success is False
-    assert node.safety_state == SafetyState.FAULT
-
-
 def test_cleanup_destroy_subscription_catches_exception(node):
     def _raise_destroy(sub):
         raise RuntimeError('destroy_subscription boom')
@@ -1318,8 +1199,6 @@ def test_servo_pick_cancel_aborts_as_fault_when_subscription_removal_fails(node,
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
-    node._open_rt_session = lambda: True
-    node._close_rt_session = lambda: True
     # 실제 destroy_subscription을 건드리지 않고(테스트 종료 시 node.destroy_node()가
     # 남은 구독을 정리하려다 다시 실패하는 것을 피하기 위해) 정리 경계 wrapper만
     # 실패하도록 대체한다.
@@ -1360,8 +1239,6 @@ def test_execute_servo_pick_cancel_right_before_closing_gripper_does_not_close(n
     node.servo_loop.step = lambda: None
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
     closed = []
     node.rg2_client.close = lambda width, force, goal_handle=None: closed.append((width, force))
 
@@ -1390,8 +1267,6 @@ def test_execute_servo_pick_fault_right_before_closing_gripper_does_not_close(no
     node.servo_loop.step = lambda: None
     node.servo_loop.get_state = lambda: 'tracking'
     node.servo_loop.start = lambda *a, **k: None
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
     closed = []
     node.rg2_client.close = lambda width, force, goal_handle=None: closed.append((width, force))
 
@@ -1420,8 +1295,6 @@ def test_servo_pick_aborts_on_tracking_loss(node, monkeypatch):
         node.servo_loop.on_tool_track(_tool_track())
 
     node.servo_loop.start = _start_and_seed
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
 
     gh = FakeGoalHandle(_goal('servo_pick'))
     gh.request.tool_class = 'spanner'
@@ -1457,8 +1330,6 @@ def test_dispatch_routes_servo_pick(node, monkeypatch):
     node.servo_loop.start = lambda *a, **k: None
     node.servo_loop.step = lambda *a, **k: None
     node._get_current_tcp_pose = lambda: (0.0, 0.0, 0.05, 0, 0, 0)
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: True
     node.rg2_client.close = lambda width, force, goal_handle=None: True
     node.rg2_client.get_state = lambda: (30.0, True)
 
@@ -1513,30 +1384,7 @@ def test_servo_pick_dry_run_still_works_when_hardware_disabled(node, monkeypatch
     assert result.success is True
 
 
-def test_servo_pick_aborts_when_start_rt_control_fails(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node.hardware_enabled = True
-    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
-    fake = _FakeDoosanDriver()
-    fake.open_rt_session_should_fail = True
-    node._doosan = fake
-    node.servo_loop.start = lambda *a, **k: None
-
-    gh = FakeGoalHandle(_goal('servo_pick'))
-    gh.request.tool_class = 'spanner'
-    gh.request.grasp_width_mm = 30.0
-    gh.request.grasp_force_n = 20.0
-
-    result = node._execute_servo_pick(gh)
-
-    assert gh.aborted is True
-    assert result.success is False
-    assert fake.publish_calls == []  # RT가 시작되지 않았으므로 속도 명령을 보내지 않는다
-
-
-def test_servo_pick_publishes_speedl_only_when_hardware_ready_and_rt_confirmed(node, monkeypatch):
+def test_servo_pick_publishes_speedl_only_when_hardware_ready(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
@@ -2106,8 +1954,6 @@ def test_dispatch_routes_handover_hold(node, monkeypatch):
 
 
 def _setup_servo_pick_dry(node):
-    node._open_rt_session = lambda: None
-    node._close_rt_session = lambda: None
     node.servo_loop.start = lambda *a, **k: None
 
 
@@ -2543,8 +2389,45 @@ def test_hardware_disabled_rg2_client_never_touches_modbus(node):
     assert node.rg2_client._client is None
 
 
-def test_hardware_disabled_rt_session_is_noop(node):
-    node._open_rt_session()
-    node._close_rt_session()
+# ---- SpeedlWatchdog 통합 (명령이 끊기면 자동으로 vel=0 발행) ----
 
-    assert node._doosan is None
+def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node, monkeypatch):
+    """워치독 통합 테스트: hardware_ready 상태에서 step()이 계속 None을 반환해
+    (tcp pose 미확보 등) pet()이 호출되지 않으면, watchdog_timeout_s 이내에
+    워치독이 자동으로 vel=0 SpeedlStream을 발행한다(2026-07-07 실측: 단일
+    정지 명령으로 충분함을 확인)."""
+    node.hardware_enabled = True
+    node.set_parameters([
+        Parameter('servo_pick.hardware_ready', value=True),
+        Parameter('servo_pick.watchdog_timeout_s', value=0.05),
+        Parameter('servo_pick.control_period_s', value=0.01),
+    ])
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    node.servo_loop.start = lambda *a, **k: None
+    node.servo_loop.get_state = lambda: 'tracking'
+    node._get_current_tcp_posx = lambda: None  # step()이 항상 None을 반환하게 함
+
+    started = time.monotonic()
+
+    def _tick():
+        # 워치독이 발동할 시간을 벌어준다(0.05s timeout보다 넉넉하게), 이후 종료.
+        if time.monotonic() - started < 0.15:
+            return ('CONTINUE', None)
+        return ('CLOSE', None)
+
+    node._servo_pick_tick = _tick
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
+    node.rg2_client.get_state = lambda: (30.0, True)
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert result.success is True
+    assert any(
+        cmd.vx == 0.0 and cmd.vy == 0.0 and cmd.vz == 0.0
+        for cmd in fake.publish_calls)  # 워치독이 최소 1회 vel=0을 발행했다
