@@ -126,13 +126,16 @@ class RobotControlNode(Node, TaskExecutor):
         # 이유: 현재 ToolTrack.pose는 base_link 절대좌표로 정의되어 있는데
         # (handover_interfaces/msg/ToolTrack.msg), ServoLoop는 이를 TCP(그리퍼) 기준
         # xy 오차로 가정하고 P 제어를 수행한다 (servo_loop.py 상단 주석 참고). 이 좌표
-        # 변환이 실제로 구현·검증되기 전까지는 실제 RT 속도 명령을 로봇에 보내면 안 된다.
+        # 변환이 실제로 구현·검증되기 전까지는 실제 속도 명령을 로봇에 보내면 안 된다.
         self.declare_parameter('servo_pick.hardware_ready', False)
-        self.declare_parameter('servo_pick.rt_ip', '192.168.137.100')
-        self.declare_parameter('servo_pick.rt_port', 12347)
-        self.declare_parameter('servo_pick.rt_control_period_s', 0.01)
-        _declare_double_array(
-            self, 'servo_pick.speedl_acc', [200.0, 200.0, 200.0, 60.0, 60.0, 60.0])
+        self.declare_parameter('servo_pick.control_period_s', 0.01)
+        self.declare_parameter('servo_pick.speedl_acc_trans_mm_s2', 200.0)
+        self.declare_parameter('servo_pick.speedl_acc_rot_deg_s2', 60.0)
+        # speedl(비-RT)은 명령이 끊겨도 스스로 멈추지 않는다(2026-07-07
+        # probe_speedl_stream.py로 실측 확인) - SpeedlWatchdog가 이 시간 동안
+        # pet()이 없으면 vel=0을 대신 발행한다. 단일 정지 명령으로 충분함도
+        # 같은 실측으로 확인됨.
+        self.declare_parameter('servo_pick.watchdog_timeout_s', 0.2)
         # ToolTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
         # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다 (_compute_tool_track_tcp_offset).
         self.declare_parameter('servo_pick.tool_track_frame_id', 'base_link')
@@ -152,7 +155,7 @@ class RobotControlNode(Node, TaskExecutor):
         # 튜닝할 수 있게 한다.
         # hardware_ready는 servo_pick.hardware_ready와 같은 이유로 기본 false다:
         # hand_pose(vision_node._track_hand)가 아직 미구현(NotImplementedError)이라
-        # frame_id/orientation 의미가 검증되지 않았다 - 확정 전까지 실제 RT 속도
+        # frame_id/orientation 의미가 검증되지 않았다 - 확정 전까지 실제 속도
         # 명령 발행을 금지한다.
         self.declare_parameter('handover_approach.hardware_ready', False)
         # 사용자가 지정한 접근 정지 거리(5cm) - 실측 협의값.
@@ -163,7 +166,10 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('handover_approach.t_lost_s', 0.5)
         self.declare_parameter('handover_approach.diverge_factor', 1.2)
         self.declare_parameter('handover_approach.diverge_window', 3)
-        self.declare_parameter('handover_approach.rt_control_period_s', 0.01)
+        self.declare_parameter('handover_approach.control_period_s', 0.01)
+        self.declare_parameter('handover_approach.speedl_acc_trans_mm_s2', 200.0)
+        self.declare_parameter('handover_approach.speedl_acc_rot_deg_s2', 60.0)
+        self.declare_parameter('handover_approach.watchdog_timeout_s', 0.2)
         # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
         # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다
         # (_compute_hand_pose_tcp_offset).

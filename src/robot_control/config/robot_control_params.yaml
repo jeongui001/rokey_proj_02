@@ -68,7 +68,7 @@
       # rate-limited하게 별도 타이머로 갱신해 GetCurrentPosx 호출 과부하를 막는다.
       tcp_pose_refresh_period_s: 0.05
       # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
-      # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlRtStream 단위,
+      # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlStream 단위,
       # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
       # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
 
