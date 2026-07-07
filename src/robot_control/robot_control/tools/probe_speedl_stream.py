@@ -170,6 +170,7 @@ def _run_gripper_during_motion(
     msg.acc = list(acc)
     msg.time = period_s
     print(f'--- phase5_gripper_during_motion ({axis}축 발행 지속, 그리퍼 스레드 종료 대기) ---')
+    print('주의: 로봇이 다시 움직입니다. 그리퍼가 끝날 때까지(최대 ~10초) 계속 이동합니다.')
     while not gripper_done.is_set():
         if stop_event.is_set():
             break
