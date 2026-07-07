@@ -286,7 +286,8 @@ class TaskFlow:
     def _handle_move_safe_result(self, result):
         if result.success:
             # handover_safe 도착 - 작업대가 보이는 자세에서 YOLO로 손을 찾아 접근한다
-            # (robot_control의 handover_approach, servo_pick과 같은 PBVS 패턴).
+            # (robot_control의 handover_approach - movel 기반 단발성 이동으로
+            # 구현 예정, 2026-07-07 기준 TODO 스텁).
             self._set_state(State.APPROACH_HAND, detail='작업자를 찾는 중')
             self._start_after_vision_mode(
                 SetVisionMode.Request.TRACK_HAND,

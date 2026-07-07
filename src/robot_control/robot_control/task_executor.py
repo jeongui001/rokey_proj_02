@@ -290,24 +290,6 @@ class TaskExecutor:
         finally:
             self._tcp_pose_request_in_flight = False
 
-    def _tcp_position_error(self, message, expected_frame):
-        if message.header.frame_id != expected_frame:
-            self.get_logger().error(
-                f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
-            return None
-        position = message.pose.position
-        if not all(math.isfinite(value) for value in (
-                position.x, position.y, position.z)):
-            return None
-        tcp = self._get_current_tcp_posx()
-        if tcp is None:
-            return None
-        return (
-            position.x - tcp[0] / 1000.0,
-            position.y - tcp[1] / 1000.0,
-            position.z - tcp[2] / 1000.0,
-        )
-
     def _validate_tool_track_message(self, message) -> bool:
         """servo_loop(칼만 ServoLoop)는 msg.pose.position을 base_link 기준 절대
         목표 위치로 직접 필터에 흘려보내므로(TCP 오차로 변환하지 않음), 여기서는

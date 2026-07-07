@@ -67,7 +67,6 @@ class _FakeDoosanDriver:
         self.ext_torque = [0.0] * 6
         self.tool_force = [0.0] * 6
         self.publish_calls = []
-        self.publish_kwargs = []
         self.stop_calls = []
         self.stop_return_value = True
         self.stop_should_raise = False
@@ -95,8 +94,6 @@ class _FakeDoosanDriver:
 
     def publish_speedl(self, cmd, *, accel_param_prefix, period_param_name):
         self.publish_calls.append(cmd)
-        self.publish_kwargs.append(
-            {'accel_param_prefix': accel_param_prefix, 'period_param_name': period_param_name})
 
 
 def _terminal_call_count(gh) -> int:
