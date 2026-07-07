@@ -119,7 +119,16 @@ def _execute_handover_approach(self, goal_handle):
 - 75-76행 주석("PBVS 서보잉" 전제)을 TODO 스텁 상태에 맞게 갱신.
 
 ### `robot_control/test/test_robot_control_node.py`
-**삭제**(스트리밍/PBVS 전제 테스트):
+**삭제**(스트리밍/PBVS 전제 테스트) - 플랜 작성 중 2차 점검으로 다음 6개를
+추가 발견함(최초 스펙에서 누락됨): `_hand_pose_msg` 헬퍼와
+`test_compute_hand_pose_tcp_offset_computes_hand_minus_tcp`,
+`test_compute_hand_pose_tcp_offset_rejects_wrong_frame_id`,
+`test_compute_hand_pose_tcp_offset_rejects_nan_inf_position`,
+`test_compute_hand_pose_tcp_offset_returns_none_when_tcp_lookup_fails`,
+`test_on_hand_pose_during_approach_ignores_message_when_offset_computation_fails`,
+`test_on_hand_pose_during_approach_forwards_computed_offset` (전부
+`_compute_hand_pose_tcp_offset`/`_on_hand_pose_during_approach` 삭제와 함께
+사라져야 하는 테스트들). 아래 목록에 이어서:
 `test_validate_handover_approach_command_rejects_nan_inf`,
 `test_validate_handover_approach_command_rejects_over_v_max`,
 `test_validate_handover_approach_command_accepts_within_limits`,
