@@ -7,7 +7,7 @@ from robot_control.safety_monitor import DoosanRobotControl, SafetyState
 
 
 class DoosanDriver:
-    """dsr_msgs2 서비스와 RT 토픽을 감싸는 하드웨어 경계."""
+    """dsr_msgs2 서비스와 토픽을 감싸는 하드웨어 경계."""
 
     def __init__(self, node):
         try:
