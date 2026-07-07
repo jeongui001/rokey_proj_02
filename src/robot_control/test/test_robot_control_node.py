@@ -2391,7 +2391,7 @@ def test_hardware_disabled_rg2_client_never_touches_modbus(node):
 
 # ---- SpeedlWatchdog 통합 (명령이 끊기면 자동으로 vel=0 발행) ----
 
-def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node, monkeypatch):
+def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node):
     """워치독 통합 테스트: hardware_ready 상태에서 step()이 계속 None을 반환해
     (tcp pose 미확보 등) pet()이 호출되지 않으면, watchdog_timeout_s 이내에
     워치독이 자동으로 vel=0 SpeedlStream을 발행한다(2026-07-07 실측: 단일
@@ -2412,7 +2412,7 @@ def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node, monke
 
     def _tick():
         # 워치독이 발동할 시간을 벌어준다(0.05s timeout보다 넉넉하게), 이후 종료.
-        if time.monotonic() - started < 0.15:
+        if time.monotonic() - started < 0.4:
             return ('CONTINUE', None)
         return ('CLOSE', None)
 
