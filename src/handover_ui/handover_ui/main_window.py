@@ -2,6 +2,15 @@ from PyQt5 import QtWidgets, QtCore
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    """공구 전달 로봇 제어 화면. RosClient가 백그라운드 스레드에서 받는 메시지를
+    Qt 위젯 업데이트로 이어붙이는 게 이 클래스의 핵심 역할이다.
+
+    RosClient의 콜백(on_task_status 등)은 rclpy 스핀 스레드(RosSpinThread)에서
+    호출될 수 있는데, PyQt 위젯은 메인 스레드에서만 안전하게 갱신할 수 있다.
+    그래서 콜백에서 위젯을 직접 만지지 않고 pyqtSignal을 emit만 하면, Qt가
+    알아서 메인 스레드 큐에 넣어 _update_* 슬롯을 안전하게 실행해준다.
+    """
+
     task_status_received = QtCore.pyqtSignal(str, str)
     gripper_state_received = QtCore.pyqtSignal(float, bool)
     fault_received = QtCore.pyqtSignal(str)
@@ -39,10 +48,13 @@ class MainWindow(QtWidgets.QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
 
+        # signal -> slot 연결 (Qt 메인 스레드에서 안전하게 실행되도록)
         self.task_status_received.connect(self._update_task_status)
         self.gripper_state_received.connect(self._update_gripper_state)
         self.fault_received.connect(self._update_fault)
 
+        # ros_client의 콜백 슬롯에 "emit"을 꽂아넣는다 - 메시지가 오면
+        # 위젯을 직접 바꾸는 대신 신호만 쏘게 하기 위함(클래스 docstring 참고)
         self.ros_client.on_task_status = self.task_status_received.emit
         self.ros_client.on_gripper_state = self.gripper_state_received.emit
         self.ros_client.on_fault = self.fault_received.emit

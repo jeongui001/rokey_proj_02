@@ -6,10 +6,19 @@ from std_msgs.msg import String
 
 
 class SttNode(Node):
+    """마이크 -> VAD 발화구간 검출 -> 로컬 Whisper -> 텍스트(전체 계획.md 1.2절).
+
+    핵심 로직 3개(_read_audio_chunk/_detect_voice_activity/_run_whisper)가
+    전부 NotImplementedError 스텁이라, 지금은 사실상 뼈대(스레드 + 버퍼링 구조)만
+    있는 상태다. 실제로 값이 흐르게 하려면 이 3개부터 채워야 한다.
+    """
+
     def __init__(self):
         super().__init__('stt_node')
-        self.pub_command = self.create_publisher(String, '/user_command/text', 10)
+        self.pub_command = self.create_publisher(String, '/user_command/text', 10)  # 서브스크라이버: task_manager
         self._stop_event = threading.Event()
+        # 오디오 캡처는 블로킹 I/O라 rclpy.spin()과 같은 스레드에서 돌리면 콜백이 막힌다.
+        # 그래서 별도 스레드에서 무한 루프로 돌리고, destroy_node()에서 stop_event로 정지시킨다.
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
@@ -25,6 +34,10 @@ class SttNode(Node):
             return default
 
     def _capture_loop(self):
+        """오디오 청크를 계속 읽으면서 발화 구간을 하나의 버퍼로 모으는 루프.
+        말하는 동안(is_speech=True)은 버퍼에 계속 쌓고, 말이 멈추면(is_speech=False)
+        그때까지 모은 버퍼 전체를 한 번에 Whisper에 넘긴다 - 즉 "문장 단위"로
+        인식하지 프레임 단위로 인식하지 않는다."""
         buffer = bytearray()
         while not self._stop_event.is_set():
             chunk = self._safe_call(self._read_audio_chunk, default=None)
@@ -36,7 +49,9 @@ class SttNode(Node):
                 buffer.extend(chunk)
                 continue
             if len(buffer) == 0:
+                # 말도 없고 모아둔 버퍼도 없으면 그냥 계속 대기
                 continue
+            # 말이 멈춘 시점 - 지금까지 모은 발화 전체를 한 번에 인식
             text = self._safe_call(self._run_whisper, bytes(buffer), default=None)
             buffer = bytearray()
             if text:

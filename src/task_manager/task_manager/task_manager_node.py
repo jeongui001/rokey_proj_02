@@ -76,13 +76,13 @@ class TaskManagerNode(Node):
 
     def _publish_status(self, detail=''):
         msg = String()
-        msg.data = json.dumps({'state': self.state, 'detail': detail})
-        self.pub_status.publish(msg)
+        msg.data = json.dumps({'state': self.state, 'detail': detail}) # 딕셔너리를 문자열로 바꾸기 위해 json.dumps 사용, 현재 상태와 디테일을 묶는다.
+        self.pub_status.publish(msg) # 상태와 디테일을 ui에 전송
 
     def _set_state(self, new_state, detail=''):
         """상태 전이는 전부 이 함수 하나를 거친다 - 상태 변경과 /task/status 퍼블리시가 항상 같이 일어나게 하기 위함."""
-        self.state = new_state
-        self._publish_status(detail)
+        self.state = new_state # 상태 변경
+        self._publish_status(detail) # 퍼블리시 -> 상태 변경시마다 퍼블리시
 
     def _on_fault(self, msg):
         """어느 상태에 있든 /robot/fault 수신 시 즉시 FAULT로 전이 (3절 표의 공통 규칙)."""
@@ -92,7 +92,7 @@ class TaskManagerNode(Node):
 
     # ---- IDLE -> PARSING -> MOVE_TO_WATCH ----
 
-    def _call_llm(self, text: str) -> dict:
+    def _call_llm(self, text: str) -> dict: # text는 str이고 리턴은 dict이여야 한다.
         """LLM API를 호출해 {"tool": ..., "action": ...}를 반환한다. 스키마 검증·재시도 포함."""
         raise NotImplementedError('_call_llm 구현 필요')
 
@@ -100,21 +100,21 @@ class TaskManagerNode(Node):
         """IDLE 상태에서만 명령을 받는다 - 처리 중에 새 명령이 들어와도 무시."""
         if self.state != State.IDLE:
             return
-        self._set_state(State.PARSING, detail=msg.data)
+        self._set_state(State.PARSING, detail=msg.data) # 인식된 문장이 전달되면 PARSING상태로 변경
         self._handle_parsing(msg.data)
 
     def _handle_parsing(self, text):
-        parsed = self._safe_call(self._call_llm, text, default=None)
+        parsed = self._safe_call(self._call_llm, text, default=None) # 인식된 문장을 LLM에 넣음
         if not parsed or 'tool' not in parsed:
             self._set_state(State.IDLE, detail='명령을 이해하지 못했습니다. 다시 말씀해주세요.')
             return
         self.current_tool = parsed['tool']
         self._detect_track_cycles = 0
         self._verify_grasp_retries = 0
-        self._set_state(State.MOVE_TO_WATCH)
+        self._set_state(State.MOVE_TO_WATCH) # 4번
         # 감시 자세로 이동시키는 것과 동시에 vision을 공구 추적 모드로 켠다.
-        self._set_vision_mode(SetVisionMode.Request.TRACK_TOOL, self.current_tool)
-        self._send_robot_goal('move_named', named_target='watch')
+        self._set_vision_mode(SetVisionMode.Request.TRACK_TOOL, self.current_tool) # 8번
+        self._send_robot_goal('move_named', named_target='watch') # 5번
 
     def _set_vision_mode(self, mode, tool_class=''):
         """vision_node의 /vision/set_mode 서비스를 비동기 호출한다.
@@ -122,13 +122,13 @@ class TaskManagerNode(Node):
         request = SetVisionMode.Request()
         request.mode = mode
         request.tool_class = tool_class
-        future = self.set_mode_client.call_async(request)
-        future.add_done_callback(
-            lambda f: self._on_set_vision_mode_response(f, mode))
+        future = self.set_mode_client.call_async(request) # 비동기 요청 
+        future.add_done_callback( # 응답이 올경우 그 응답이 f가 됨
+            lambda f: self._on_set_vision_mode_response(f, mode)) # 인수가 future만 있는게 아닌 mode도 필요해서 lambda로 감쌌다.
 
     def _on_set_vision_mode_response(self, future, requested_mode):
         response = future.result()
-        if response.success:
+        if response.success: # 성공시 그냥 넘어감
             return
         self.get_logger().warn(f'set_vision_mode({requested_mode}) failed: {response.message}')
         # OFF 전환 실패는 이미 성공 경로(HOME 진입 등)에서 발생하는 정리성 호출이라
@@ -145,26 +145,26 @@ class TaskManagerNode(Node):
         goal.task_type = task_type
         goal.named_target = named_target
         if target_pose is not None:
-            goal.target_pose = target_pose
+            goal.target_pose = target_pose # 잡는 포즈는 일단 없는걸로 지정해뒀기 떄문에 이렇게 if로 감쌈
         goal.tool_class = tool_class
         goal.grasp_width_mm = grasp_width_mm
         goal.grasp_force_n = grasp_force_n
-        future = self.robot_task_client.send_goal_async(
-            goal, feedback_callback=self._on_robot_feedback)
-        future.add_done_callback(self._on_goal_response)
+        future = self.robot_task_client.send_goal_async( # 골 전송
+            goal, feedback_callback=self._on_robot_feedback) # 피드백 수신
+        future.add_done_callback(self._on_goal_response) # 골에 대한 응답이 오면 실행
 
     def _on_robot_feedback(self, feedback_msg):
         """servo_pick 진행 중 robot_control이 보내는 state(tracking/descending/...)를
         그대로 /task/status에 실어 UI에 전달한다."""
-        self._publish_status(detail=f'servo:{feedback_msg.feedback.state}')
+        self._publish_status(detail=f'servo:{feedback_msg.feedback.state}') # 간단하게 상태만 보냄
 
     def _on_goal_response(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
             self._set_state(State.FAULT, detail='goal rejected')
             return
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._on_robot_result)
+        result_future = goal_handle.get_result_async() # 결과 수신 등록
+        result_future.add_done_callback(self._on_robot_result) # 결과가 오면 실행할 함수 등록
 
     def _on_robot_result(self, future):
         """모든 RobotTask result가 여기로 들어온다. goal 안에 어떤 task_type을 보냈는지는
