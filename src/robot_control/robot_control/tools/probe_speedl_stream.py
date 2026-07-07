@@ -9,6 +9,7 @@ RT 세션(ConnectRtControl/StartRtControl) 없이 dsr_msgs2의 speedl_stream 토
 """
 
 import argparse
+import signal
 import sys
 import threading
 import time
@@ -141,3 +142,96 @@ def _run_phase_segments(
         if not ok:
             return False
     return True
+
+
+def _run_gripper_during_motion(
+        pub, speedl_stream_cls, axis, vel_mm_s, acc, period_s,
+        rg2_client, grasp_width_mm, grasp_force_n, stop_event):
+    """메인 스레드가 speedl_stream을 계속 발행하는 동안, 별도 스레드에서 그리퍼를
+    닫았다 여는 것으로 '이동 중 그리퍼 동작'을 확인한다. RG2Client.close/open은
+    내부적으로 busy 비트를 폴링하며 블로킹하므로 메인 발행 루프와 분리해야 한다."""
+    gripper_done = threading.Event()
+
+    def _gripper_worker():
+        print('[그리퍼] close() 호출')
+        ok_close = rg2_client.close(grasp_width_mm, grasp_force_n)
+        print(f'[그리퍼] close 결과: {ok_close} (status={rg2_client.last_status})')
+        time.sleep(1.0)
+        print('[그리퍼] open() 호출')
+        ok_open = rg2_client.open()
+        print(f'[그리퍼] open 결과: {ok_open} (status={rg2_client.last_status})')
+        gripper_done.set()
+
+    worker = threading.Thread(target=_gripper_worker, daemon=True)
+    worker.start()
+
+    msg = speedl_stream_cls()
+    msg.vel = _velocity_vector(axis, vel_mm_s, 1)
+    msg.acc = list(acc)
+    msg.time = period_s
+    print(f'--- phase5_gripper_during_motion ({axis}축 발행 지속, 그리퍼 스레드 종료 대기) ---')
+    while not gripper_done.is_set():
+        if stop_event.is_set():
+            break
+        pub.publish(msg)
+        time.sleep(period_s)
+    worker.join(timeout=5.0)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    _confirm_or_exit()
+
+    try:
+        import rclpy
+        from dsr_msgs2.msg import SpeedlStream
+        from robot_control.rg2_client import RG2Client
+    except ImportError as exc:
+        print(f'dsr_msgs2/rclpy import 실패 - 두산 ROS2 워크스페이스를 source 하세요: {exc}')
+        sys.exit(1)
+
+    acc = (args.acc_trans_mm_s2, args.acc_rot_deg_s2)
+    stop_event = threading.Event()
+
+    def _handle_signal(signum, _frame):
+        print(f'\n시그널 {signum} 수신 - 정지 명령 발행 후 종료합니다.')
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
+    rclpy.init(args=None)
+    node = rclpy.create_node('probe_speedl_stream')
+    pub = node.create_publisher(SpeedlStream, f'/{args.robot_id}/speedl_stream', 10)
+    rg2_client = RG2Client(
+        ip=args.rg2_ip, port=args.rg2_port, hardware_enabled=True,
+        gripper=args.rg2_gripper, node=None)
+
+    try:
+        segments = build_phase_plan(
+            phase_duration_s=args.phase_duration_s,
+            osc_period_s=args.osc_period_s,
+            osc_duration_s=args.osc_duration_s,
+            pause_durations_s=args.pause_durations_s)
+        completed = _run_phase_segments(
+            pub, SpeedlStream, args.axis, args.vel_mm_s, acc,
+            args.period_s, segments, stop_event)
+
+        print('--- phase4_explicit_stop ---')
+        _publish_zero(pub, SpeedlStream, acc, args.period_s)
+
+        if completed and not stop_event.is_set():
+            _run_gripper_during_motion(
+                pub, SpeedlStream, args.axis, args.vel_mm_s, acc,
+                args.period_s, rg2_client, args.grasp_width_mm,
+                args.grasp_force_n, stop_event)
+
+        print('--- phase6_final_stop ---')
+        _publish_zero(pub, SpeedlStream, acc, args.period_s)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
