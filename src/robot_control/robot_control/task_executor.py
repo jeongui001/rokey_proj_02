@@ -9,6 +9,8 @@ from handover_interfaces.msg import ToolTrack
 
 from robot_control.rg2_client import RG2Status
 from robot_control.safety_monitor import FaultPrefix, SafetyState
+from robot_control.servo_loop import ServoCommand
+from robot_control.speedl_watchdog import SpeedlWatchdog
 
 
 class TaskExecutor:
@@ -23,16 +25,6 @@ class TaskExecutor:
             return bool(self._doosan.stop(stop_mode))
         except Exception as exc:
             self.get_logger().error(f'MoveStop cleanup 중 예외: {exc}')
-            return False
-
-    def _cleanup_close_rt_session(self) -> bool:
-        """RT 세션 stop/disconnect (_close_rt_session 경계). _close_rt_session이
-        실제로 확인한 성공 여부(bool)를 그대로 전달한다 - 예외 발생 시에도 절대
-        상위로 전파하지 않는다."""
-        try:
-            return bool(self._close_rt_session())
-        except Exception as exc:
-            self.get_logger().error(f'RT 세션 종료 cleanup 중 예외: {exc}')
             return False
 
     def _cleanup_disable_compliance(self) -> bool:
@@ -226,23 +218,6 @@ class TaskExecutor:
 
     # ---- servo_pick ----
 
-    def _open_rt_session(self) -> bool:
-        """RT 세션을 열고, 실제로 시작이 확인된 경우에만 True를 반환한다."""
-        if not self.hardware_enabled:
-            self.get_logger().info('[dry_run] RT 세션 오픈 생략')
-            return True
-        if self._doosan is None:
-            raise RuntimeError('DoosanDriver가 초기화되지 않았습니다.')
-        return self._doosan.open_rt_session()
-
-    def _close_rt_session(self) -> bool:
-        if not self.hardware_enabled:
-            self.get_logger().info('[dry_run] RT 세션 종료 생략')
-            return True
-        if self._doosan is None:
-            return True  # 정리할 DoosanDriver 자체가 없음 - idempotent하게 성공 취급
-        return bool(self._doosan.close_rt_session())
-
     def _servo_pick_tick(self):
         abort_reason = self.servo_loop.should_abort()
         if abort_reason is not None:
@@ -372,68 +347,80 @@ class TaskExecutor:
 
     def _run_rt_tracking(
             self, goal_handle, *, name, message_type, topic, callback,
-            servo, step, tick, validate_command, ready_parameter, period_parameter):
-        """물체·손 추적이 공통으로 사용하는 RT 실행/취소/정리 루프.
+            servo, step, tick, validate_command, ready_parameter,
+            period_parameter, accel_param_prefix):
+        """물체·손 추적이 공통으로 사용하는 실행/취소/정리 루프.
+
+        RT 세션 없이 speedl_stream(비-RT)에 직접 연속 발행한다(2026-07-07
+        probe_speedl_stream.py 실측: RT 세션 없이도 부드러운 서보잉이 가능함을
+        확인). RT가 제공하던 "명령 끊기면 자동 정지"는 SpeedlWatchdog(데드맨
+        스위치, 별도 스레드)로 대체한다 - 루프가 매 틱 pet()하고,
+        watchdog_timeout_s 이내에 pet이 없으면 워치독이 독립적으로 vel=0을
+        발행한다(단일 정지 명령으로 충분함도 같은 실측으로 확인됨).
 
         step: 인자 없이 호출해 이번 틱의 ServoCommand(또는 아직 계산할 수 없으면
         None)를 반환하는 콜러블 - servo_pick(칼만 ServoLoop, TCP pose 필요)과
         handover_approach(HandApproachServo, 내부 상태만 사용)가 서로 다른
         step() 시그니처를 쓰므로 호출부에서 클로저로 그 차이를 흡수한다."""
         subscription = None
-        rt_attempted = False
         outcome = 'ABORT'
         detail = f'{name} aborted'
         self._tcp_tracking_active = True
+        watchdog = SpeedlWatchdog(
+            timeout_s=float(
+                self.get_parameter(f'{accel_param_prefix}.watchdog_timeout_s').value),
+            on_timeout=lambda: self._doosan.publish_speedl(
+                ServoCommand(), accel_param_prefix=accel_param_prefix,
+                period_param_name=period_parameter))
         try:
-            rt_attempted = True
-            rt_confirmed = self._open_rt_session()
-            if self.hardware_enabled and not rt_confirmed:
-                outcome, detail = 'ABORT', f'{name} aborted - RT 세션 시작 실패'
-            else:
-                subscription = self.create_subscription(
-                    message_type, topic, callback, 10,
-                    callback_group=self.sensor_callback_group)
-                ready = bool(self.get_parameter(ready_parameter).value)
-                period = float(self.get_parameter(period_parameter).value)
+            subscription = self.create_subscription(
+                message_type, topic, callback, 10,
+                callback_group=self.sensor_callback_group)
+            ready = bool(self.get_parameter(ready_parameter).value)
+            period = float(self.get_parameter(period_parameter).value)
+            publish_active = self.hardware_enabled and ready and self._doosan is not None
+            if publish_active:
+                watchdog.start()
 
-                while rclpy.ok():
-                    if goal_handle.is_cancel_requested:
-                        if not self._cleanup_stop_motion():
-                            detail = f'{name} 취소 중 MoveStop 실패'
-                            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
-                            outcome = 'FAULT'
-                        else:
-                            outcome, detail = 'CANCELED', f'{name} canceled'
-                        break
-                    if self.safety_state != SafetyState.NORMAL:
+            while rclpy.ok():
+                if goal_handle.is_cancel_requested:
+                    if not self._cleanup_stop_motion():
+                        detail = f'{name} 취소 중 MoveStop 실패'
+                        self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                        outcome = 'FAULT'
+                    else:
+                        outcome, detail = 'CANCELED', f'{name} canceled'
+                    break
+                if self.safety_state != SafetyState.NORMAL:
+                    outcome = 'ABORT'
+                    detail = f'{name} aborted - safety_state={self.safety_state}'
+                    break
+
+                state, reason = tick()
+                feedback = RobotTask.Feedback()
+                feedback.state = servo.get_state()
+                goal_handle.publish_feedback(feedback)
+                if state == 'ABORT':
+                    outcome, detail = 'ABORT', reason
+                    break
+                if state in ('CLOSE', 'STOP'):
+                    outcome, detail = 'ARRIVED', ''
+                    break
+
+                command = step()
+                if command is not None and publish_active:
+                    if not validate_command(command):
                         outcome = 'ABORT'
-                        detail = f'{name} aborted - safety_state={self.safety_state}'
+                        detail = f'{name} aborted - invalid velocity command'
                         break
-
-                    state, reason = tick()
-                    feedback = RobotTask.Feedback()
-                    feedback.state = servo.get_state()
-                    goal_handle.publish_feedback(feedback)
-                    if state == 'ABORT':
-                        outcome, detail = 'ABORT', reason
-                        break
-                    if state in ('CLOSE', 'STOP'):
-                        outcome, detail = 'ARRIVED', ''
-                        break
-
-                    command = step()
-                    if command is not None and (
-                            self.hardware_enabled and ready and rt_confirmed
-                            and self._doosan is not None):
-                        if not validate_command(command):
-                            outcome = 'ABORT'
-                            detail = f'{name} aborted - invalid RT velocity command'
-                            break
-                        self._doosan.publish_speedl_rt(command)
-                    time.sleep(period)
-                else:
-                    self._cleanup_stop_motion()
-                    outcome, detail = 'ABORT', f'{name} aborted - rclpy 종료 중'
+                    self._doosan.publish_speedl(
+                        command, accel_param_prefix=accel_param_prefix,
+                        period_param_name=period_parameter)
+                    watchdog.pet()
+                time.sleep(period)
+            else:
+                self._cleanup_stop_motion()
+                outcome, detail = 'ABORT', f'{name} aborted - rclpy 종료 중'
         except Exception as exc:
             self.get_logger().error(f'{name} 실행 중 예외: {exc}')
             stop_ok = self._cleanup_stop_motion()
@@ -446,13 +433,11 @@ class TaskExecutor:
                         f'{FaultPrefix.FAULT}{name} 예외 처리 중 MoveStop 실패: {exc}')
                     outcome = 'FAULT'
         finally:
+            watchdog.stop()
             sub_ok = self._cleanup_destroy_subscription(subscription)
-            rt_ok = self._cleanup_close_rt_session() if rt_attempted else True
             self._tcp_tracking_active = False
-            if not (sub_ok and rt_ok):
-                detail = (
-                    f'{name} cleanup 실패 '
-                    f'(subscription={sub_ok}, rt_session={rt_ok})')
+            if not sub_ok:
+                detail = f'{name} cleanup 실패 (subscription={sub_ok})'
                 self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                 outcome = 'FAULT'
         return outcome, detail
@@ -495,7 +480,8 @@ class TaskExecutor:
             tick=self._servo_pick_tick,
             validate_command=self._validate_servo_command,
             ready_parameter='servo_pick.hardware_ready',
-            period_parameter='servo_pick.rt_control_period_s')
+            period_parameter='servo_pick.control_period_s',
+            accel_param_prefix='servo_pick')
         if outcome != 'ARRIVED':
             return self._finish_tracking_result(goal_handle, outcome, detail)
 
@@ -589,7 +575,8 @@ class TaskExecutor:
             tick=self._handover_approach_tick,
             validate_command=self._validate_handover_approach_command,
             ready_parameter='handover_approach.hardware_ready',
-            period_parameter='handover_approach.rt_control_period_s')
+            period_parameter='handover_approach.control_period_s',
+            accel_param_prefix='handover_approach')
         if outcome == 'ARRIVED':
             detail = 'handover_approach arrived'
         return self._finish_tracking_result(goal_handle, outcome, detail)
