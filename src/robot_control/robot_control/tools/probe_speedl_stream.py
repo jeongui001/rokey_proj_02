@@ -10,6 +10,8 @@ RT 세션(ConnectRtControl/StartRtControl) 없이 dsr_msgs2의 speedl_stream 토
 
 import argparse
 import sys
+import threading
+import time
 from collections import namedtuple
 
 AXIS_INDEX = {'x': 0, 'y': 1, 'z': 2}
@@ -77,3 +79,65 @@ def _confirm_or_exit():
     if answer != 'yes':
         print('취소되었습니다.')
         sys.exit(0)
+
+
+STOP_TICK_S = 0.05
+FINAL_STOP_REPEATS = 5
+
+
+def _velocity_vector(axis, vel_mm_s, sign):
+    vel6 = [0.0] * 6
+    vel6[AXIS_INDEX[axis]] = vel_mm_s * sign
+    return vel6
+
+
+def _sleep_ticked(stop_event, seconds):
+    """seconds초를 STOP_TICK_S 단위로 나눠 자며 stop_event를 감시한다.
+    stop_event가 세팅되면 즉시 False, 다 자면 True를 반환한다."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return False
+        time.sleep(min(STOP_TICK_S, max(deadline - time.monotonic(), 0.0)))
+    return True
+
+
+def _publish_zero(pub, speedl_stream_cls, acc, period_s, repeats=FINAL_STOP_REPEATS):
+    msg = speedl_stream_cls()
+    msg.vel = [0.0] * 6
+    msg.acc = list(acc)
+    msg.time = period_s
+    for _ in range(repeats):
+        pub.publish(msg)
+        time.sleep(period_s)
+
+
+def _run_publish_segment(
+        pub, speedl_stream_cls, axis, vel_mm_s, acc, period_s, segment, stop_event):
+    msg = speedl_stream_cls()
+    msg.vel = _velocity_vector(axis, vel_mm_s, segment.sign)
+    msg.acc = list(acc)
+    msg.time = period_s
+    deadline = time.monotonic() + segment.duration_s
+    while time.monotonic() < deadline:
+        if stop_event.is_set():
+            return False
+        pub.publish(msg)
+        time.sleep(period_s)
+    return True
+
+
+def _run_phase_segments(
+        pub, speedl_stream_cls, axis, vel_mm_s, acc, period_s, segments, stop_event):
+    for segment in segments:
+        print(f'--- {segment.label} ({segment.kind}, {segment.duration_s:.2f}s) ---')
+        if segment.kind == 'publish':
+            ok = _run_publish_segment(
+                pub, speedl_stream_cls, axis, vel_mm_s, acc, period_s, segment,
+                stop_event)
+        else:
+            print(f'발행 중단 {segment.duration_s:.2f}s - 로봇 반응을 관찰하세요.')
+            ok = _sleep_ticked(stop_event, segment.duration_s)
+        if not ok:
+            return False
+    return True
