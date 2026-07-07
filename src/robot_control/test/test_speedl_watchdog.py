@@ -18,14 +18,14 @@ def test_pet_prevents_timeout():
     assert calls == []
 
 
-def test_timeout_fires_once_when_pet_stops():
+def test_timeout_fires_repeatedly_while_pet_stays_stopped():
     calls = []
     wd = SpeedlWatchdog(
         timeout_s=0.05, on_timeout=lambda: calls.append(True), poll_interval_s=0.01)
     wd.start()
     time.sleep(0.2)
     wd.stop()
-    assert calls == [True]
+    assert len(calls) > 1
 
 
 def test_stop_prevents_timeout_after_pet_stops():
@@ -41,3 +41,27 @@ def test_stop_prevents_timeout_after_pet_stops():
 def test_stop_without_start_does_not_raise():
     wd = SpeedlWatchdog(timeout_s=0.1, on_timeout=lambda: None)
     wd.stop()  # start() 없이 stop()만 호출해도 예외 없이 안전해야 한다
+
+
+def test_watchdog_rearms_after_pet_resumes():
+    calls = []
+    wd = SpeedlWatchdog(
+        timeout_s=0.05, on_timeout=lambda: calls.append(True), poll_interval_s=0.01)
+    wd.start()
+    try:
+        time.sleep(0.15)  # 첫 정지 유발 - 최소 1회 발동
+        assert len(calls) >= 1
+        first_fire_count = len(calls)
+
+        # pet()을 재개하면 더 이상 발동하지 않아야 한다
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            wd.pet()
+            time.sleep(0.01)
+        assert len(calls) == first_fire_count
+
+        # 다시 pet()을 멈추면 재무장되어 다시 발동해야 한다
+        time.sleep(0.15)
+        assert len(calls) > first_fire_count
+    finally:
+        wd.stop()

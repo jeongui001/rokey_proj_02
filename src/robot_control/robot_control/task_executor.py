@@ -323,9 +323,9 @@ class TaskExecutor:
             position.x, position.y, position.z))
 
     def _validate_servo_command(self, cmd) -> bool:
-        """RT 속도 명령을 실제로 발행하기 직전 마지막 안전 검사. ServoLoop.step()이
+        """속도 명령을 실제로 발행하기 직전 마지막 안전 검사. ServoLoop.step()이
         내부적으로 이미 _clip으로 속도를 제한하지만, 발행 경계에서 NaN/Inf와 제한을
-        한 번 더 확인해 유효하지 않은 값이 그대로 RT로 나가지 않게 한다."""
+        한 번 더 확인해 유효하지 않은 값이 그대로 나가지 않게 한다."""
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
         if not all(math.isfinite(v) for v in values):
             return False
@@ -366,13 +366,14 @@ class TaskExecutor:
         outcome = 'ABORT'
         detail = f'{name} aborted'
         self._tcp_tracking_active = True
-        watchdog = SpeedlWatchdog(
-            timeout_s=float(
-                self.get_parameter(f'{accel_param_prefix}.watchdog_timeout_s').value),
-            on_timeout=lambda: self._doosan.publish_speedl(
-                ServoCommand(), accel_param_prefix=accel_param_prefix,
-                period_param_name=period_parameter))
+        watchdog = None
         try:
+            watchdog = SpeedlWatchdog(
+                timeout_s=float(
+                    self.get_parameter(f'{accel_param_prefix}.watchdog_timeout_s').value),
+                on_timeout=lambda: self._doosan.publish_speedl(
+                    ServoCommand(), accel_param_prefix=accel_param_prefix,
+                    period_param_name=period_parameter))
             subscription = self.create_subscription(
                 message_type, topic, callback, 10,
                 callback_group=self.sensor_callback_group)
@@ -433,7 +434,8 @@ class TaskExecutor:
                         f'{FaultPrefix.FAULT}{name} 예외 처리 중 MoveStop 실패: {exc}')
                     outcome = 'FAULT'
         finally:
-            watchdog.stop()
+            if watchdog is not None:
+                watchdog.stop()
             sub_ok = self._cleanup_destroy_subscription(subscription)
             self._tcp_tracking_active = False
             if not sub_ok:
@@ -526,7 +528,7 @@ class TaskExecutor:
         return offset
 
     def _validate_handover_approach_command(self, cmd) -> bool:
-        """RT 속도 명령을 실제로 발행하기 직전 마지막 안전 검사(_validate_servo_command와
+        """속도 명령을 실제로 발행하기 직전 마지막 안전 검사(_validate_servo_command와
         동일한 목적). HandApproachServo는 3축 모두 같은 v_max로 클립하므로 여기서도
         축 구분 없이 하나의 한계로 검사한다."""
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)

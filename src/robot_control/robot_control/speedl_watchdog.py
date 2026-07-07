@@ -1,5 +1,8 @@
+import logging
 import threading
 import time
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class SpeedlWatchdog:
@@ -10,9 +13,12 @@ class SpeedlWatchdog:
     의존하지 않는 순수 파이썬 클래스라 하드웨어 없이 유닛 테스트 가능하다.
 
     비-RT speedl은 명령이 끊겨도 스스로 멈추지 않지만(2026-07-07
-    probe_speedl_stream.py 실측 확인), vel=0을 단 한 번만 발행해도 로봇이 멈춘
-    채 유지된다(같은 실측) - 그래서 on_timeout은 한 번만 호출하고 스레드를
-    종료한다(재시작하려면 start()를 다시 호출).
+    probe_speedl_stream.py 실측 확인), vel=0을 발행하면 로봇이 멈춘 채
+    유지된다(같은 실측). 타임아웃이 지속되는 동안은 poll_interval_s마다
+    on_timeout을 계속 호출한다(스레드가 죽지 않고 감시를 유지) - 이후 pet()이
+    다시 들어와 타임아웃 조건이 해소되면 자동으로 재무장되어 추가 호출 없이
+    감시만 계속한다. 즉 "한 번 쏘고 죽는" 1회성 알람이 아니라, 루프가 실제로
+    다시 살아날 때까지 정지를 계속 보장하는 지속적 데드맨스위치다.
 
     같은 프로세스 내 스레드 기반이라 메인 루프가 행(hang)에 걸리거나 예외로
     죽어도 동작하지만, 프로세스 자체가 죽는 경우(kill -9, segfault)는 보호
@@ -45,8 +51,10 @@ class SpeedlWatchdog:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             if time.monotonic() - self._last_pet > self._timeout_s:
-                self._on_timeout()
-                return
+                try:
+                    self._on_timeout()
+                except Exception:
+                    _LOGGER.exception('SpeedlWatchdog on_timeout 콜백 중 예외 발생')
             time.sleep(self._poll_interval_s)
 
 

@@ -67,6 +67,7 @@ class _FakeDoosanDriver:
         self.ext_torque = [0.0] * 6
         self.tool_force = [0.0] * 6
         self.publish_calls = []
+        self.publish_kwargs = []
         self.stop_calls = []
         self.stop_return_value = True
         self.stop_should_raise = False
@@ -94,6 +95,8 @@ class _FakeDoosanDriver:
 
     def publish_speedl(self, cmd, *, accel_param_prefix, period_param_name):
         self.publish_calls.append(cmd)
+        self.publish_kwargs.append(
+            {'accel_param_prefix': accel_param_prefix, 'period_param_name': period_param_name})
 
 
 def _terminal_call_count(gh) -> int:
@@ -2387,6 +2390,36 @@ def test_hardware_disabled_rg2_client_never_touches_modbus(node):
     node.rg2_client.open()
 
     assert node.rg2_client._client is None
+
+
+def test_handover_approach_publishes_speedl_with_own_param_prefix(node, monkeypatch):
+    """servo_pick과의 교차배선 버그 수정 검증: handover_approach 실행 시
+    publish_speedl에 accel_param_prefix='handover_approach'/
+    period_param_name='handover_approach.control_period_s'가 전달되는지 확인한다
+    (예전에는 servo_pick의 파라미터를 항상 썼던 교차배선이 있었다)."""
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('handover_approach.hardware_ready', value=True)])
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    ticks = iter(['CONTINUE', 'STOP'])
+    node._handover_approach_tick = lambda: (next(ticks), None)
+    node.hand_approach_servo.step = lambda: ServoCommand(vx=0.1)
+    node.hand_approach_servo.start = lambda: None
+    node.hand_approach_servo.get_state = lambda: 'tracking'
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert result.success is True
+    assert len(fake.publish_calls) == 1
+    assert fake.publish_kwargs[0] == {
+        'accel_param_prefix': 'handover_approach',
+        'period_param_name': 'handover_approach.control_period_s',
+    }
 
 
 # ---- SpeedlWatchdog 통합 (명령이 끊기면 자동으로 vel=0 발행) ----

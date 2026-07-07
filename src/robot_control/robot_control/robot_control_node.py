@@ -142,7 +142,7 @@ class RobotControlNode(Node, TaskExecutor):
         # TCP 위치 캐시 샘플의 나이(초)가 이 값보다 크면 오래됐다고 보고 사용하지
         # 않는다 (서비스 왕복 시간이 아니라 _tcp_pose_cache 샘플 자체의 나이를
         # 뜻한다 - _on_tcp_pose_refresh_timer/_get_current_tcp_posx 참고). 하드웨어
-        # 캘리브레이션 값이 아니라 RT 루프에 맞는 통신 타이밍 설정이다.
+        # 캘리브레이션 값이 아니라 서보 제어 루프에 맞는 통신 타이밍 설정이다.
         self.declare_parameter('servo_pick.tcp_pose_max_age_s', 0.2)
         # TCP 위치 캐시를 갱신하는 주기 - ToolTrack 콜백마다 동기 호출하는 대신
         # rate-limited하게 별도 타이머로 갱신한다 (GetCurrentPosx 과부하 방지).
