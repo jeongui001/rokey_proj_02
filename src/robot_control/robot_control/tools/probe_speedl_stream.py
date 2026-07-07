@@ -26,8 +26,9 @@ def build_phase_plan(
     """1~3단계(일정속도 지속발행 / 방향전환 오시레이션 / 명령 중단-재개) 스케줄을
     만든다. axis/vel_mm_s는 세그먼트에 담지 않는다 - sign(부호)만 담고, 실제 축과
     속도 크기는 실행 시점에 적용한다(_velocity_vector 참고)."""
-    segments = [PhaseSegment('publish', 'phase1_constant', phase_duration_s, 1)]
+    segments = [PhaseSegment('publish', 'phase1_constant', phase_duration_s, 1)] # 페이즈1, 정방향으로 꾸준히 퍼블리시
 
+    # 페이즈2 오실레이션: osc_period_s 주기로 방향 전환, osc_duration_s 동안 반복
     t = 0.0
     i = 0
     while t < osc_duration_s - 1e-9:
@@ -38,6 +39,7 @@ def build_phase_plan(
         t += duration
         i += 1
 
+    # 페이즈3
     for i, pause_s in enumerate(pause_durations_s):
         segments.append(PhaseSegment('publish', f'phase3_burst_{i}', pause_burst_s, 1))
         segments.append(PhaseSegment('pause', f'phase3_pause_{i}', pause_s, 0))
@@ -221,16 +223,16 @@ def main(argv=None):
             args.period_s, segments, stop_event)
 
         print('--- phase4_explicit_stop ---')
-        _publish_zero(pub, SpeedlStream, acc, args.period_s)
+        _publish_zero(pub, SpeedlStream, acc, args.period_s) # 정지
 
         if completed and not stop_event.is_set():
-            _run_gripper_during_motion(
+            _run_gripper_during_motion( # 이동 중 그리퍼 동작 확인
                 pub, SpeedlStream, args.axis, args.vel_mm_s, acc,
                 args.period_s, rg2_client, args.grasp_width_mm,
                 args.grasp_force_n, stop_event)
 
         print('--- phase6_final_stop ---')
-        _publish_zero(pub, SpeedlStream, acc, args.period_s)
+        _publish_zero(pub, SpeedlStream, acc, args.period_s) # 최종 정지
     finally:
         node.destroy_node()
         rclpy.shutdown()

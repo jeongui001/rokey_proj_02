@@ -38,14 +38,14 @@ class KalmanXYZV:
         q = np.array([self.q_pos, self.q_pos, self.q_pos, self.q_vel, self.q_vel])
         return np.diag(q * max(dt, 1e-6))
 
-    def predict(self, dt):
+    def predict(self, dt): # 과거 데이터로 현재 예측
         """칼만 필터 예측 단계: x = F@x, P = F@P@F.T + Q. ToolTrack이 들어올 때마다
         update 직전에 호출한다(경과시간 dt만큼 앞으로 밀어서 현재 관측과 비교하기 위함)."""
         F = self._F(dt)
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + self._Q(dt)
+        self.x = F @ self.x # 상태 예측
+        self.P = F @ self.P @ F.T + self._Q(dt) # 공분산 예측
 
-    def predict_position(self, lead_time):
+    def predict_position(self, lead_time): # 현재 예측 데이터로 미래 예측
         """predict()와 달리 상태(self.x, self.P)를 바꾸지 않고, lead_time 이후 위치만
         읽기 전용으로 외삽해서 반환한다. servo_loop.step()이 이걸로 지연 보상
         (Δt_lat)된 목표점 p_ref를 계산한다(2.3절)."""

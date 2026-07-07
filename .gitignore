@@ -9,3 +9,5 @@ __pycache__/
 
 # 로컬 개발용 임시 launch/스크립트 - 커밋 대상 아님
 /dev/
+
+docs/superpowers/
