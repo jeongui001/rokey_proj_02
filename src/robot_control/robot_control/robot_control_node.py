@@ -21,7 +21,7 @@ from robot_control.safety_monitor import (
     SafetyMonitor,
     SafetyState,
 )
-from robot_control.servo_loop import HandApproachServo, ServoLoop
+from robot_control.servo_loop import ServoLoop
 from robot_control.task_executor import TaskExecutor
 
 NAMED_POSE_NAMES = ('home', 'front', 'up', 'down', 'watch', 'handover_safe')
@@ -149,10 +149,10 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo_pick.tcp_pose_refresh_period_s', 0.05)
 
         # handover_approach: handover_safe 도착 후 /vision/hand_pose(작업자 손 위치)를
-        # 향해 servo_pick과 같은 PBVS 패턴으로 접근하다 stop_distance_m 이내가 되면
-        # 멈춘다(그리퍼 동작 없음 - 이후 handover_hold가 당김을 기다린다). 사람에게
-        # 접근하는 동작이라 servo_pick과 별도 네임스페이스로 두어 더 보수적으로
-        # 튜닝할 수 있게 한다.
+        # 향해 접근하다 stop_distance_m 이내가 되면 멈춘다(그리퍼 동작 없음 - 이후
+        # handover_hold가 당김을 기다린다). 실제 접근 로직(movel 기반 단발성 이동)은
+        # 아직 구현 전이라 _execute_handover_approach는 게이트 체크 후 TODO를
+        # 반환하는 스텁 상태다 - 아래 파라미터는 그 구현이 재사용할 것들이다.
         # hardware_ready는 servo_pick.hardware_ready와 같은 이유로 기본 false다:
         # hand_pose(vision_node._track_hand)가 아직 미구현(NotImplementedError)이라
         # frame_id/orientation 의미가 검증되지 않았다 - 확정 전까지 실제 속도
@@ -160,19 +160,9 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('handover_approach.hardware_ready', False)
         # 사용자가 지정한 접근 정지 거리(5cm) - 실측 협의값.
         self.declare_parameter('handover_approach.stop_distance_m', 0.05)
-        self.declare_parameter('handover_approach.v_max', 0.15)
-        self.declare_parameter('handover_approach.kp_xy', 1.0)
         self.declare_parameter('handover_approach.timeout_s', 10.0)
-        self.declare_parameter('handover_approach.t_lost_s', 0.5)
-        self.declare_parameter('handover_approach.diverge_factor', 1.2)
-        self.declare_parameter('handover_approach.diverge_window', 3)
-        self.declare_parameter('handover_approach.control_period_s', 0.01)
-        self.declare_parameter('handover_approach.speedl_acc_trans_mm_s2', 200.0)
-        self.declare_parameter('handover_approach.speedl_acc_rot_deg_s2', 60.0)
-        self.declare_parameter('handover_approach.watchdog_timeout_s', 0.2)
         # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
-        # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다
-        # (_compute_hand_pose_tcp_offset).
+        # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
         self.declare_parameter('handover_approach.hand_pose_frame_id', 'base_link')
 
         self.hardware_enabled = bool(self.get_parameter('hardware_enabled').value)
@@ -202,16 +192,6 @@ class RobotControlNode(Node, TaskExecutor):
             dt_latency=self.get_parameter('servo.dt_latency').value,
             timeout_s=self.get_parameter('servo.timeout').value,
             t_lost_s=self.get_parameter('servo.t_lost').value,
-        )
-
-        self.hand_approach_servo = HandApproachServo(
-            kp_xy=self.get_parameter('handover_approach.kp_xy').value,
-            v_max=self.get_parameter('handover_approach.v_max').value,
-            timeout_s=self.get_parameter('handover_approach.timeout_s').value,
-            t_lost_s=self.get_parameter('handover_approach.t_lost_s').value,
-            stop_distance_m=self.get_parameter('handover_approach.stop_distance_m').value,
-            diverge_factor=self.get_parameter('handover_approach.diverge_factor').value,
-            diverge_window=self.get_parameter('handover_approach.diverge_window').value,
         )
 
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.

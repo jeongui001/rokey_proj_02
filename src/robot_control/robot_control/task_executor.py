@@ -2,7 +2,6 @@ import math
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
 
 from handover_interfaces.action import RobotTask
 from handover_interfaces.msg import ToolTrack
@@ -359,9 +358,9 @@ class TaskExecutor:
         발행한다(단일 정지 명령으로 충분함도 같은 실측으로 확인됨).
 
         step: 인자 없이 호출해 이번 틱의 ServoCommand(또는 아직 계산할 수 없으면
-        None)를 반환하는 콜러블 - servo_pick(칼만 ServoLoop, TCP pose 필요)과
-        handover_approach(HandApproachServo, 내부 상태만 사용)가 서로 다른
-        step() 시그니처를 쓰므로 호출부에서 클로저로 그 차이를 흡수한다."""
+        None)를 반환하는 콜러블 - 현재는 servo_pick(칼만 ServoLoop, TCP pose 필요)만
+        이 루프를 쓴다. handover_approach는 movel 기반 단발성 이동으로 별도
+        구현될 예정이라 이 루프를 쓰지 않는다(2026-07-07)."""
         subscription = None
         outcome = 'ABORT'
         detail = f'{name} aborted'
@@ -515,45 +514,6 @@ class TaskExecutor:
 
     # ---- handover_approach (handover_safe 이후 작업자 손에 접근) ----
 
-    def _compute_hand_pose_tcp_offset(self, message):
-        error = self._tcp_position_error(
-            message,
-            self.get_parameter('handover_approach.hand_pose_frame_id').value)
-        if error is None:
-            return None
-        offset = PoseStamped()
-        offset.header = message.header
-        offset.pose.position.x, offset.pose.position.y, offset.pose.position.z = error
-        offset.pose.orientation = message.pose.orientation
-        return offset
-
-    def _validate_handover_approach_command(self, cmd) -> bool:
-        """속도 명령을 실제로 발행하기 직전 마지막 안전 검사(_validate_servo_command와
-        동일한 목적). HandApproachServo는 3축 모두 같은 v_max로 클립하므로 여기서도
-        축 구분 없이 하나의 한계로 검사한다."""
-        values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
-        if not all(math.isfinite(v) for v in values):
-            return False
-        tol = 1e-6
-        v_max = abs(self.get_parameter('handover_approach.v_max').value)
-        return all(abs(v) <= v_max + tol for v in values)
-
-    def _on_hand_pose_during_approach(self, msg):
-        offset_msg = self._compute_hand_pose_tcp_offset(msg)
-        if offset_msg is None:
-            # frame_id 불일치, NaN/Inf, TCP 조회 실패/신선도 미달 - 이번 프레임은
-            # 유실된 것처럼 취급한다(HandApproachServo.should_abort의 t_lost_s가 감지한다).
-            return
-        self.hand_approach_servo.on_hand_pose(offset_msg)
-
-    def _handover_approach_tick(self):
-        abort_reason = self.hand_approach_servo.should_abort()
-        if abort_reason is not None:
-            return ('ABORT', abort_reason)
-        if self.hand_approach_servo.should_stop():
-            return ('STOP', None)
-        return ('CONTINUE', None)
-
     def _execute_handover_approach(self, goal_handle):
         if self.safety_state != SafetyState.NORMAL:
             return self._finish_tracking_result(
@@ -565,23 +525,11 @@ class TaskExecutor:
                 goal_handle, 'ABORT',
                 'handover_approach rejected - handover_approach.hardware_ready=false')
 
-        self.hand_approach_servo.start()
-        outcome, detail = self._run_rt_tracking(
-            goal_handle,
-            name='handover_approach',
-            message_type=PoseStamped,
-            topic='/vision/hand_pose',
-            callback=self._on_hand_pose_during_approach,
-            servo=self.hand_approach_servo,
-            step=self.hand_approach_servo.step,
-            tick=self._handover_approach_tick,
-            validate_command=self._validate_handover_approach_command,
-            ready_parameter='handover_approach.hardware_ready',
-            period_parameter='handover_approach.control_period_s',
-            accel_param_prefix='handover_approach')
-        if outcome == 'ARRIVED':
-            detail = 'handover_approach arrived'
-        return self._finish_tracking_result(goal_handle, outcome, detail)
+        # TODO: movel 기반 단발성 접근 구현 예정 - RT/speedl_stream 미사용.
+        # /vision/hand_pose를 한 번만 읽어 현재 TCP->손 방향으로
+        # stop_distance_m만큼 못 미친 지점까지 movel로 이동한다(재계산 없음).
+        return self._finish_tracking_result(
+            goal_handle, 'ABORT', 'handover_approach not yet implemented')
 
     # ---- handover_hold ----
 
