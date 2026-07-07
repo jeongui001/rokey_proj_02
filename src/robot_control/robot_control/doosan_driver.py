@@ -12,8 +12,6 @@ class DoosanDriver:
     def __init__(self, node):
         try:
             from dsr_msgs2.srv import (
-                ConnectRtControl,
-                DisconnectRtControl,
                 GetCurrentPosx,
                 GetExternalTorque,
                 GetRobotState,
@@ -23,11 +21,9 @@ class DoosanDriver:
                 MoveStop,
                 ReleaseComplianceCtrl,
                 SetRobotControl,
-                StartRtControl,
-                StopRtControl,
                 TaskComplianceCtrl,
             )
-            from dsr_msgs2.msg import SpeedlRtStream
+            from dsr_msgs2.msg import SpeedlStream
         except ImportError as exc:
             raise RuntimeError(
                 'hardware_enabled=true에는 dsr_msgs2가 필요합니다. '
@@ -43,13 +39,9 @@ class DoosanDriver:
         self._GetExternalTorque = GetExternalTorque
         self._GetToolForce = GetToolForce
         self._GetCurrentPosx = GetCurrentPosx
-        self._ConnectRtControl = ConnectRtControl
-        self._StartRtControl = StartRtControl
-        self._StopRtControl = StopRtControl
-        self._DisconnectRtControl = DisconnectRtControl
         self._TaskComplianceCtrl = TaskComplianceCtrl
         self._ReleaseComplianceCtrl = ReleaseComplianceCtrl
-        self._SpeedlRtStream = SpeedlRtStream
+        self._SpeedlStream = SpeedlStream
 
         prefix = f"/{node.get_parameter('robot_id').value}"
         group = node.hardware_callback_group
@@ -71,24 +63,14 @@ class DoosanDriver:
         self._cli_get_current_posx = node.create_client(
             GetCurrentPosx, f'{prefix}/aux_control/get_current_posx',
             callback_group=group)
-        self._cli_connect_rt = node.create_client(
-            ConnectRtControl, f'{prefix}/realtime/connect_rt_control',
-            callback_group=group)
-        self._cli_start_rt = node.create_client(
-            StartRtControl, f'{prefix}/realtime/start_rt_control', callback_group=group)
-        self._cli_stop_rt = node.create_client(
-            StopRtControl, f'{prefix}/realtime/stop_rt_control', callback_group=group)
-        self._cli_disconnect_rt = node.create_client(
-            DisconnectRtControl, f'{prefix}/realtime/disconnect_rt_control',
-            callback_group=group)
         self._cli_task_compliance = node.create_client(
             TaskComplianceCtrl, f'{prefix}/force/task_compliance_ctrl',
             callback_group=group)
         self._cli_release_compliance = node.create_client(
             ReleaseComplianceCtrl, f'{prefix}/force/release_compliance_ctrl',
             callback_group=group)
-        self._pub_speedl_rt = node.create_publisher(
-            SpeedlRtStream, f'{prefix}/speedl_rt_stream', 10)
+        self._pub_speedl = node.create_publisher(
+            SpeedlStream, f'{prefix}/speedl_stream', 10)
 
     @staticmethod
     def _response_success(response) -> bool:
@@ -213,56 +195,19 @@ class DoosanDriver:
         response = self._wait_for_future(self._cli_set_robot_control.call_async(request), 2.0)
         return self._response_success(response)
 
-    def open_rt_session(self) -> bool:
-        if self._cli_connect_rt.wait_for_service(timeout_sec=1.0):
-            request = self._ConnectRtControl.Request()
-            request.ip_address = self._node.get_parameter('servo_pick.rt_ip').value
-            request.port = int(self._node.get_parameter('servo_pick.rt_port').value)
-            response = self._wait_for_future(
-                self._cli_connect_rt.call_async(request), 3.0)
-            if not self._response_success(response):
-                self._node.get_logger().warn(
-                    'connect_rt_control 실패: 기존 드라이버 연결 여부를 확인하세요.')
-        else:
-            self._node.get_logger().warn('connect_rt_control 서비스 없음')
-
-        if not self._cli_start_rt.wait_for_service(timeout_sec=1.0):
-            raise RuntimeError('start_rt_control 서비스 연결 실패')
-        response = self._wait_for_future(
-            self._cli_start_rt.call_async(self._StartRtControl.Request()), 3.0)
-        if not self._response_success(response):
-            raise RuntimeError('start_rt_control 실패')
-        return True
-
-    def close_rt_session(self) -> bool:
-        stop_ok = False
-        if self._cli_stop_rt.wait_for_service(timeout_sec=1.0):
-            response = self._wait_for_future(
-                self._cli_stop_rt.call_async(self._StopRtControl.Request()), 3.0)
-            stop_ok = self._response_success(response)
-        else:
-            self._node.get_logger().error('stop_rt_control 서비스 연결 실패')
-
-        disconnect_ok = False
-        if self._cli_disconnect_rt.wait_for_service(timeout_sec=1.0):
-            response = self._wait_for_future(
-                self._cli_disconnect_rt.call_async(
-                    self._DisconnectRtControl.Request()), 3.0)
-            disconnect_ok = self._response_success(response)
-        else:
-            self._node.get_logger().error('disconnect_rt_control 서비스 연결 실패')
-        return stop_ok and disconnect_ok
-
-    def publish_speedl_rt(self, command):
+    def publish_speedl(self, command, *, accel_param_prefix, period_param_name):
         # 실제 단위가 확인될 때까지 hardware_ready 게이트로 발행을 막는다.
-        message = self._SpeedlRtStream()
+        # accel_param_prefix/period_param_name으로 호출자(servo_pick 또는
+        # handover_approach)에 맞는 자신의 파라미터를 쓴다 - 예전에는 항상
+        # servo_pick 것만 썼던 교차배선을 여기서 바로잡는다.
+        message = self._SpeedlStream()
         message.vel = [
             command.vx, command.vy, command.vz, 0.0, 0.0, command.yaw_rate]
-        message.acc = list(
-            self._node.get_parameter('servo_pick.speedl_acc').value)
-        message.time = self._node.get_parameter(
-            'servo_pick.rt_control_period_s').value
-        self._pub_speedl_rt.publish(message)
+        message.acc = [
+            self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_trans_mm_s2').value,
+            self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_rot_deg_s2').value]
+        message.time = self._node.get_parameter(period_param_name).value
+        self._pub_speedl.publish(message)
 
     def enable_compliance(self):
         if not self._cli_task_compliance.wait_for_service(timeout_sec=1.0):
