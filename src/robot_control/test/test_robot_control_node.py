@@ -712,121 +712,6 @@ def test_on_tool_track_during_servo_forwards_raw_message_to_servo_loop(node):
     assert received == [msg]
 
 
-# ---- 작업자 손 위치 -> TCP 오차 계산 (_compute_hand_pose_tcp_offset) ----
-
-def _hand_pose_msg(frame_id='base_link', x=1.5, y=0.2, z=0.4):
-    msg = PoseStamped()
-    msg.header.frame_id = frame_id
-    msg.pose.position.x = x
-    msg.pose.position.y = y
-    msg.pose.position.z = z
-    msg.pose.orientation.w = 1.0
-    return msg
-
-
-def test_compute_hand_pose_tcp_offset_computes_hand_minus_tcp(node):
-    node._get_current_tcp_posx = lambda: [500.0, 200.0, 400.0, 0.0, 90.0, 0.0]  # mm
-
-    offset = node._compute_hand_pose_tcp_offset(_hand_pose_msg(x=1.5, y=0.2, z=0.4))
-
-    assert offset is not None
-    assert offset.pose.position.x == pytest.approx(1.0)
-    assert offset.pose.position.y == pytest.approx(0.0)
-    assert offset.pose.position.z == pytest.approx(0.0)
-
-
-def test_compute_hand_pose_tcp_offset_rejects_wrong_frame_id(node):
-    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
-    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg(frame_id='camera_link')) is None
-
-
-@pytest.mark.parametrize('x,y,z', [
-    (float('nan'), 0.2, 0.4),
-    (1.5, float('inf'), 0.4),
-    (1.5, 0.2, float('-inf')),
-])
-def test_compute_hand_pose_tcp_offset_rejects_nan_inf_position(node, x, y, z):
-    node._get_current_tcp_posx = lambda: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-
-    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg(x=x, y=y, z=z)) is None
-
-
-def test_compute_hand_pose_tcp_offset_returns_none_when_tcp_lookup_fails(node):
-    node._get_current_tcp_posx = lambda: None
-
-    assert node._compute_hand_pose_tcp_offset(_hand_pose_msg()) is None
-
-
-def test_on_hand_pose_during_approach_ignores_message_when_offset_computation_fails(node):
-    node._compute_hand_pose_tcp_offset = lambda msg: None
-    received = []
-    node.hand_approach_servo.on_hand_pose = lambda msg: received.append(msg)
-
-    node._on_hand_pose_during_approach(_hand_pose_msg())
-
-    assert received == []
-
-
-def test_on_hand_pose_during_approach_forwards_computed_offset(node):
-    computed = _hand_pose_msg()
-    node._compute_hand_pose_tcp_offset = lambda msg: computed
-    received = []
-    node.hand_approach_servo.on_hand_pose = lambda msg: received.append(msg)
-
-    node._on_hand_pose_during_approach(_hand_pose_msg())
-
-    assert received == [computed]
-
-
-# ---- handover_approach RT 발행 직전 마지막 안전 검사 ----
-
-def test_validate_handover_approach_command_rejects_nan_inf(node):
-    assert node._validate_handover_approach_command(ServoCommand(vx=float('nan'))) is False
-
-
-def test_validate_handover_approach_command_rejects_over_v_max(node):
-    node.set_parameters([Parameter('handover_approach.v_max', value=0.1)])
-
-    assert node._validate_handover_approach_command(ServoCommand(vx=0.5)) is False
-
-
-def test_validate_handover_approach_command_accepts_within_limits(node):
-    node.set_parameters([Parameter('handover_approach.v_max', value=0.2)])
-
-    assert node._validate_handover_approach_command(ServoCommand(vx=0.1, vy=-0.1, vz=0.05)) is True
-
-
-# ---- handover_approach tick ----
-
-def test_handover_approach_tick_continue(node):
-    node.hand_approach_servo.should_abort = lambda: None
-    node.hand_approach_servo.should_stop = lambda: False
-
-    status, reason = node._handover_approach_tick()
-
-    assert status == 'CONTINUE'
-    assert reason is None
-
-
-def test_handover_approach_tick_stop(node):
-    node.hand_approach_servo.should_abort = lambda: None
-    node.hand_approach_servo.should_stop = lambda: True
-
-    status, reason = node._handover_approach_tick()
-
-    assert status == 'STOP'
-
-
-def test_handover_approach_tick_abort(node):
-    node.hand_approach_servo.should_abort = lambda: 'diverged'
-
-    status, reason = node._handover_approach_tick()
-
-    assert status == 'ABORT'
-    assert reason == 'diverged'
-
-
 # ---- handover_approach goal 거부 (hardware_ready 게이트) ----
 
 def test_goal_callback_rejects_handover_approach_when_hardware_ready_false(node):
@@ -857,66 +742,6 @@ def test_execute_handover_approach_rejected_when_hardware_ready_false(node):
     assert result.success is False
 
 
-def test_execute_handover_approach_success_stops_without_gripper_action(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    ticks = iter(['CONTINUE', 'CONTINUE', 'STOP'])
-    node._handover_approach_tick = lambda: (next(ticks), None)
-    node.hand_approach_servo.step = lambda: ServoCommand()
-    node.hand_approach_servo.get_state = lambda: 'tracking'
-    node.hand_approach_servo.start = lambda: None
-
-    rg2_calls = []
-    node.rg2_client.open = lambda goal_handle=None: rg2_calls.append('open') or True
-    node.rg2_client.close = lambda width, force, goal_handle=None: rg2_calls.append('close') or True
-
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
-    assert rg2_calls == []  # 그리퍼 동작은 전혀 하지 않는다
-    assert len(gh.feedback_msgs) == 3
-
-
-def test_execute_handover_approach_aborts_on_abort_reason(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node._handover_approach_tick = lambda: ('ABORT', 'lost')
-    node.hand_approach_servo.get_state = lambda: 'tracking'
-    node.hand_approach_servo.start = lambda: None
-
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.aborted is True
-    assert result.success is False
-    assert result.message == 'lost'
-
-
-def test_execute_handover_approach_cancel_mid_loop_calls_canceled(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node._handover_approach_tick = lambda: ('CONTINUE', None)
-    node.hand_approach_servo.step = lambda: ServoCommand()
-    node.hand_approach_servo.get_state = lambda: 'tracking'
-    node.hand_approach_servo.start = lambda: None
-
-    gh = FakeGoalHandle(_goal('handover_approach'))
-    gh.is_cancel_requested = True
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.was_canceled is True
-    assert gh.aborted is False
-    assert result.success is False
-
-
 def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
     node.safety_state = SafetyState.FAULT
     gh = FakeGoalHandle(_goal('handover_approach'))
@@ -927,27 +752,14 @@ def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
     assert result.success is False
 
 
-def test_execute_handover_approach_sets_and_clears_tcp_tracking_active(node, monkeypatch):
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    observed = {'active': None}
-
-    def fake_tick():
-        observed['active'] = node._tcp_tracking_active
-        return ('STOP', None)
-
-    node._handover_approach_tick = fake_tick
-    node.hand_approach_servo.get_state = lambda: 'arrived'
-    node.hand_approach_servo.start = lambda: None
-
+def test_execute_handover_approach_returns_not_implemented_when_gates_pass(node):
     gh = FakeGoalHandle(_goal('handover_approach'))
 
-    assert node._tcp_tracking_active is False
-    node._execute_handover_approach(gh)
+    result = node._execute_handover_approach(gh)
 
-    assert observed['active'] is True
-    assert node._tcp_tracking_active is False
+    assert gh.aborted is True
+    assert result.success is False
+    assert result.message == 'handover_approach not yet implemented'
 
 
 # ---- SpeedlStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----
@@ -2391,35 +2203,6 @@ def test_hardware_disabled_rg2_client_never_touches_modbus(node):
 
     assert node.rg2_client._client is None
 
-
-def test_handover_approach_publishes_speedl_with_own_param_prefix(node, monkeypatch):
-    """servo_pick과의 교차배선 버그 수정 검증: handover_approach 실행 시
-    publish_speedl에 accel_param_prefix='handover_approach'/
-    period_param_name='handover_approach.control_period_s'가 전달되는지 확인한다
-    (예전에는 servo_pick의 파라미터를 항상 썼던 교차배선이 있었다)."""
-    import time as time_module
-    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
-
-    node.hardware_enabled = True
-    node.set_parameters([Parameter('handover_approach.hardware_ready', value=True)])
-    fake = _FakeDoosanDriver()
-    node._doosan = fake
-    ticks = iter(['CONTINUE', 'STOP'])
-    node._handover_approach_tick = lambda: (next(ticks), None)
-    node.hand_approach_servo.step = lambda: ServoCommand(vx=0.1)
-    node.hand_approach_servo.start = lambda: None
-    node.hand_approach_servo.get_state = lambda: 'tracking'
-
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert result.success is True
-    assert len(fake.publish_calls) == 1
-    assert fake.publish_kwargs[0] == {
-        'accel_param_prefix': 'handover_approach',
-        'period_param_name': 'handover_approach.control_period_s',
-    }
 
 
 # ---- SpeedlWatchdog 통합 (명령이 끊기면 자동으로 vel=0 발행) ----
