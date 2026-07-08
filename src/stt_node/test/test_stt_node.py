@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 import rclpy
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 from stt_node.stt_node import SttNode
 
@@ -94,6 +94,8 @@ def test_detect_wake_word_delegates_to_wakeup_word(node):
     calls = []
 
     class _FakeWakeupWord:
+        last_level = 0.0
+
         def is_wakeup(self, stream):
             calls.append(stream)
             return True
@@ -103,6 +105,24 @@ def test_detect_wake_word_delegates_to_wakeup_word(node):
 
     assert node._detect_wake_word() is True
     assert calls == [node._mic.stream]
+
+
+def test_detect_wake_word_publishes_mic_level(node):
+    class _FakeWakeupWord:
+        last_level = 0.42
+
+        def is_wakeup(self, stream):
+            return False
+
+    node._wakeup_word = _FakeWakeupWord()
+    node._mic.stream = object()
+    received = []
+    node.create_subscription(Float32, '/stt/mic_level', lambda m: received.append(m.data), 10)
+
+    node._detect_wake_word()
+    rclpy.spin_once(node, timeout_sec=1.0)
+
+    assert received == pytest.approx([0.42])
 
 
 # ---- _record_command_audio (sounddevice -> WAV bytes, 무음 필터링) ----
