@@ -2,6 +2,7 @@ import os
 import threading
 
 import rclpy
+from geometry_msgs.msg import TransformStamped
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -9,6 +10,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
 from handover_interfaces.action import RobotTask
 from handover_interfaces.msg import GripperState
@@ -157,6 +159,15 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('safety.debug_log_tool_force', False)
         self.declare_parameter('gripper_poll_period_s', 0.5)
 
+        # base_link -> flange TF를 계속 방송한다 - vision_node/tool_detection_node가
+        # "이미지가 찍힌 시각의 로봇 자세"를 tf2로 조회할 수 있게 하기 위함이다
+        # (로봇이 이동 중이어도 검출 시점의 좌표를 얻을 수 있음). flange 이후
+        # (flange -> camera_link 등)는 각 카메라 노드가 자신의 hand-eye 캘리브레이션으로
+        # 별도 방송/계산한다 - 여기서는 로봇 자세만 책임진다.
+        self.declare_parameter('tf_broadcast.period_s', 0.02)
+        self.declare_parameter('tf_broadcast.parent_frame_id', 'base_link')
+        self.declare_parameter('tf_broadcast.child_frame_id', 'flange')
+
         # DoosanDriver(doosan_driver.py)가 dsr_msgs2 서비스를 부를 때 쓰는 통신
         # 타임아웃/폴링 간격 - rg2.command_timeout_s 등과 같은 성격의 통신 타이밍
         # 상수였으나 한 곳에서 보이도록 ROS 파라미터로 승격했다.
@@ -209,10 +220,17 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('handover_approach.hardware_ready', False)
         # 사용자가 지정한 접근 정지 거리(5cm) - 실측 협의값.
         self.declare_parameter('handover_approach.stop_distance_m', 0.05)
+        # hand_pose 수신 대기 타임아웃 - movel 서비스 자체의 왕복 타임아웃(move.timeout_s)과는
+        # 별개로, "메시지가 아예 안 온다"를 감지하기 위한 것이다.
         self.declare_parameter('handover_approach.timeout_s', 10.0)
         # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
         # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
         self.declare_parameter('handover_approach.hand_pose_frame_id', 'base_link')
+        # movel 이동 속도 - 사람에게 접근하는 동작이라 실측 전까지 보수적으로 낮게 둔다
+        # (named pose 이동인 move.vel_deg_s=30deg/s보다 훨씬 느린 속도). hardware_ready가
+        # 기본 false로 게이트되어 있어 실측/검증 전에는 어차피 실제 명령이 나가지 않는다.
+        self.declare_parameter('handover_approach.vel_mm_s', 30.0)
+        self.declare_parameter('handover_approach.acc_mm_s2', 100.0)
 
         self.hardware_enabled = bool(self.get_parameter('hardware_enabled').value)
         self.safety_monitor = SafetyMonitor(self)
@@ -257,6 +275,7 @@ class RobotControlNode(Node, TaskExecutor):
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.
         self.pub_gripper_state = self.create_publisher(GripperState, '/gripper/state', 10)
         self.pub_fault = self.create_publisher(String, '/robot/fault', 10)
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self._init_doosan_driver()
 
@@ -284,6 +303,9 @@ class RobotControlNode(Node, TaskExecutor):
         # 서비스 호출을 하지 않기 위함).
         self._tcp_pose_cache = None
         self._tcp_pose_request_in_flight = False
+        # handover_approach가 /vision/hand_pose 1개를 받을 때까지 임시로 채워두는
+        # 슬롯 (_on_hand_pose_received/_wait_for_hand_pose 참고).
+        self._pending_hand_pose = None
         # servo_pick 또는 handover_approach가 실제로 실행 중일 때만 TCP 위치를
         # 갱신한다 - 불필요한 조회로 executor 스레드를 낭비하거나 안전상태 polling을
         # 지연시키지 않기 위함이다.
@@ -291,6 +313,9 @@ class RobotControlNode(Node, TaskExecutor):
         self._gripper_timer = self.create_timer(
             self.get_parameter('gripper_poll_period_s').value,
             self._on_gripper_timer, callback_group=self.sensor_callback_group)
+        self._tf_broadcast_timer = self.create_timer(
+            self.get_parameter('tf_broadcast.period_s').value,
+            self._on_tf_broadcast_timer, callback_group=self.sensor_callback_group)
         self._state_poll_timer = self.create_timer(
             self.get_parameter('safety.state_poll_period_s').value,
             self._on_state_poll_timer, callback_group=self.sensor_callback_group)
@@ -466,6 +491,34 @@ class RobotControlNode(Node, TaskExecutor):
         msg.width_mm = width_mm
         msg.grip_detected = grip_detected
         self.pub_gripper_state.publish(msg)
+
+    def _on_tf_broadcast_timer(self):
+        """base_link -> flange TF를 방송한다. 로봇이 이동 중에도 vision_node/
+        tool_detection_node가 "이미지가 찍힌 시각"의 로봇 자세를 tf2로 조회할 수
+        있게 하기 위함이다(그 뒤 flange -> camera_link는 각 카메라 노드의
+        hand-eye 캘리브레이션이 별도로 책임진다). dry-run(hardware_enabled=false)
+        에서는 실제 자세가 없으므로 방송하지 않는다."""
+        if not self.hardware_enabled or self._doosan is None:
+            return
+        pos6 = self._doosan.get_current_posx(ref=0)
+        if pos6 is None:
+            return
+        from scipy.spatial.transform import Rotation  # dry-run에서는 필요 없는 지연 임포트
+        x_mm, y_mm, z_mm, a_deg, b_deg, c_deg = pos6
+        quat = Rotation.from_euler('ZYZ', [a_deg, b_deg, c_deg], degrees=True).as_quat()
+
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.get_parameter('tf_broadcast.parent_frame_id').value
+        msg.child_frame_id = self.get_parameter('tf_broadcast.child_frame_id').value
+        msg.transform.translation.x = x_mm / 1000.0
+        msg.transform.translation.y = y_mm / 1000.0
+        msg.transform.translation.z = z_mm / 1000.0
+        msg.transform.rotation.x = float(quat[0])
+        msg.transform.rotation.y = float(quat[1])
+        msg.transform.rotation.z = float(quat[2])
+        msg.transform.rotation.w = float(quat[3])
+        self._tf_broadcaster.sendTransform(msg)
 
     # ---- /robot/recover ----
 

@@ -141,11 +141,9 @@ class TaskFlow:
         self._send_robot_goal('move_named', named_target=named_target)
 
     def _handle_fetch_tool(self, tool):
-        allow_manual_fetch = bool(self.get_parameter('test_mode.allow_manual_fetch').value)
-        is_allowed_manual = allow_manual_fetch and self.operation_mode == Mode.MANUAL
-        if self.operation_mode != Mode.AUTO and not is_allowed_manual:
-            self._publish_status(detail='공구 전달 명령은 AUTO 모드에서만 지원됩니다.')
-            return
+        # AUTO/MANUAL 모드 구분 없이 공구 이름이 인식되면(음성/GUI 텍스트 동일 경로)
+        # 전체 자동 픽업+전달 시퀀스를 시작한다 - MANUAL은 개별 이동 명령을 추가로
+        # 더 허용할 뿐, fetch_tool 자체를 막지 않는다.
         if not bool(self.get_parameter('auto.config_ready').value):
             # AUTO 모드 전환 자체는 허용하되, 실기에서 미합의 trigger/grasp spec
             # 값으로 추측 동작하지 않도록 실제 goal 송신은 막는다.
@@ -379,8 +377,9 @@ class TaskFlow:
     def _handle_move_safe_result(self, result):
         if result.success:
             # handover_safe 도착 - 작업대가 보이는 자세에서 YOLO로 손을 찾아 접근한다
-            # (robot_control의 handover_approach - movel 기반 단발성 이동으로
-            # 구현 예정, 2026-07-07 기준 TODO 스텁).
+            # (robot_control의 handover_approach - movel 기반 단발성 이동으로 구현됨,
+            # /vision/hand_pose 1회 수신 후 이동. vision_node의 손 추적이 아직
+            # hand_pose를 채워 보내지 않으면 handover_approach.timeout_s로 실패한다).
             self._set_state(State.APPROACH_HAND, detail='작업자를 찾는 중')
             self._start_after_vision_mode(
                 SetVisionMode.Request.TRACK_HAND,

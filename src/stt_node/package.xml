@@ -3,7 +3,7 @@
 <package format="3">
   <name>stt_node</name>
   <version>0.0.1</version>
-  <description>마이크 VAD + 로컬 Whisper -> /user_command/text</description>
+  <description>마이크 웨이크워드 감지(openwakeword) + OpenAI STT -> /user_command/text</description>
   <maintainer email="hwangjeongui01@gmail.com">hwangjeongui</maintainer>
   <license>MIT</license>
 

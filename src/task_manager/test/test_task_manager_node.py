@@ -1198,16 +1198,15 @@ def test_fetch_tool_ignored_in_manual_mode(node):
     assert node.current_tool is None
 
 
-def test_fetch_tool_requires_auto_mode_switch_first(node):
+def test_fetch_tool_works_in_manual_mode_without_switching_to_auto(node):
+    # fetch_tool은 AUTO/MANUAL 모드 구분 없이 동작한다 - config_ready만 갖춰지면
+    # 굳이 자동 모드로 전환하지 않아도 타이핑/음성 명령만으로 전체 시퀀스가 시작된다.
     node.set_parameters([Parameter('auto.config_ready', value=True)])
+    assert node.operation_mode == Mode.MANUAL  # 기본값 그대로
+    node._set_vision_mode = lambda mode, tool_class='': None
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
 
-    node._on_user_command(String(data='스패너 갖다줘'))
-    assert sent == []
-
-    node._on_user_command(String(data='자동 모드로 전환해줘'))
-    node._set_vision_mode = lambda mode, tool_class='': None
     node._on_user_command(String(data='스패너 갖다줘'))
 
     assert node.state == State.MOVE_TO_WATCH
@@ -1452,7 +1451,7 @@ def test_check_trigger_rejects_different_tool(node):
     _configure_trigger_params(node)
     node.current_tool = 'spanner'
 
-    assert node._check_trigger(_fresh_tool_track(node, tool_class='driver')) is False
+    assert node._check_trigger(_fresh_tool_track(node, tool_class='screw_driver')) is False
 
 
 def test_check_trigger_rejects_no_current_tool(node):
@@ -1856,26 +1855,11 @@ def test_home_result_failure_sets_fault(node):
     assert node.safety_state == Safety.FAULT
 
 
-# ---- test_mode.allow_manual_fetch ----
+# ---- fetch_tool은 MANUAL 모드에서도 동작 ----
 
-def test_fetch_tool_rejected_in_manual_mode_by_default(node):
+def test_fetch_tool_allowed_in_manual_mode(node):
     node.operation_mode = Mode.MANUAL
     node.set_parameters([Parameter('auto.config_ready', value=True)])
-    sent = []
-    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
-
-    node._handle_fetch_tool('spanner')
-
-    assert sent == []
-    assert node.state == State.IDLE
-
-
-def test_fetch_tool_allowed_in_manual_mode_when_flag_enabled(node):
-    node.operation_mode = Mode.MANUAL
-    node.set_parameters([
-        Parameter('auto.config_ready', value=True),
-        Parameter('test_mode.allow_manual_fetch', value=True),
-    ])
     node._start_after_vision_mode = lambda mode, tool_class, expected_state, on_success: on_success()
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))

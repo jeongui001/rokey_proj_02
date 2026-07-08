@@ -1,0 +1,10 @@
+path: datasets
+train: train/images
+val: valid/images
+test: test/images
+nc: 4
+names:
+- bottle
+- hammer
+- screwdriver
+- wrench

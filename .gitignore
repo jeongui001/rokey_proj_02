@@ -12,4 +12,5 @@ __pycache__/
 
 docs/superpowers/
 
+# OpenAI API 키 등 비밀값 - 커밋 금지
 .env
