@@ -21,15 +21,18 @@ def generate_launch_description():
             'camera_namespace': '',
         }.items()
     )
-    # hand-eye 캘리브레이션 결과(T_gripper2camera.npy, flange -> camera_link)를
-    # m 단위 평행이동 + 쿼터니언으로 변환해 반영 (src/vision_node/resource/T_gripper2camera.npy 참고)
+    # hand-eye 캘리브레이션 결과(T_gripper2camera.npy, link_6 -> camera_link)를
+    # m 단위 평행이동 + 쿼터니언으로 변환해 반영 (src/vision_node/resource/T_gripper2camera.npy 참고).
+    # 2026-07-08 실기 검증 중 발견: dsr_description2(m0609) URDF에 "flange" 프레임이
+    # 없어(joint_6/link_6에서 체인이 끝남) robot_control의 base_link->link_6 방송과
+    # 안 이어졌었다("TF has two or more unconnected trees") - link_6으로 정정.
     static_tf = Node(
         package='tf2_ros',
         executable='static_transform_publisher',
         arguments=[
             '--x', '0.032594', '--y', '0.065706', '--z', '-0.203569',
             '--qx', '0.000794', '--qy', '0.011346', '--qz', '0.999927', '--qw', '0.004194',
-            '--frame-id', 'flange', '--child-frame-id', 'camera_link',
+            '--frame-id', 'link_6', '--child-frame-id', 'camera_link',
         ],
     )
     vision_node = Node(

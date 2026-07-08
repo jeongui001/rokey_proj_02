@@ -288,11 +288,14 @@ class TaskExecutor:
     def _get_current_tcp_posx(self):
         """캐시된 최신 TCP 위치를 [x,y,z,rx,ry,rz](mm/deg)로 반환한다.
 
-        실제 GetCurrentPosx 서비스 호출은 이 함수가 아니라 rate-limited된
-        _on_tcp_pose_refresh_timer가 별도로 수행하고 결과를 self._tcp_pose_cache에
-        저장한다 - ToolTrack 콜백(60Hz일 수 있음)마다 동기 서비스 호출을 하면 여러
-        요청이 겹쳐 executor 스레드를 점유해 안전상태/E-Stop polling이 늦어질 수
-        있기 때문이다. 이 함수는 캐시만 읽으므로 절대 블로킹하지 않는다.
+        실제 GetCurrentPosx 서비스 호출은 이 함수가 아니라 robot_control_node의
+        _on_tf_broadcast_timer가 TF 방송과 함께 수행하고 결과를 self._tcp_pose_cache에
+        저장한다(_tcp_tracking_active일 때만) - ToolTrack 콜백(60Hz일 수 있음)마다
+        동기 서비스 호출을 하면 여러 요청이 겹쳐 executor 스레드를 점유해 안전상태/
+        E-Stop polling이 늦어질 수 있기 때문이다. 이 함수는 캐시만 읽으므로 절대
+        블로킹하지 않는다. (2026-07-08: 이전에는 별도 _on_tcp_pose_refresh_timer가
+        독립적으로 GetCurrentPosx를 폴링했으나, TF 방송 폴링과 같은 서비스를 이중
+        호출해 스레드 고갈을 유발해 하나로 합쳤다.)
 
         hardware_enabled=false에서는 캐시가 애초에 채워지지 않으므로 항상 None을
         반환한다. 캐시가 없거나 servo_pick.tcp_pose_max_age_s보다 오래됐으면(=조회
@@ -308,36 +311,6 @@ class TaskExecutor:
         if age_s > max_age_s:
             return None
         return cache['pos6']
-
-    def _on_tcp_pose_refresh_timer(self):
-        """TCP 위치 캐시를 rate-limited하게 갱신한다(GetCurrentPosx 호출 과부하 방지).
-
-        - 한 번에 하나의 요청만 허용한다(_tcp_pose_request_in_flight로 직렬화).
-        - servo_pick이 실제로 실행 중일 때만 갱신한다(불필요한 조회를 피한다).
-          handover_approach는 movel 기반 단발성 이동이라 이 캐시를 쓰지 않고
-          _execute_handover_approach에서 get_current_posx를 직접 동기 호출한다.
-        - safety_state가 NORMAL이 아니거나 rclpy가 종료 중이면 새 조회를 시작하지 않는다.
-        - 조회 실패 시 기존 캐시를 덮어쓰지 않는다 - 캐시의 나이가 계속 늘어나
-          _get_current_tcp_posx()의 신선도 검사가 자연히 오래된 값을 거부하게 한다
-          (실패했다고 이전 값을 성공한 것처럼 재사용하지 않는다).
-        """
-        if not rclpy.ok():
-            return
-        if not self.hardware_enabled or self._doosan is None:
-            return
-        if self.safety_state != SafetyState.NORMAL:
-            return
-        if not self._tcp_tracking_active:
-            return
-        if self._tcp_pose_request_in_flight:
-            return  # 이미 진행 중인 요청이 있음 - 겹쳐서 새로 호출하지 않는다
-        self._tcp_pose_request_in_flight = True
-        try:
-            pos6 = self._doosan.get_current_posx(ref=0)  # DR_BASE
-            if pos6 is not None:
-                self._tcp_pose_cache = {'pos6': pos6, 'received_at': time.monotonic()}
-        finally:
-            self._tcp_pose_request_in_flight = False
 
     def _validate_tool_track_message(self, message) -> bool:
         """servo_loop(칼만 ServoLoop)는 msg.pose.position을 base_link 기준 절대

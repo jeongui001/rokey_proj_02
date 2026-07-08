@@ -16,6 +16,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from handover_interfaces.msg import Detection2D, DetectionArray
@@ -63,9 +64,10 @@ class ToolDetectionNode(Node):
         self._bridge = CvBridge()
         self.pub_detections = self.create_publisher(DetectionArray, '/detection/tool_boxes', 10)
         # 퍼블리셔: realsense2_camera(기성 패키지). vision_node와 동일 토픽을 구독해
-        # 같은 프레임을 본다.
+        # 같은 프레임을 본다. 카메라 드라이버는 BEST_EFFORT(qos_profile_sensor_data)를 쓰도록
+        # 권장되므로 기본 QoS(RELIABLE) 대신 명시적으로 맞춰 드라이버 QoS 변경에 조용히 깨지지 않게 한다.
         self.sub_color = self.create_subscription(
-            Image, '/camera/color/image_raw', self._on_color, 10)
+            Image, '/camera/color/image_raw', self._on_color, qos_profile_sensor_data)
 
     def _on_color(self, msg):
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')

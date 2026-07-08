@@ -223,3 +223,56 @@ def test_track_tool_orientation_identity_when_axis_unavailable(node):
     assert track.depth_valid is False
     assert track.pose.orientation.w == pytest.approx(1.0)
     assert track.pose.orientation.z == pytest.approx(0.0)
+
+
+def test_track_tool_publishes_debug_image_with_bbox_and_axis_overlay(node):
+    """전체 계획.md 4.6절 계약: bbox+축 오버레이를 /vision/debug_image/compressed로
+    발행해야 한다 - operator_gui/rqt_image_view 모니터링용(기존엔 미구현이었음)."""
+    import numpy as np
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+
+    fake_depth = np.full((480, 424), 310, dtype=np.uint16)  # 벨트 0.31m
+    fake_depth[100:120, 100:240] = 300                      # 막대 0.30m, 140x20
+
+    def fake_imgmsg_to_cv2(msg, desired_encoding=None):
+        if desired_encoding == 'bgr8':
+            return np.zeros((480, 424, 3), dtype=np.uint8)
+        return fake_depth
+
+    node._bridge.imgmsg_to_cv2 = fake_imgmsg_to_cv2
+
+    detection = Detection2D()
+    detection.class_name = 'spanner'
+    detection.score = 0.9
+    detection.x1, detection.y1, detection.x2, detection.y2 = 90, 90, 250, 130
+    detection_msg = _make_detection_msg([detection])
+
+    published = []
+    node.pub_debug_image.publish = published.append
+
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg,
+        FakeTransform(), 'spanner')
+
+    assert track is not None
+    assert len(published) == 1
+    assert published[0].format == 'jpeg'
+    assert len(published[0].data) > 0
+
+
+def test_track_tool_debug_image_off_when_disabled(node):
+    """vision.publish_debug_image=False면 인코딩 비용 없이 발행을 건너뛴다."""
+    node.publish_debug_image = False
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: __import__('numpy').zeros(
+        (480, 424), dtype='uint16')
+
+    detection_msg = _make_detection_msg([])
+    published = []
+    node.pub_debug_image.publish = published.append
+
+    node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg,
+        FakeTransform(), 'spanner')
+
+    assert published == []
