@@ -4,6 +4,7 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import Buffer, TransformListener, TransformException
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
@@ -80,10 +81,17 @@ class VisionNode(Node):
 
         # color/depth/camera_info/검출결과 4개를 같은 시각 근처끼리 묶어서 하나의 콜백으로 받는다.
         # 이래야 "이 bbox가 어느 depth 프레임의 것인지"가 어긋나지 않는다.
-        self.sub_color = message_filters.Subscriber(self, Image, '/camera/color/image_raw')  # 퍼블리셔: realsense2_camera(기성 패키지)
+        # realsense2_camera는 이미지/camera_info를 BEST_EFFORT(sensor data) QoS로 퍼블리시한다.
+        # qos_profile을 안 주면 message_filters.Subscriber가 기본값(RELIABLE)을 써서 DDS가
+        # 아예 연결을 안 맺어 콜백이 영원히 안 불린다 - 반드시 맞춰줘야 한다.
+        self.sub_color = message_filters.Subscriber(
+            self, Image, '/camera/color/image_raw', qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_depth = message_filters.Subscriber(
-            self, Image, '/camera/aligned_depth_to_color/image_raw')  # 퍼블리셔: realsense2_camera(기성 패키지)
-        self.sub_info = message_filters.Subscriber(self, CameraInfo, '/camera/color/camera_info')  # 퍼블리셔: realsense2_camera(기성 패키지)
+            self, Image, '/camera/aligned_depth_to_color/image_raw',
+            qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
+        self.sub_info = message_filters.Subscriber(
+            self, CameraInfo, '/camera/color/camera_info',
+            qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_detections = message_filters.Subscriber(
             self, DetectionArray, '/detection/tool_boxes')  # 퍼블리셔: object_detection(팀원3)
         self._sync = message_filters.ApproximateTimeSynchronizer(
@@ -113,6 +121,11 @@ class VisionNode(Node):
     def _on_synced_images(self, color_msg, depth_msg, info_msg, detection_msg):
         """4개 토픽이 시간적으로 맞춰졌을 때마다(30~60Hz 목표) 호출되는 메인 루프.
         모드에 따라 _track_tool 또는 _track_hand로 위임하고, 결과가 있으면 퍼블리시."""
+        # DEBUG(파이프라인 점검용, 나중에 제거): 동기화 콜백 자체가 도는지 확인
+        self.get_logger().info(
+            f'DEBUG sync callback fired, mode={self.mode}, tool_class={self.tool_class!r}, '
+            f'n_detections={len(detection_msg.detections)}',
+            throttle_duration_sec=1.0)
         try:
             # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
             tf_at_stamp = self.tf_buffer.lookup_transform(
@@ -175,6 +188,12 @@ class VisionNode(Node):
 
         stamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
         result = self.tracker.update(detection_msg.detections, tool_class, reconstruct, stamp)
+        # DEBUG(파이프라인 점검용, 나중에 제거): tracker.update 결과 확인
+        self.get_logger().info(
+            f'DEBUG _track_tool: classes_in_frame='
+            f'{[d.class_name for d in detection_msg.detections]}, '
+            f'looking_for={tool_class!r}, result_is_none={result is None}',
+            throttle_duration_sec=1.0)
         if result is None:
             # 검출이 끊긴 프레임 - 축 이력도 지운다. 물체가 화면에서 사라졌다 다시
             # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다

@@ -13,18 +13,18 @@
 /**:
   ros__parameters:
     auto:
-      config_ready: false  # TODO: 실기 검증 완료 후 true로 전환
+      config_ready: true  # TEMP: 파이프라인 스모크테스트용 임시 활성화 - 실기 캘리브레이션 값 아님, 검증 끝나면 false로 되돌리고 재설정할 것
 
     # DETECT_TRACK 상태에서 ToolTrack 메시지를 servo_pick 트리거로 인정할지 판단하는
     # 조건들. min_confidence/max_track_age_s/required_frame_id는 vision_node 및 실기
     # 환경과 합의가 끝난 뒤 채워야 하는 값이라 -1/빈 문자열(미설정)로 두었다 - 이
     # 값들이 미설정인 동안 _check_trigger는 항상 False를 반환한다(안전 측 fail-closed).
     trigger:
-      min_confidence: -1.0        # TODO(vision_node와 캘리브레이션 필요, 범위 0.0~1.0)
+      min_confidence: 0.3         # TEMP(스모크테스트용 임시값, 범위 0.0~1.0) - 캘리브레이션 필요
       require_depth_valid: true   # 안전한 기본값 - depth 무효 트랙은 신뢰하지 않는다
       require_approaching: true   # 안전한 기본값 - 멀어지는 트랙은 트리거로 쓰지 않는다
-      required_frame_id: ''       # TODO(vision_node와 프레임 이름 합의 필요)
-      max_track_age_s: -1.0       # TODO(캘리브레이션 필요, 초 단위)
+      required_frame_id: 'base_link'  # vision_node.py가 ToolTrack publish 시 실제로 쓰는 frame_id
+      max_track_age_s: 1.0        # TEMP(스모크테스트용 임시값, 초 단위) - 캘리브레이션 필요
 
     # 공구별 grasp spec. width_mm/force_n은 servo_pick goal에 실제로 실어 보내는 값,
     # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위다.
@@ -38,13 +38,13 @@
       bottle:
         width_mm: 80.0
         force_n: 30.0
-        verify_min_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
-        verify_max_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
+        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       spanner:
         width_mm: 80.0
         force_n: 30.0
-        verify_min_width_mm: -1.0
-        verify_max_width_mm: -1.0
+        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       screw_driver:
         # width_mm은 "닫힐 때 목표 폭"이다(RG2Client.close 참고) - 물체(드라이버
         # 손잡이)보다 넓으면 물체에 닿기도 전에 목표 폭에서 멈춰 grip_detected=False가
@@ -52,23 +52,23 @@
         # 완전히 닫힘)으로 두어 force 한계에 걸려 멈추게 한다.
         width_mm: 5.0
         force_n: 25.0
-        verify_min_width_mm: -1.0
-        verify_max_width_mm: -1.0
+        verify_min_width_mm: 0.0     # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 15.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       wrench:
         width_mm: 80.0
         force_n: 30.0
-        verify_min_width_mm: -1.0
-        verify_max_width_mm: -1.0
+        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       pliers:
         width_mm: 80.0
         force_n: 30.0
-        verify_min_width_mm: -1.0
-        verify_max_width_mm: -1.0
+        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       hammer:
         width_mm: 80.0
         force_n: 30.0
-        verify_min_width_mm: -1.0
-        verify_max_width_mm: -1.0
+        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
+        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
 
     # 아래는 통신/타이밍 관련 값으로, 하드웨어 캘리브레이션 값이 아니다 - 실 환경에
     # 맞게 조정 가능하다.
