@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 
 import rclpy
 from geometry_msgs.msg import TransformStamped
@@ -159,14 +160,18 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('safety.debug_log_tool_force', False)
         self.declare_parameter('gripper_poll_period_s', 0.5)
 
-        # base_link -> flange TF를 계속 방송한다 - vision_node/tool_detection_node가
+        # base_link -> link_6 TF를 계속 방송한다 - vision_node/tool_detection_node가
         # "이미지가 찍힌 시각의 로봇 자세"를 tf2로 조회할 수 있게 하기 위함이다
-        # (로봇이 이동 중이어도 검출 시점의 좌표를 얻을 수 있음). flange 이후
-        # (flange -> camera_link 등)는 각 카메라 노드가 자신의 hand-eye 캘리브레이션으로
+        # (로봇이 이동 중이어도 검출 시점의 좌표를 얻을 수 있음). link_6 이후
+        # (link_6 -> camera_link 등)는 각 카메라 노드가 자신의 hand-eye 캘리브레이션으로
         # 별도 방송/계산한다 - 여기서는 로봇 자세만 책임진다.
+        # 2026-07-08 실기 검증 중 발견: dsr_description2(m0609) URDF는 "flange"라는
+        # 프레임을 정의하지 않는다(joint_6/link_6에서 체인이 끝남, xacro 확인) - 이
+        # 노드가 원래 발행하던 'flange' 자식 프레임이 실제 로봇 상태 발행과 안 이어져
+        # "TF has two or more unconnected trees" 오류가 났었다. 'link_6'으로 정정.
         self.declare_parameter('tf_broadcast.period_s', 0.02)
         self.declare_parameter('tf_broadcast.parent_frame_id', 'base_link')
-        self.declare_parameter('tf_broadcast.child_frame_id', 'flange')
+        self.declare_parameter('tf_broadcast.child_frame_id', 'link_6')
 
         # DoosanDriver(doosan_driver.py)가 dsr_msgs2 서비스를 부를 때 쓰는 통신
         # 타임아웃/폴링 간격 - rg2.command_timeout_s 등과 같은 성격의 통신 타이밍
@@ -201,12 +206,16 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo_pick.tool_track_frame_id', 'base_link')
         # TCP 위치 캐시 샘플의 나이(초)가 이 값보다 크면 오래됐다고 보고 사용하지
         # 않는다 (서비스 왕복 시간이 아니라 _tcp_pose_cache 샘플 자체의 나이를
-        # 뜻한다 - _on_tcp_pose_refresh_timer/_get_current_tcp_posx 참고). 하드웨어
+        # 뜻한다 - _on_tf_broadcast_timer/_get_current_tcp_posx 참고). 하드웨어
         # 캘리브레이션 값이 아니라 서보 제어 루프에 맞는 통신 타이밍 설정이다.
+        # 2026-07-08: 칼만 ServoLoop는 dt가 벌어질수록 예측 불확실성(Q)이 누적되고,
+        # 캐시가 이 값보다 오래 묵으면 매 tick 명령을 계산할 최신 TCP 위치 자체가
+        # 없어 서보가 아예 멈춘다. 이전에는 이 캐시를 tcp_pose_refresh_period_s(20Hz)로
+        # 별도 폴링했는데, tf_broadcast.period_s(50Hz) 폴링과 같은 GetCurrentPosx
+        # 서비스를 이중으로 때려 스레드 고갈 및 TF 정지를 유발했다(실기 확인) - 이제
+        # TF 방송용 폴링 결과에 캐시 갱신을 얹어 폴링 스트림을 하나로 합쳤다
+        # (_on_tf_broadcast_timer 참고, tcp_pose_refresh_period_s 파라미터는 제거됨).
         self.declare_parameter('servo_pick.tcp_pose_max_age_s', 0.2)
-        # TCP 위치 캐시를 갱신하는 주기 - ToolTrack 콜백마다 동기 호출하는 대신
-        # rate-limited하게 별도 타이머로 갱신한다 (GetCurrentPosx 과부하 방지).
-        self.declare_parameter('servo_pick.tcp_pose_refresh_period_s', 0.05)
 
         # handover_approach: handover_safe 도착 후 /vision/hand_pose(작업자 손 위치)를
         # 향해 접근하다 stop_distance_m 이내가 되면 멈춘다(그리퍼 동작 없음 - 이후
@@ -298,17 +307,21 @@ class RobotControlNode(Node, TaskExecutor):
             cancel_callback=self._cancel_callback,
             callback_group=self.action_callback_group)
 
-        # TCP 위치 캐시 - _on_tcp_pose_refresh_timer가 rate-limited하게 채우고,
-        # _get_current_tcp_posx()는 이 캐시만 읽는다 (ToolTrack 콜백에서 매번 동기
-        # 서비스 호출을 하지 않기 위함).
+        # TCP 위치 캐시 - _on_tf_broadcast_timer가 TF 방송용으로 조회한 GetCurrentPosx
+        # 결과를 함께 채운다(아래 타이머 설명 참고). _get_current_tcp_posx()는 이
+        # 캐시만 읽는다 (ToolTrack 콜백에서 매번 동기 서비스 호출을 하지 않기 위함).
         self._tcp_pose_cache = None
+        # _on_tf_broadcast_timer 전체(TF 방송 + TCP 캐시 갱신)를 감싸는 단일
+        # in-flight 가드 - 두 용도가 같은 GetCurrentPosx 서비스 호출 하나를
+        # 공유하므로 플래그도 하나만 있으면 된다(과거에는 두 타이머가 각자 별도
+        # 요청을 겹쳐 보내 스레드 고갈을 유발했다).
         self._tcp_pose_request_in_flight = False
         # handover_approach가 /vision/hand_pose 1개를 받을 때까지 임시로 채워두는
         # 슬롯 (_on_hand_pose_received/_wait_for_hand_pose 참고).
         self._pending_hand_pose = None
         # servo_pick 또는 handover_approach가 실제로 실행 중일 때만 TCP 위치를
-        # 갱신한다 - 불필요한 조회로 executor 스레드를 낭비하거나 안전상태 polling을
-        # 지연시키지 않기 위함이다.
+        # 캐시에 반영한다 - 불필요한 상태 갱신을 피하기 위함이다(TF 방송 자체는
+        # 이 값과 무관하게 항상 진행된다).
         self._tcp_tracking_active = False
         self._gripper_timer = self.create_timer(
             self.get_parameter('gripper_poll_period_s').value,
@@ -319,9 +332,6 @@ class RobotControlNode(Node, TaskExecutor):
         self._state_poll_timer = self.create_timer(
             self.get_parameter('safety.state_poll_period_s').value,
             self._on_state_poll_timer, callback_group=self.sensor_callback_group)
-        self._tcp_pose_timer = self.create_timer(
-            self.get_parameter('servo_pick.tcp_pose_refresh_period_s').value,
-            self._on_tcp_pose_refresh_timer, callback_group=self.sensor_callback_group)
 
         self.recover_srv = self.create_service(
             Trigger, '/robot/recover', self._on_recover, callback_group=self.sensor_callback_group)
@@ -493,16 +503,38 @@ class RobotControlNode(Node, TaskExecutor):
         self.pub_gripper_state.publish(msg)
 
     def _on_tf_broadcast_timer(self):
-        """base_link -> flange TF를 방송한다. 로봇이 이동 중에도 vision_node/
-        tool_detection_node가 "이미지가 찍힌 시각"의 로봇 자세를 tf2로 조회할 수
-        있게 하기 위함이다(그 뒤 flange -> camera_link는 각 카메라 노드의
-        hand-eye 캘리브레이션이 별도로 책임진다). dry-run(hardware_enabled=false)
-        에서는 실제 자세가 없으므로 방송하지 않는다."""
+        """base_link -> link_6(tf_broadcast.child_frame_id) TF를 방송하고, 같은
+        GetCurrentPosx 조회 결과로 servo_pick의 TCP 위치 캐시(_tcp_pose_cache)도
+        함께 채운다. TF는 로봇이 이동 중에도 vision_node/tool_detection_node가
+        "이미지가 찍힌 시각"의 로봇 자세를 tf2로 조회할 수 있게 하기 위함이고(그 뒤
+        link_6 -> camera_link는 각 카메라 노드의 hand-eye 캘리브레이션이 별도로
+        책임진다), TCP 캐시는 칼만 ServoLoop.step()이 매 RT tick 읽는 값이다. dry-run
+        (hardware_enabled=false)에서는 실제 자세가 없으므로 아무것도 하지 않는다.
+
+        2026-07-08 실기 검증 중 발견: 원래 이 타이머(50Hz, TF 전용)와
+        _on_tcp_pose_refresh_timer(20Hz, TCP 캐시 전용)가 각자 in-flight 가드를
+        갖고 독립적으로 GetCurrentPosx를 호출했다. servo_pick이 시작해 두 타이머가
+        동시에 뛰기 시작하면 응답이 느려지는 순간(doosan_driver._wait_for_future는
+        최대 future_wait_timeout_s=2초까지 스레드를 블로킹) 겹친 호출들이
+        MultiThreadedExecutor(num_threads=4)의 스레드를 전부 점유해버려 TF 방송이
+        통째로 멈췄다(실기에서 5초+ 정지 확인 - servo_pick 진입과 동시에 발생,
+        결과적으로 vision_node의 TF lookup도 "extrapolation into the future"로
+        계속 실패해 ToolTrack이 아예 발행되지 못했다). 두 폴링을 이 타이머 하나로
+        합쳐 GetCurrentPosx 호출 자체를 하나의 스트림으로 만들었다 - in-flight
+        가드는 여전히 필요하다(호출 자체가 timer period보다 오래 걸릴 수 있으므로)."""
         if not self.hardware_enabled or self._doosan is None:
             return
-        pos6 = self._doosan.get_current_posx(ref=0)
+        if self._tcp_pose_request_in_flight:
+            return  # 이전 GetCurrentPosx 응답 대기 중 - 겹쳐서 새로 호출하지 않는다
+        self._tcp_pose_request_in_flight = True
+        try:
+            pos6 = self._doosan.get_current_posx(ref=0)
+        finally:
+            self._tcp_pose_request_in_flight = False
         if pos6 is None:
             return
+        if self._tcp_tracking_active and self.safety_state == SafetyState.NORMAL:
+            self._tcp_pose_cache = {'pos6': pos6, 'received_at': time.monotonic()}
         from scipy.spatial.transform import Rotation  # dry-run에서는 필요 없는 지연 임포트
         x_mm, y_mm, z_mm, a_deg, b_deg, c_deg = pos6
         quat = Rotation.from_euler('ZYZ', [a_deg, b_deg, c_deg], degrees=True).as_quat()

@@ -3,7 +3,7 @@ import time
 import pytest
 import rclpy
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 from handover_interfaces.msg import GripperState
 from operator_gui.ros_client import DEFAULT_CAMERA_TOPIC, RosClient, _OperatorGuiNode
@@ -22,11 +22,15 @@ class _FakeOwner:
         self.gripper_state_calls = []
         self.fault_calls = []
         self.camera_image_calls = []
+        self.mic_level_calls = []
+        self.stt_command_calls = []
         self.on_task_status = lambda state, detail, mode, safety, resumable: (
             self.task_status_calls.append((state, detail, mode, safety, resumable)))
         self.on_gripper_state = lambda width, grip: self.gripper_state_calls.append((width, grip))
         self.on_fault = lambda msg: self.fault_calls.append(msg)
         self.on_camera_image = lambda data: self.camera_image_calls.append(data)
+        self.on_mic_level = lambda level: self.mic_level_calls.append(level)
+        self.on_stt_command = lambda text: self.stt_command_calls.append(text)
 
 
 @pytest.fixture
@@ -97,6 +101,24 @@ def test_camera_image_callback_forwards_raw_bytes(node, owner, peer):
 
     assert _spin_until(node, lambda: owner.camera_image_calls)
     assert owner.camera_image_calls == [bytes([1, 2, 3, 4])]
+
+
+def test_mic_level_callback_forwards_value(node, owner, peer):
+    pub = peer.create_publisher(Float32, '/stt/mic_level', 10)
+    time.sleep(0.3)
+    pub.publish(Float32(data=0.42))
+
+    assert _spin_until(node, lambda: owner.mic_level_calls)
+    assert owner.mic_level_calls == pytest.approx([0.42])
+
+
+def test_stt_command_callback_forwards_text(node, owner, peer):
+    pub = peer.create_publisher(String, '/user_command/text', 10)
+    time.sleep(0.3)
+    pub.publish(String(data='스패너 갖다줘'))
+
+    assert _spin_until(node, lambda: owner.stt_command_calls)
+    assert owner.stt_command_calls == ['스패너 갖다줘']
 
 
 def test_publish_command_sends_message(node, peer):

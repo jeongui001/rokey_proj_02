@@ -96,6 +96,20 @@
       # true면 관절값 미설정 named pose도 dry-run 이동을 허용(상태 흐름 시험용)
       allow_unconfigured_named_poses: true
 
+    # base_link -> link_6 TF 방송 + servo_pick TCP 캐시 갱신을 겸하는 폴링 주기
+    # (robot_control_node._on_tf_broadcast_timer). 코드 기본값은 0.02s(50Hz)였으나,
+    # 2026-07-08 실기 검증 중 이 주기로는 vision_node의 TF lookup이 계속
+    # "extrapolation into the future"로 실패했다 - 최신 TF 샘플 시각이 이미지 촬영
+    # 시각보다 항상 ~1.3초 뒤처져 있었다(GetCurrentPosx 스트림을 하나로 합친 뒤에도
+    # 동일). 원인은 이 요청 자체가 아니라, 같은 실기 dsr_controller2 파이프라인을
+    # safety.state_poll(10Hz, get_robot_state+get_external_torque+get_tool_force
+    # 3콜)과 함께 나눠 써야 하는데 50Hz 요구가 그 처리량을 넘어서는 것으로 보인다.
+    # state_poll과 같은 10Hz로 낮춰 재검증한다 - 로봇 이동 속도(v_max=0.25m/s)
+    # 대비 100ms 간격은 tf2 보간으로 충분히 촘촘하다. 문제가 재발하면 더 낮추는
+    # 것이 다음 시도.
+    tf_broadcast:
+      period_s: 0.1
+
     servo_pick:
       # ToolTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
       # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
@@ -104,9 +118,9 @@
       # 않는다(서비스 왕복 시간이 아니라 캐시 샘플 자체의 나이) - 하드웨어
       # 캘리브레이션 값이 아니라 RT 루프에 맞는 통신 타이밍 설정이다.
       tcp_pose_max_age_s: 0.2
-      # TCP 위치 캐시를 갱신하는 주기. ToolTrack 콜백마다 동기 호출하지 않고
-      # rate-limited하게 별도 타이머로 갱신해 GetCurrentPosx 호출 과부하를 막는다.
-      tcp_pose_refresh_period_s: 0.05
+      # TCP 위치 캐시 갱신 주기는 별도 파라미터가 없다 - tf_broadcast.period_s
+      # 폴링(_on_tf_broadcast_timer)에 얹어서 채워진다(2026-07-08, 이중 폴링으로
+      # 인한 스레드 고갈 방지).
       # SpeedlWatchdog(speedl_watchdog.py)이 pet() 유무를 확인하는 내부 폴링 주기 -
       # 통신 타이밍 상수였다가 다른 servo_pick.* 값들과 함께 보이도록 승격했다.
       watchdog_poll_interval_s: 0.05

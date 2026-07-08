@@ -1,3 +1,4 @@
+import cv2
 import message_filters
 import numpy as np
 import rclpy
@@ -6,7 +7,7 @@ from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import Buffer, TransformListener, TransformException
-from sensor_msgs.msg import Image, CameraInfo
+from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from geometry_msgs.msg import PoseStamped
 
 from handover_interfaces.msg import ToolTrack, DetectionArray
@@ -31,6 +32,16 @@ FOV_MARGIN_PX = 8        # bbox가 화면 가장자리에 이만큼 가까우면
 ELONGATION_TRUST_MIN = 1.3
 ELONGATION_ALPHA_FLOOR = 0.2  # 저신뢰 구간에서 스무딩 alpha에 곱할 최소 배율
 
+# 디버그 이미지용 클래스 색상 팔레트(BGR) - YOLO 모델 클래스 목록을 모르는 상태(이 노드는
+# 검출을 직접 안 함)라 tool_detection_node처럼 순번 배정이 안 되니 이름 해시로 고정 배정한다.
+_DEBUG_CLASS_COLORS = [
+    (0, 255, 0), (255, 100, 0), (0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0),
+]
+
+
+def _class_color(class_name):
+    return _DEBUG_CLASS_COLORS[hash(class_name) % len(_DEBUG_CLASS_COLORS)]
+
 
 class VisionNode(Node):
     """RealSense 전담 노드(전체 계획.md 1.4절). set_mode로 지정된 모드에 따라
@@ -54,9 +65,13 @@ class VisionNode(Node):
         self.declare_parameter('vision.yaw_depth_band_m', 0.008)  # 공구 윗면에서 이보다 깊은 픽셀은 벨트로 보고 제외
         self.declare_parameter('vision.axis_smooth_alpha', 0.25)
         self.declare_parameter('vision.depth_valid_min_ratio', 0.2)  # 패치 유효 비율이 이 미만이면 depth_valid=False
+        # 개발/모니터링용 bbox+축 오버레이 이미지 발행 여부 (전체 계획.md 4.6절 계약 -
+        # operator_gui가 구독 예정). 매 프레임 인코딩 비용이 있으니 필요 없으면 끌 수 있게 파라미터화.
+        self.declare_parameter('vision.publish_debug_image', True)
         self.min_z_m = self.get_parameter('vision.min_z_m').value
         self.yaw_band = self.get_parameter('vision.yaw_depth_band_m').value
         self.valid_min_ratio = self.get_parameter('vision.depth_valid_min_ratio').value
+        self.publish_debug_image = self.get_parameter('vision.publish_debug_image').value
         self.approach_ref_xy = (
             self.get_parameter('vision.approach_ref_x').value,
             self.get_parameter('vision.approach_ref_y').value,
@@ -72,6 +87,8 @@ class VisionNode(Node):
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
         self.pub_hand_pose = self.create_publisher(PoseStamped, '/vision/hand_pose', 10)  # 서브스크라이버: task_manager
+        self.pub_debug_image = self.create_publisher(
+            CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.srv_set_mode = self.create_service(SetVisionMode, '/vision/set_mode', self._on_set_mode)  # 클라이언트: task_manager
 
         # eye-in-hand라 3D 복원엔 "지금"이 아니라 "이미지가 찍힌 시각"의 flange pose가 필요하다
@@ -81,11 +98,13 @@ class VisionNode(Node):
 
         # color/depth/camera_info/검출결과 4개를 같은 시각 근처끼리 묶어서 하나의 콜백으로 받는다.
         # 이래야 "이 bbox가 어느 depth 프레임의 것인지"가 어긋나지 않는다.
-        # realsense2_camera는 이미지/camera_info를 BEST_EFFORT(sensor data) QoS로 퍼블리시한다.
-        # qos_profile을 안 주면 message_filters.Subscriber가 기본값(RELIABLE)을 써서 DDS가
-        # 아예 연결을 안 맺어 콜백이 영원히 안 불린다 - 반드시 맞춰줘야 한다.
+        # realsense2_camera 등 카메라 드라이버는 스트림 QoS로 BEST_EFFORT(qos_profile_sensor_data)를
+        # 쓰도록 권장되고 버전/설정에 따라 언제든 그렇게 바뀔 수 있다. 여기서 기본 QoS(RELIABLE)를
+        # 쓰면 드라이버가 BEST_EFFORT로 바뀌는 순간 에러 없이 프레임을 0개 수신하게 되므로,
+        # 카메라 원시 스트림 3개는 명시적으로 맞춰둔다.
         self.sub_color = message_filters.Subscriber(
-            self, Image, '/camera/color/image_raw', qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
+            self, Image, '/camera/color/image_raw',
+            qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_depth = message_filters.Subscriber(
             self, Image, '/camera/aligned_depth_to_color/image_raw',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
@@ -199,11 +218,18 @@ class VisionNode(Node):
             # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다
             # (프로토타입 reset_missing과 같은 방침).
             self.axis_smoother.reset(tool_class)
+            if self.publish_debug_image:
+                # tool_class 매칭 검출이 없어도 들어온 검출 전체는 그려서 보여준다 -
+                # 왜 안 잡히는지(다른 클래스만 보임/아예 없음) 눈으로 바로 확인 가능하게.
+                self._publish_debug_image(color_msg, detection_msg.detections, None, None)
             return None  # 이번 프레임엔 tool_class 검출이 없었음 - 퍼블리시 안 함
 
         position, velocity, depth_valid, chosen_det = result
-        yaw_quat = self._grip_yaw_quaternion(
+        yaw_quat, axis_debug = self._grip_yaw_quaternion(
             chosen_det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class)
+
+        if self.publish_debug_image:
+            self._publish_debug_image(color_msg, detection_msg.detections, chosen_det, axis_debug)
 
         track = ToolTrack()
         track.header = color_msg.header  # 관측 시각(stamp)은 그대로 - 서보 루프의 시간 정합 기준
@@ -233,12 +259,16 @@ class VisionNode(Node):
         장축은 3D 포인트클라우드 PCA(tool_axis_from_depth)로 구하고, 장단축비가 낮을수록
         (정사각형에 가까운 마스크 - PCA 각도가 노이즈에 민감) 스무딩을 강하게 눌러
         저신뢰 관측이 각도를 흔들지 못하게 한다. 그립 방향은 장축에 수직(top-down 파지).
-        마스크 픽셀 부족 등으로 축을 못 구한 프레임은 None."""
+        마스크 픽셀 부족 등으로 축을 못 구한 프레임은 (None, None).
+
+        반환: (쿼터니언 또는 None, 디버그 시각화용 정보 dict 또는 None). 디버그 정보는
+        카메라 이미지 평면 좌표계 그대로(base 회전 반영 전)라 _publish_debug_image에서
+        원본 프레임 위에 곧바로 그릴 수 있다."""
         h, w = depth_m_img.shape
         x1, y1 = max(det.x1, 0), max(det.y1, 0)
         x2, y2 = min(det.x2, w), min(det.y2, h)
         if x2 <= x1 or y2 <= y1:
-            return None
+            return None, None
         if is_bbox_at_edge(det.x1, det.y1, det.x2, det.y2, w, h, FOV_MARGIN_PX):
             # 가장자리 걸침은 컨베이어 위에서 흔해 무효화하면 축이 거의 안 나온다 -
             # 보이는 부분만으로 계속 계산하되 정보성 로그만 남긴다 (프로토타입 방침).
@@ -246,23 +276,60 @@ class VisionNode(Node):
                 f'{det.class_name} bbox가 화면 가장자리에 걸침 - 잘린 실루엣으로 축 계산',
                 throttle_duration_sec=1.0)
         roi = depth_m_img[y1:y2, x1:x2]
-        axis_deg, _, elongation = tool_axis_from_depth(
+        axis_deg, rect, elongation = tool_axis_from_depth(
             roi, fx, fy, ppx, ppy, ox=x1, oy=y1,
             dmin=self.min_z_m, dmax=DEPTH_MAX_M,
             band_m=self.yaw_band, min_px=YAW_MIN_MASK_PX)
         if axis_deg is None:
-            return None
+            return None, None
         trust = min(1.0, max(0.0, (elongation - 1.0) / (ELONGATION_TRUST_MIN - 1.0)))
         alpha = self.axis_smoother.alpha * max(ELONGATION_ALPHA_FLOOR, trust)
         axis_deg = self.axis_smoother.update(tool_class, axis_deg, alpha=alpha)
         grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
+        debug_info = {'rect': rect, 'axis_deg': axis_deg, 'grip_deg': grip_deg, 'origin': (x1, y1)}
 
         # 그립축 방향벡터(카메라 이미지 평면)를 base 좌표계로 회전 (top-down 전제)
         d_cam = np.array([np.cos(np.deg2rad(grip_deg)), np.sin(np.deg2rad(grip_deg)), 0.0])
         rot = np.array(tf_matrix)[:3, :3]
         d_base = rot @ d_cam
         base_yaw_deg = float(np.degrees(np.arctan2(d_base[1], d_base[0])) % 180.0)
-        return yaw_deg_to_quaternion(base_yaw_deg)
+        return yaw_deg_to_quaternion(base_yaw_deg), debug_info
+
+    def _publish_debug_image(self, color_msg, detections, chosen_det, axis_debug):
+        """검출 전체의 bbox + (있으면) 추적 대상의 축선을 그려 압축 이미지로 발행한다
+        (전체 계획.md 4.6절 계약, operator_gui/rqt_image_view로 모니터링용). 클래스별
+        색상은 YOLO 모델 정보 없이도 이름 해시로 고정 배정한다."""
+        frame = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8').copy()
+        for d in detections:
+            color = _class_color(d.class_name)
+            is_target = chosen_det is not None and d is chosen_det
+            thickness = 3 if is_target else 1
+            cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
+            cv2.putText(frame, f'{d.class_name} {d.score * 100:.0f}%', (d.x1, max(d.y1 - 7, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+        if axis_debug is not None:
+            ox, oy = axis_debug['origin']
+            rect = axis_debug['rect']
+            (rcx, rcy), (rw, rh), _ = rect
+            box_pts = (cv2.boxPoints(rect) + np.array([ox, oy], dtype=np.float32)).astype(np.int32)
+            cv2.polylines(frame, [box_pts], True, (255, 255, 255), 2)
+            theta = np.deg2rad(axis_debug['axis_deg'])
+            half_len = max(rw, rh) / 2
+            gcx, gcy = int(rcx) + ox, int(rcy) + oy
+            dx, dy = int(half_len * np.cos(theta)), int(half_len * np.sin(theta))
+            cv2.line(frame, (gcx - dx, gcy - dy), (gcx + dx, gcy + dy), (255, 255, 255), 2)
+            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
+                        (ox, oy - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        ok, buf = cv2.imencode('.jpg', frame)
+        if not ok:
+            return
+        msg = CompressedImage()
+        msg.header = color_msg.header
+        msg.format = 'jpeg'
+        msg.data = buf.tobytes()
+        self.pub_debug_image.publish(msg)
 
     def _track_hand(self, color_msg, depth_msg, info_msg, tf_at_stamp):
         """MediaPipe로 손목을 검출해 PoseStamped를 만든다."""

@@ -258,6 +258,29 @@ def test_gripper_state_updates_label(window, qtbot):
     assert 'True' in window.gripper_label.text()
 
 
+# ---- 음성 인식: 마이크 음량 게이지 + 마지막 명령어 ----
+
+def test_mic_level_updates_progress_bar(window, qtbot):
+    with qtbot.waitSignal(window.mic_level_received, timeout=1000):
+        window.ros_client.on_mic_level(0.75)
+
+    assert window.mic_level_bar.value() == 75
+
+
+def test_mic_level_clips_out_of_range_values(window, qtbot):
+    with qtbot.waitSignal(window.mic_level_received, timeout=1000):
+        window.ros_client.on_mic_level(1.5)
+
+    assert window.mic_level_bar.value() == 100
+
+
+def test_stt_command_updates_label(window, qtbot):
+    with qtbot.waitSignal(window.stt_command_received, timeout=1000):
+        window.ros_client.on_stt_command('스패너 갖다줘')
+
+    assert '스패너 갖다줘' in window.stt_command_label.text()
+
+
 # ---- 연결 상태 ----
 
 def test_connection_status_changes_update_label_and_log(window, qtbot):
@@ -338,6 +361,53 @@ def test_camera_recovers_automatically_after_new_image(window, qtbot):
 
     assert window._camera_stale is False
     assert not window.camera_label.pixmap().isNull()
+
+
+# ---- 카메라 오버레이 (영상 안쪽 우측 상단, 로봇 현재 상태) ----
+
+def test_camera_overlay_shows_dash_before_first_status(window):
+    assert window.camera_overlay_label.text() == '-'
+
+
+def test_camera_overlay_shows_translated_state_label(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('DETECT_TRACK', '', 'AUTO', 'NORMAL', False)
+
+    assert window.camera_overlay_label.text() == '탐지 중'
+
+
+def test_camera_overlay_falls_back_to_raw_state_when_unmapped(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('SOME_NEW_STATE', '', 'AUTO', 'NORMAL', False)
+
+    assert window.camera_overlay_label.text() == 'SOME_NEW_STATE'
+
+
+def test_camera_overlay_prioritizes_safety_over_task_state(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'FAULT', False)
+
+    assert window.camera_overlay_label.text() == '오류'
+
+
+def test_camera_overlay_stays_visible_when_camera_is_stale(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
+    window.camera_stale_timeout_s = 0.01
+    window._last_camera_image_at = 0.0
+
+    window._check_camera_stale()
+
+    assert window._camera_stale is True
+    assert window.camera_overlay_label.text() == '대기중'
+    assert window.camera_overlay_label.isVisible()
+
+
+def test_camera_overlay_stays_top_right_after_resize(window):
+    window.resize(700, 500)
+    expected_x = window.camera_label.width() - window.camera_overlay_label.width() - 8
+    assert window.camera_overlay_label.x() == max(expected_x, 8)
+    assert window.camera_overlay_label.y() == 8
 
 
 def test_camera_stale_timeout_from_env_var(monkeypatch, qtbot):
