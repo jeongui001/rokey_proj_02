@@ -14,6 +14,11 @@ def generate_launch_description():
             'depth_module.depth_profile': '424x240x60',
             'rgb_camera.color_profile': '424x240x60',
             'align_depth.enable': 'true',
+            # realsense2_camera 기본값(camera_namespace='camera')은 노드 이름과 겹쳐
+            # 토픽이 /camera/camera/color/image_raw로 발행된다 - vision_node/
+            # tool_detection_node는 /camera/color/image_raw(단일)를 구독하므로 비워서 맞춘다
+            # (2026-07-08 실기 검증 중 발견: 이걸 안 하면 두 노드 다 이미지를 하나도 못 받는다).
+            'camera_namespace': '',
         }.items()
     )
     # hand-eye 캘리브레이션 결과(T_gripper2camera.npy, flange -> camera_link)를
@@ -31,4 +36,11 @@ def generate_launch_description():
         package='vision_node',
         executable='vision_node',
     )
-    return LaunchDescription([realsense_launch, static_tf, vision_node])
+    # object_detection(팀원3) 역할 - YOLO 추론만 하고 /detection/tool_boxes로 발행한다.
+    # vision_node와 발행 토픽이 겹치지 않으므로(예전엔 둘 다 /vision/tool_track에 발행해
+    # 동시 실행 금지였음) 함께 띄울 수 있다.
+    tool_detection_node = Node(
+        package='vision_node',
+        executable='tool_detection_node',
+    )
+    return LaunchDescription([realsense_launch, static_tf, vision_node, tool_detection_node])

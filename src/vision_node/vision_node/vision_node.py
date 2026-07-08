@@ -1,4 +1,5 @@
 import message_filters
+import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.duration import Duration
@@ -14,6 +15,20 @@ from vision_node.tracking import (
     ToolTracker, pixel_to_camera_xyz, transform_to_matrix, camera_to_base, is_approaching,
 )
 from vision_node.hand_tracking import create_hands_detector, detect_hand_wrist_pixel
+from vision_node.grasp_geometry import (
+    AxisSmoother, is_bbox_at_edge, patch_median_depth, tool_axis_from_depth,
+    yaw_deg_to_quaternion,
+)
+
+# 뎁스/축 계산 상수 - tool_detection_node(프로토타입 계열)에서 실기 검증된 값 그대로.
+DEPTH_MAX_M = 2.0        # 이보다 먼 뎁스는 무효(배경/노이즈)
+PATCH_HALF = 4           # patch_median_depth 반경 -> (2*4+1)^2 = 9x9 패치
+YAW_MIN_MASK_PX = 50     # 공구 윗면 마스크 최소 픽셀 수 - 미달이면 축 계산 포기
+FOV_MARGIN_PX = 8        # bbox가 화면 가장자리에 이만큼 가까우면 잘림 의심 플래그
+# 장단축비(길이/폭)가 이 값 이상이면 PCA 각도를 완전히 신뢰. 정사각형에 가까울수록
+# (렌치/망치 머리처럼 폭이 넓은 공구) 각도가 노이즈에 민감해 튀므로 신뢰도를 낮춘다.
+ELONGATION_TRUST_MIN = 1.3
+ELONGATION_ALPHA_FLOOR = 0.2  # 저신뢰 구간에서 스무딩 alpha에 곱할 최소 배율
 
 
 class VisionNode(Node):
@@ -34,7 +49,13 @@ class VisionNode(Node):
         self.declare_parameter('vision.approach_ref_y', 0.0)
         self.declare_parameter('vision.tracker_alpha', 0.6)     # ToolTracker 위치 스무딩
         self.declare_parameter('vision.tracker_beta', 0.3)      # ToolTracker 속도 스무딩
+        # 축(yaw) 계산 파라미터 - tool_detection_node와 동일 기본값
+        self.declare_parameter('vision.yaw_depth_band_m', 0.008)  # 공구 윗면에서 이보다 깊은 픽셀은 벨트로 보고 제외
+        self.declare_parameter('vision.axis_smooth_alpha', 0.25)
+        self.declare_parameter('vision.depth_valid_min_ratio', 0.2)  # 패치 유효 비율이 이 미만이면 depth_valid=False
         self.min_z_m = self.get_parameter('vision.min_z_m').value
+        self.yaw_band = self.get_parameter('vision.yaw_depth_band_m').value
+        self.valid_min_ratio = self.get_parameter('vision.depth_valid_min_ratio').value
         self.approach_ref_xy = (
             self.get_parameter('vision.approach_ref_x').value,
             self.get_parameter('vision.approach_ref_y').value,
@@ -44,6 +65,8 @@ class VisionNode(Node):
         self.tracker = ToolTracker(
             alpha=self.get_parameter('vision.tracker_alpha').value,
             beta=self.get_parameter('vision.tracker_beta').value)
+        self.axis_smoother = AxisSmoother(
+            alpha=self.get_parameter('vision.axis_smooth_alpha').value)
         self._hands_detector = None  # 지연 생성 (TRACK_HAND 최초 진입 시 create_hands_detector() 호출)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
@@ -82,6 +105,7 @@ class VisionNode(Node):
         self.tool_class = request.tool_class
         if request.mode == SetVisionMode.Request.TRACK_TOOL:
             self.tracker.reset()
+            self.axis_smoother.reset(request.tool_class)  # 이전 사이클의 축 이력도 함께 초기화
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
         return response
@@ -118,13 +142,18 @@ class VisionNode(Node):
         return transform_to_matrix((t.x, t.y, t.z), (r.x, r.y, r.z, r.w))
 
     def _track_tool(self, color_msg, depth_msg, info_msg, detection_msg, tf_at_stamp, tool_class):
-        """저해상도 검출(팀원3 제공) + 3D 복원(tf_at_stamp 사용) + 알파-베타 필터로 ToolTrack을 만든다."""
+        """저해상도 검출(팀원3 제공) + 3D 복원(tf_at_stamp 사용) + 알파-베타 필터로 ToolTrack을 만든다.
+
+        yaw(그립 방향)는 선택된 bbox의 depth ROI에서 3D 포인트클라우드 PCA로 구한다
+        (grasp_geometry.tool_axis_from_depth - 프로토타입 tool_detection_node에서 실기 검증됨).
+        """
         # CameraInfo.k는 3x3 intrinsic 행렬을 1차원으로 편 것: [fx,0,ppx, 0,fy,ppy, 0,0,1]
         # numpy 배열이라 float()로 캐스팅해두지 않으면 이후 계산 결과가 numpy 타입으로 오염되어
         # bool 필드(approaching 등)에 대입할 때 타입 에러가 난다.
         fx, fy, ppx, ppy = (float(info_msg.k[0]), float(info_msg.k[4]),
                             float(info_msg.k[2]), float(info_msg.k[5]))
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        depth_m_img = depth_image.astype(np.float64) / 1000.0  # RealSense depth는 보통 mm(16UC1)
         tf_matrix = self._tf_matrix(tf_at_stamp)
 
         def reconstruct(cx, cy):
@@ -132,12 +161,14 @@ class VisionNode(Node):
             후보 bbox마다 이 함수를 호출한다 (tracking.py는 ROS/depth 이미지를 몰라도 되게
             이 클로저 하나로 depth 조회 + intrinsics + tf 변환을 전부 감춘다)."""
             px, py = int(cx), int(cy)
-            if not (0 <= py < depth_image.shape[0] and 0 <= px < depth_image.shape[1]):
+            if not (0 <= py < depth_m_img.shape[0] and 0 <= px < depth_m_img.shape[1]):
                 return None
-            depth_m = float(depth_image[py, px]) / 1000.0  # RealSense depth는 보통 mm(16UC1)
-            depth_valid = depth_m >= self.min_z_m
+            # 단일 픽셀은 금속/반사면 뎁스 구멍에 취약해서 9x9 패치 median으로 보완
+            z_m, valid_ratio = patch_median_depth(
+                depth_m_img, px, py, half=PATCH_HALF, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
+            depth_valid = z_m is not None and valid_ratio >= self.valid_min_ratio
             # depth 무효 구간은 마지막 유효 z로 픽셀->광선을 역산해 x,y만 RGB 추적으로 갱신 (2.7절)
-            z = depth_m if depth_valid else (self.tracker.last_valid_z or 0.0)
+            z = z_m if z_m is not None else (self.tracker.last_valid_z or 0.0)
             cam_xyz = pixel_to_camera_xyz(px, py, z, fx, fy, ppx, ppy)
             base_xyz = camera_to_base(cam_xyz, tf_matrix)
             return (base_xyz[0], base_xyz[1], base_xyz[2], depth_valid)
@@ -145,20 +176,74 @@ class VisionNode(Node):
         stamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
         result = self.tracker.update(detection_msg.detections, tool_class, reconstruct, stamp)
         if result is None:
+            # 검출이 끊긴 프레임 - 축 이력도 지운다. 물체가 화면에서 사라졌다 다시
+            # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다
+            # (프로토타입 reset_missing과 같은 방침).
+            self.axis_smoother.reset(tool_class)
             return None  # 이번 프레임엔 tool_class 검출이 없었음 - 퍼블리시 안 함
 
-        position, velocity, depth_valid = result
+        position, velocity, depth_valid, chosen_det = result
+        yaw_quat = self._grip_yaw_quaternion(
+            chosen_det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class)
+
         track = ToolTrack()
-        track.header = color_msg.header  # 관측 시각 그대로 전달 (서보 루프의 시간 정합 기준)
+        track.header = color_msg.header  # 관측 시각(stamp)은 그대로 - 서보 루프의 시간 정합 기준
+        # position/orientation은 위에서 이미 base_link로 변환했으므로 frame_id도 base_link로
+        # 고쳐야 한다 - color_msg.header를 그대로 복사하면 frame_id가 카메라 프레임으로 남아
+        # robot_control의 _validate_tool_track_message(frame_id=='base_link' 검사)가 거부한다.
+        # _track_tool은 TF 조회 성공(_on_synced_images) 후에만 호출되므로 항상 base_link.
+        track.header.frame_id = 'base_link'
         track.tool_class = tool_class
+        track.confidence = float(chosen_det.score)
         track.pose.position.x = position[0]
         track.pose.position.y = position[1]
         track.pose.position.z = position[2]
-        track.pose.orientation.w = 1.0   # yaw는 1차 구현 범위 밖 - identity 고정
+        if yaw_quat is not None:
+            (track.pose.orientation.x, track.pose.orientation.y,
+             track.pose.orientation.z, track.pose.orientation.w) = yaw_quat
+        else:
+            track.pose.orientation.w = 1.0  # 축 미확정 프레임 - identity (구독측은 depth_valid와 별개로 처리)
         track.depth_valid = bool(depth_valid)
         track.approaching = bool(is_approaching(
             (position[0], position[1]), velocity, self.approach_ref_xy))
         return track
+
+    def _grip_yaw_quaternion(self, det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class):
+        """선택된 검출의 bbox depth ROI에서 그립 yaw 쿼터니언(base 기준)을 계산한다.
+
+        장축은 3D 포인트클라우드 PCA(tool_axis_from_depth)로 구하고, 장단축비가 낮을수록
+        (정사각형에 가까운 마스크 - PCA 각도가 노이즈에 민감) 스무딩을 강하게 눌러
+        저신뢰 관측이 각도를 흔들지 못하게 한다. 그립 방향은 장축에 수직(top-down 파지).
+        마스크 픽셀 부족 등으로 축을 못 구한 프레임은 None."""
+        h, w = depth_m_img.shape
+        x1, y1 = max(det.x1, 0), max(det.y1, 0)
+        x2, y2 = min(det.x2, w), min(det.y2, h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+        if is_bbox_at_edge(det.x1, det.y1, det.x2, det.y2, w, h, FOV_MARGIN_PX):
+            # 가장자리 걸침은 컨베이어 위에서 흔해 무효화하면 축이 거의 안 나온다 -
+            # 보이는 부분만으로 계속 계산하되 정보성 로그만 남긴다 (프로토타입 방침).
+            self.get_logger().debug(
+                f'{det.class_name} bbox가 화면 가장자리에 걸침 - 잘린 실루엣으로 축 계산',
+                throttle_duration_sec=1.0)
+        roi = depth_m_img[y1:y2, x1:x2]
+        axis_deg, _, elongation = tool_axis_from_depth(
+            roi, fx, fy, ppx, ppy, ox=x1, oy=y1,
+            dmin=self.min_z_m, dmax=DEPTH_MAX_M,
+            band_m=self.yaw_band, min_px=YAW_MIN_MASK_PX)
+        if axis_deg is None:
+            return None
+        trust = min(1.0, max(0.0, (elongation - 1.0) / (ELONGATION_TRUST_MIN - 1.0)))
+        alpha = self.axis_smoother.alpha * max(ELONGATION_ALPHA_FLOOR, trust)
+        axis_deg = self.axis_smoother.update(tool_class, axis_deg, alpha=alpha)
+        grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
+
+        # 그립축 방향벡터(카메라 이미지 평면)를 base 좌표계로 회전 (top-down 전제)
+        d_cam = np.array([np.cos(np.deg2rad(grip_deg)), np.sin(np.deg2rad(grip_deg)), 0.0])
+        rot = np.array(tf_matrix)[:3, :3]
+        d_base = rot @ d_cam
+        base_yaw_deg = float(np.degrees(np.arctan2(d_base[1], d_base[0])) % 180.0)
+        return yaw_deg_to_quaternion(base_yaw_deg)
 
     def _track_hand(self, color_msg, depth_msg, info_msg, tf_at_stamp):
         """MediaPipe로 손목을 검출해 PoseStamped를 만든다."""
