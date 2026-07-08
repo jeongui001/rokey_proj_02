@@ -46,8 +46,12 @@
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
       driver:
-        width_mm: 80.0
-        force_n: 30.0
+        # width_mm은 "닫힐 때 목표 폭"이다(RG2Client.close 참고) - 물체(드라이버
+        # 손잡이)보다 넓으면 물체에 닿기도 전에 목표 폭에서 멈춰 grip_detected=False가
+        # 된다(실기에서 80mm으로 이 문제 확인됨). 손잡이보다 확실히 좁은 값(거의
+        # 완전히 닫힘)으로 두어 force 한계에 걸려 멈추게 한다.
+        width_mm: 5.0
+        force_n: 25.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
       wrench:

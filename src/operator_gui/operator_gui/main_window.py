@@ -186,10 +186,12 @@ CMD_DOWN = '아래를 봐'
 CMD_WATCH = '컨베이어를 봐'
 CMD_STOP = '멈춰'
 CMD_RESET = '리셋'
+CMD_RESUME = '재개'
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    task_status_received = QtCore.pyqtSignal(str, str, str, str)  # state, detail, operation_mode, safety_state
+    # state, detail, operation_mode, safety_state, resumable
+    task_status_received = QtCore.pyqtSignal(str, str, str, str, bool)
     gripper_state_received = QtCore.pyqtSignal(float, bool)
     fault_received = QtCore.pyqtSignal(str)
     connection_changed = QtCore.pyqtSignal(bool)
@@ -207,6 +209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._last_state = None
         self._last_operation_mode = None
         self._last_safety_state = None
+        self._last_resumable = False
         self._last_grip_detected = None
         self._last_fault_message = None
         # /task/status가 fault 이후 실제로 비정상 safety_state를 확인해줘야만
@@ -337,6 +340,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.reset_button = QtWidgets.QPushButton('복구 요청 (리셋)')
         self.reset_button.setObjectName('primaryButton')
         self.reset_button.clicked.connect(lambda: self._send_text(CMD_RESET))
+        self.resume_button = QtWidgets.QPushButton('재개')
+        self.resume_button.setEnabled(False)
+        self.resume_button.clicked.connect(lambda: self._send_text(CMD_RESUME))
         self.estop_notice_label = QtWidgets.QLabel(
             '※ 실제 비상정지(E-Stop)는 로봇 본체의 물리 버튼입니다.')
         self.estop_notice_label.setObjectName('sectionNote')
@@ -344,6 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         estop_layout = QtWidgets.QVBoxLayout()
         estop_layout.addWidget(self.stop_button)
         estop_layout.addWidget(self.reset_button)
+        estop_layout.addWidget(self.resume_button)
         estop_layout.addWidget(self.estop_notice_label)
         estop_group.setLayout(estop_layout)
 
@@ -374,8 +381,9 @@ class MainWindow(QtWidgets.QMainWindow):
         middle_layout.addWidget(self.camera_label, stretch=2)
         middle_layout.addWidget(right_container, stretch=1)
 
-        # 하단: 시간순 로그
+        # 하단: 시간순 로그 - 최소 10줄 이상 보이도록 높이를 확보한다.
         self.log_view = QtWidgets.QListWidget()
+        self.log_view.setMinimumHeight(220)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(top_bar)
@@ -429,7 +437,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ---- 상태 업데이트 ----
 
-    def _update_task_status(self, state, detail, operation_mode, safety_state):
+    def _update_task_status(self, state, detail, operation_mode, safety_state, resumable=False):
         self.state_label.setText(f'상태: {state}')
         self.detail_label.setText(f'디테일: {detail}')
         self.mode_label.setText(f'모드: {operation_mode or "-"}')
@@ -441,6 +449,8 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._last_operation_mode is not None and operation_mode != self._last_operation_mode:
             self._log(f'모드 전환: {self._last_operation_mode} -> {operation_mode}')
         self._last_operation_mode = operation_mode
+
+        self._last_resumable = bool(resumable)
 
         self._apply_safety_state(safety_state)
         self._received_first_status = True
@@ -510,11 +520,14 @@ class MainWindow(QtWidgets.QMainWindow):
           이미 그 모드로 전환해도 task_manager가 안전하게 무시한다).
         - 작업 중단(STOP)과 복구 요청(RESET) 버튼은 이 정책과 무관하게 항상
           활성화된 상태로 둔다.
+        - 재개(RESUME) 버튼은 task_manager가 /task/status.resumable로 보고해준
+          값(안전상태 NORMAL + state IDLE + 재개할 스냅샷 존재)을 그대로 따른다 -
+          최종 판단은 task_manager가 하므로 여기서는 그 값을 그대로 반영할 뿐이다.
         """
         if not self._received_first_status:
             for button in (self.auto_button, self.manual_button, self.home_button,
                            self.front_button, self.up_button, self.down_button,
-                           self.watch_button):
+                           self.watch_button, self.resume_button):
                 button.setEnabled(False)
             return
 
@@ -530,6 +543,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for button in (self.home_button, self.front_button, self.up_button,
                        self.down_button, self.watch_button):
             button.setEnabled(pose_buttons_enabled)
+
+        self.resume_button.setEnabled(bool(self._last_resumable))
 
         # stop_button/reset_button은 항상 활성화 상태를 유지한다(정책 대상에서 제외).
 

@@ -10,7 +10,10 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/vision_node.launch.py']),
-        ('share/' + package_name + '/resource', ['resource/T_gripper2camera.npy']),
+        ('share/' + package_name + '/resource', [
+            'resource/T_gripper2camera.npy',
+            'resource/tool_detector_best.pt',
+        ]),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

@@ -65,6 +65,9 @@ class ActionCoordinator:
         호출하지 않는다 - 대신 그 콜백을 버리고 곧바로 FAULT로 전환한다. _goal_generation을
         올려 지연 도착하는 콜백(이미 진행 중이던 send_goal_async/get_result_async의
         결과 등)이 이후에도 상태를 되돌리지 못하게 한다."""
+        # self.state가 바뀌기 전에 재개용 스냅샷을 남긴다 (_capture_resume_snapshot 참고,
+        # _enter_fault를 거치지 않는 이 예외 경로에서도 동일하게 필요하다).
+        self._capture_resume_snapshot()
         self._goal_in_progress = False
         self._current_goal_handle = None
         self._goal_result_state = None

@@ -23,6 +23,13 @@ class RG2Client:
     _DEFAULT_COMMAND_TIMEOUT_S = 5.0
     _DEFAULT_POLL_INTERVAL_S = 0.05
     _DEFAULT_OPEN_WIDTH_TOLERANCE_MM = 2.0
+    _DEFAULT_CONNECT_TIMEOUT_S = 2.0
+    # node 없이(node=None) 생성된 경우의 기본값 - robot_control_node를 통해 쓰일
+    # 때는 항상 node가 주어지므로 실제로는 각 파라미터 기본값이 적용된다. 여기
+    # 기본값을 0으로 두는 건 node 없는 단위 테스트/스크립트에서 재시도로 인한
+    # 예상치 못한 지연을 피하기 위해서다.
+    _DEFAULT_COMMUNICATION_RETRY_COUNT = 0
+    _DEFAULT_COMMUNICATION_RETRY_BACKOFF_S = 0.5
 
     def __init__(
             self, ip: str, port: int = 502, hardware_enabled: bool = False,
@@ -44,7 +51,7 @@ class RG2Client:
             from pymodbus.client.sync import ModbusTcpClient
             self._client = ModbusTcpClient(
                 self.ip, port=self.port, stopbits=1, bytesize=8, parity='E',
-                baudrate=115200, timeout=1)
+                baudrate=115200, timeout=self._connect_timeout_s())
         try:
             if not self._client.connect():
                 return None
@@ -67,6 +74,24 @@ class RG2Client:
         if self._node is not None:
             return float(self._node.get_parameter('rg2.open_width_tolerance_mm').value)
         return self._DEFAULT_OPEN_WIDTH_TOLERANCE_MM
+
+    def _connect_timeout_s(self) -> float:
+        # 이전에는 ModbusTcpClient의 소켓 타임아웃이 1초로 하드코딩돼 있어,
+        # 네트워크가 잠깐 느려지기만 해도 COMMUNICATION_ERROR로 이어졌다.
+        if self._node is not None:
+            return float(self._node.get_parameter('rg2.connect_timeout_s').value)
+        return self._DEFAULT_CONNECT_TIMEOUT_S
+
+    def _communication_retry_count(self) -> int:
+        if self._node is not None:
+            return max(0, int(self._node.get_parameter('rg2.communication_retry_count').value))
+        return self._DEFAULT_COMMUNICATION_RETRY_COUNT
+
+    def _communication_retry_backoff_s(self) -> float:
+        if self._node is not None:
+            return max(
+                0.0, float(self._node.get_parameter('rg2.communication_retry_backoff_s').value))
+        return self._DEFAULT_COMMUNICATION_RETRY_BACKOFF_S
 
     def _validate_inputs(self, width_mm: float, force_n: float) -> bool:
         if self.gripper not in self.MAX_WIDTH_MM or self.gripper not in self.MAX_FORCE_N:
@@ -199,6 +224,29 @@ class RG2Client:
         self.last_grip_detected = grip_detected
         return RG2Status.SUCCESS
 
+    def _run_command_with_retry(self, goal_handle, values, max_width):
+        """COMMUNICATION_ERROR에 한해서만 자동 재시도한다 - 같은 목표(width/force)를
+        그대로 다시 보내는 멱등한 재시도라, 이전 시도가 실제로는 그리퍼에 전달됐어도
+        같은 명령을 또 보내는 것뿐이라 안전하다. CANCELED/FAULT/INVALID_INPUT 등
+        다른 상태는 재시도하지 않고 즉시 반환한다(취소/안전정지를 재시도로 덮어쓰지
+        않기 위함)."""
+        retries = self._communication_retry_count()
+        backoff_s = self._communication_retry_backoff_s()
+        attempt = 0
+        while True:
+            status = self._run_command(goal_handle, values, max_width)
+            if status != RG2Status.COMMUNICATION_ERROR or attempt >= retries:
+                return status
+            if goal_handle is not None and goal_handle.is_cancel_requested:
+                return status
+            if self._node is not None and self._node.safety_state != SafetyState.NORMAL:
+                return status
+            attempt += 1
+            if self._node is not None:
+                self._node.get_logger().warn(
+                    f'RG2 통신 오류 - 재시도 {attempt}/{retries}')
+            time.sleep(backoff_s)
+
     def open(self, goal_handle=None) -> bool:
         self.last_status = None
         self.last_width_mm = None
@@ -216,7 +264,7 @@ class RG2Client:
             self.last_grip_detected = False
             return True
 
-        self.last_status = self._run_command(
+        self.last_status = self._run_command_with_retry(
             goal_handle,
             [int(max_force * 10), int(max_width * 10), self._CMD_GRIP_W_OFFSET],
             max_width)
@@ -245,7 +293,7 @@ class RG2Client:
             self.last_grip_detected = True
             return True
 
-        self.last_status = self._run_command(
+        self.last_status = self._run_command_with_retry(
             goal_handle,
             [int(force_n * 10), int(width_mm * 10), self._CMD_GRIP_W_OFFSET],
             self.MAX_WIDTH_MM[self.gripper])

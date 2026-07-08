@@ -4,7 +4,7 @@ import pytest
 from PyQt5 import QtCore, QtGui
 from PyQt5.QtCore import Qt
 
-from operator_gui.main_window import DEFAULT_CAMERA_STALE_TIMEOUT_S, MainWindow
+from operator_gui.main_window import CMD_RESUME, DEFAULT_CAMERA_STALE_TIMEOUT_S, MainWindow
 
 
 class _FakeRosClient:
@@ -59,7 +59,7 @@ def _png_bytes():
 
 def test_task_status_updates_all_top_labels(window, qtbot):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('MOVE_TO_WATCH', '감시 자세로 이동', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('MOVE_TO_WATCH', '감시 자세로 이동', 'AUTO', 'NORMAL', False)
 
     assert window.state_label.text() == '상태: MOVE_TO_WATCH'
     assert window.detail_label.text() == '디테일: 감시 자세로 이동'
@@ -69,11 +69,11 @@ def test_task_status_updates_all_top_labels(window, qtbot):
 
 def test_task_state_change_is_logged_but_first_report_is_not(window, qtbot):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
     count_after_first = window.log_view.count()
 
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('MOVE_TO_WATCH', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('MOVE_TO_WATCH', '', 'AUTO', 'NORMAL', False)
 
     assert window.log_view.count() > count_after_first
 
@@ -95,7 +95,7 @@ def test_fixed_command_buttons_publish_expected_text(window, qtbot, button_attr,
     # 초기 /task/status를 받기 전에는 이동/모드 버튼이 비활성화되므로, 먼저 정상
     # 상태(MANUAL/NORMAL/IDLE)를 수신한 것으로 시뮬레이션한다.
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
 
     button = getattr(window, button_attr)
     qtbot.mouseClick(button, Qt.LeftButton)
@@ -134,7 +134,7 @@ def test_command_blocked_when_not_connected(qtbot):
     qtbot.addWidget(win)
     win.show()
     with qtbot.waitSignal(win.task_status_received, timeout=1000):
-        win.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+        win.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
 
     qtbot.mouseClick(win.home_button, Qt.LeftButton)
 
@@ -154,7 +154,7 @@ def test_command_blocked_when_not_connected(qtbot):
 ])
 def test_safety_state_label_color(window, qtbot, safety_state, expected_color):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', safety_state)
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', safety_state, False)
 
     assert expected_color in window.safety_label.styleSheet()
 
@@ -170,7 +170,7 @@ def test_fault_banner_shows_message(window, qtbot):
 def test_fault_immediately_disables_move_and_mode_buttons_without_waiting_for_status(window, qtbot):
     # 1) MANUAL/NORMAL/IDLE로 pose 버튼이 활성화된 상태를 준비한다.
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
     assert window.home_button.isEnabled() is True
     assert window.auto_button.isEnabled() is True
 
@@ -193,12 +193,12 @@ def test_fault_banner_persists_until_normal_status_received(window, qtbot):
     assert window.fault_banner.isVisible()
 
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'PROTECTIVE_STOP')
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'PROTECTIVE_STOP', False)
     assert window.fault_banner.isVisible()
     assert 'torque anomaly' in window.fault_banner.text()
 
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
     assert not window.fault_banner.isVisible()
 
 
@@ -212,7 +212,7 @@ def test_fault_after_normal_status_never_shows_green(window, qtbot, prefix, expe
     # 직전 safety_state가 NORMAL이었더라도, Fault 메시지 도착 시 배너가 초록으로
     # 표시되면 안 된다 - 접두어(또는 접두어 없음)에 따른 색만 사용해야 한다.
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
     assert not window.fault_banner.isVisible()
 
     with qtbot.waitSignal(window.fault_received, timeout=1000):
@@ -232,19 +232,19 @@ def test_stale_normal_status_right_after_fault_does_not_hide_banner(window, qtbo
     assert window.fault_banner.isVisible()
 
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
 
     assert window.fault_banner.isVisible()
     assert 'unexpected force' in window.fault_banner.text()
 
     # /task/status가 실제로 비정상 상태를 확인해준 뒤에야
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'FAULT')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'FAULT', False)
     assert window.fault_banner.isVisible()
 
     # 그 다음 NORMAL이 와야 비로소 배너가 사라진다.
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
     assert not window.fault_banner.isVisible()
 
 
@@ -412,7 +412,7 @@ def test_move_and_mode_buttons_disabled_before_initial_status(qtbot):
 ])
 def test_move_and_mode_buttons_disabled_when_not_normal(window, qtbot, safety_state):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', safety_state)
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', safety_state, False)
 
     for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
                  'up_button', 'down_button', 'watch_button'):
@@ -424,13 +424,13 @@ def test_move_and_mode_buttons_disabled_when_not_normal(window, qtbot, safety_st
 
 def test_pose_buttons_enabled_only_in_manual_mode(window, qtbot):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'AUTO', 'NORMAL', False)
 
     for attr in ('home_button', 'front_button', 'up_button', 'down_button', 'watch_button'):
         assert getattr(window, attr).isEnabled() is False, attr
 
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL')
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
 
     for attr in ('home_button', 'front_button', 'up_button', 'down_button', 'watch_button'):
         assert getattr(window, attr).isEnabled() is True, attr
@@ -438,7 +438,7 @@ def test_pose_buttons_enabled_only_in_manual_mode(window, qtbot):
 
 def test_move_and_mode_buttons_disabled_while_action_in_progress(window, qtbot):
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('MOVE_TO_WATCH', '', 'MANUAL', 'NORMAL')
+        window.ros_client.on_task_status('MOVE_TO_WATCH', '', 'MANUAL', 'NORMAL', False)
 
     for attr in ('auto_button', 'manual_button', 'home_button', 'front_button',
                  'up_button', 'down_button', 'watch_button'):
@@ -451,10 +451,39 @@ def test_stop_and_reset_buttons_always_enabled_regardless_of_state(window, qtbot
     # 작업 중단(STOP)과 복구 요청(RESET)은 서로 다른 목적이지만 둘 다 버튼 정책과
     # 무관하게 항상 눌러야 한다.
     with qtbot.waitSignal(window.task_status_received, timeout=1000):
-        window.ros_client.on_task_status('SERVO_PICK', '', 'AUTO', 'FAULT')
+        window.ros_client.on_task_status('SERVO_PICK', '', 'AUTO', 'FAULT', False)
 
     assert window.stop_button.isEnabled() is True
     assert window.reset_button.isEnabled() is True
+
+
+# ---- 재개(resume) 버튼 ----
+
+def test_resume_button_disabled_before_first_status(window):
+    assert window.resume_button.isEnabled() is False
+
+
+def test_resume_button_disabled_when_not_resumable(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', False)
+
+    assert window.resume_button.isEnabled() is False
+
+
+def test_resume_button_enabled_when_task_manager_reports_resumable(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', True)
+
+    assert window.resume_button.isEnabled() is True
+
+
+def test_resume_button_click_publishes_resume_command(window, qtbot):
+    with qtbot.waitSignal(window.task_status_received, timeout=1000):
+        window.ros_client.on_task_status('IDLE', '', 'MANUAL', 'NORMAL', True)
+
+    qtbot.mouseClick(window.resume_button, Qt.LeftButton)
+
+    assert window.ros_client.published == [CMD_RESUME]
 
 
 # ---- 종료 시 정리 ----

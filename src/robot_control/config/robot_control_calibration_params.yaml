@@ -1,0 +1,23 @@
+# robot_control 실측 캘리브레이션 파라미터 (robot_control_params.yaml 위에 override).
+#
+# 목적: handover_hold 당김 감지 값은 실제 로봇 자세/장착 방향에 따라 달라지는
+# 하드웨어 종속 값이라 코드 기본값(fail-closed)으로 넣지 않는다. 이 파일은
+# 2026-07-07 실기 tool_force 로그 실측 기반 값만 override한다.
+#
+# 사용법: launch 시 params_file 인자로 robot_control_params.yaml과 함께 넘기거나,
+# 명령행에서 개별 -p 오버라이드로 사용한다:
+#   ros2 launch robot_control robot_control.launch.py \
+#     params_file:=<share>/robot_control/config/robot_control_calibration_params.yaml
+/**:
+  ros__parameters:
+    # 실측 로그: 가만히 있을 때 fx는 항상 2.3 이하, 당길 때는 대부분 4~12로 뛰었다
+    # (fy/fz는 부호가 일정하지 않고 baseline과 겹쳐 fx보다 신뢰도가 낮았음).
+    handover_hold:
+      pull_axis_index: 0        # fx
+      pull_direction_sign: 1
+      pull_force_threshold_n: 4.0
+      # 기본값(3)이면 fx가 threshold를 3번 연속(~0.2~0.3초) 넘겨야 당김이 확정된다 -
+      # 그만큼 오래 당겨야 해서 관절 토크(외력 감지 FAULT)가 쌓일 시간도 늘어난다.
+      # threshold는 그대로 두고(가만히 있을 때 노이즈 대비 여유 유지) 확인 샘플만
+      # 1로 낮춰 첫 순간 바로 확정되게 한다.
+      pull_confirm_samples: 1

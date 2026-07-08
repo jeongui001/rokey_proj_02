@@ -57,6 +57,14 @@ class RobotControlNode(Node, TaskExecutor):
         # open() 완료 후 최종 폭이 "최대 폭에 도달했다"고 참고로 판단할 때 허용할
         # 오차(mm) - 실측으로 확정된 값이 아니라 통신/기구적 오차를 감안한 여유값이다.
         self.declare_parameter('rg2.open_width_tolerance_mm', 2.0)
+        # Modbus 소켓 타임아웃 - 이전에는 1초로 하드코딩돼 있어 네트워크가 잠깐
+        # 느려지기만 해도 COMMUNICATION_ERROR로 이어졌다.
+        self.declare_parameter('rg2.connect_timeout_s', 2.0)
+        # COMMUNICATION_ERROR에 한해서만 자동 재시도한다(같은 목표를 다시 보내는
+        # 멱등한 재시도라 안전함) - CANCELED/FAULT 등 다른 상태는 재시도하지 않는다
+        # (RG2Client._run_command_with_retry 참고).
+        self.declare_parameter('rg2.communication_retry_count', 2)
+        self.declare_parameter('rg2.communication_retry_backoff_s', 0.5)
 
         self.declare_parameter('servo.kp_xy', 1.2)
         self.declare_parameter('servo.kp_yaw', 1.0)
@@ -142,6 +150,10 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('safety.external_torque.stop_join_timeout_s', 2.0)
         self.declare_parameter('safety.fault_stop_mode', 1)  # DR_QSTOP: Quick stop Cat.2
         self.declare_parameter('safety.state_poll_period_s', 0.1)
+        # 진단용: true면 상태 폴링마다 tool_force를 1초 간격으로 로그에 남긴다.
+        # handover_hold.pull_axis_index/pull_direction_sign/pull_force_threshold_n을
+        # 실측으로 잡을 때만 켠다 - 기본 실행에서는 로그 스팸을 피하기 위해 false.
+        self.declare_parameter('safety.debug_log_tool_force', False)
         self.declare_parameter('gripper_poll_period_s', 0.5)
 
         # DoosanDriver(doosan_driver.py)가 dsr_msgs2 서비스를 부를 때 쓰는 통신
@@ -432,6 +444,16 @@ class RobotControlNode(Node, TaskExecutor):
         if state is None:
             return
         self._latest_robot_state = state
+        if bool(self.get_parameter('safety.debug_log_tool_force').value):
+            # 당김 감지(handover_hold.pull_axis_index/pull_direction_sign/
+            # pull_force_threshold_n) 실측 캘리브레이션 전용 - 1초에 한 번만 남긴다.
+            tool_force = state.get('tool_force') if isinstance(state, dict) else None
+            if tool_force:
+                self.get_logger().info(
+                    f'[tool_force debug] fx={tool_force[0]:.1f} fy={tool_force[1]:.1f} '
+                    f'fz={tool_force[2]:.1f} mx={tool_force[3]:.1f} my={tool_force[4]:.1f} '
+                    f'mz={tool_force[5]:.1f} (N, Nm / DR_BASE 기준)',
+                    throttle_duration_sec=1.0)
         reason = self._check_fault(state)
         if reason is not None and reason != self._last_fault_reason:
             self._declare_fault(reason)
