@@ -21,3 +21,11 @@
       # threshold는 그대로 두고(가만히 있을 때 노이즈 대비 여유 유지) 확인 샘플만
       # 1로 낮춰 첫 순간 바로 확정되게 한다.
       pull_confirm_samples: 1
+
+    # 2026-07-08 실기 테스트(E-stop 대기 상태) 전제로 활성화. 좌표 변환 자체의
+    # 코드상 결함은 없는 것으로 확인했으나 실기 검증 이력이 없으므로, 문제
+    # 발생 시 이 두 값을 다시 false로 되돌리는 것이 첫 대응이다.
+    servo_pick:
+      hardware_ready: true
+    handover_approach:
+      hardware_ready: true

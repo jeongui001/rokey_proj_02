@@ -313,8 +313,9 @@ class TaskExecutor:
         """TCP 위치 캐시를 rate-limited하게 갱신한다(GetCurrentPosx 호출 과부하 방지).
 
         - 한 번에 하나의 요청만 허용한다(_tcp_pose_request_in_flight로 직렬화).
-        - servo_pick 또는 handover_approach가 실제로 실행 중일 때만 갱신한다
-          (불필요한 조회를 피한다).
+        - servo_pick이 실제로 실행 중일 때만 갱신한다(불필요한 조회를 피한다).
+          handover_approach는 movel 기반 단발성 이동이라 이 캐시를 쓰지 않고
+          _execute_handover_approach에서 get_current_posx를 직접 동기 호출한다.
         - safety_state가 NORMAL이 아니거나 rclpy가 종료 중이면 새 조회를 시작하지 않는다.
         - 조회 실패 시 기존 캐시를 덮어쓰지 않는다 - 캐시의 나이가 계속 늘어나
           _get_current_tcp_posx()의 신선도 검사가 자연히 오래된 값을 거부하게 한다

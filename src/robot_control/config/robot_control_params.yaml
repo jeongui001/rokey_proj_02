@@ -32,8 +32,8 @@
     # 그대로 적용되며, 그 경우 해당 named pose로의 이동은 명확한 실패로 처리된다
     # (robot_control_node._call_move_service 참고).
     #
-    # handover_safe: 작업대 전체가 보이는 자세 - handover_approach(YOLO 손 추적 후
-    # 접근하는 서보잉)의 출발점으로 쓰인다.
+    # handover_safe: 작업대 전체가 보이는 자세 - handover_approach(/vision/hand_pose를
+    # 1회 수신해 movel로 단발 접근)의 출발점으로 쓰인다.
     named_poses:
       home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
       front: [0.0, 0.0, 90.0, 0.0, 0.0, 0.0]

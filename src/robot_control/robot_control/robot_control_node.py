@@ -152,8 +152,8 @@ class RobotControlNode(Node, TaskExecutor):
         # 변환이 실제로 구현·검증되기 전까지는 실제 속도 명령을 로봇에 보내면 안 된다.
         self.declare_parameter('servo_pick.hardware_ready', False)
         self.declare_parameter('servo_pick.control_period_s', 0.01)
-        self.declare_parameter('servo_pick.speedl_acc_trans_mm_s2', 200.0)
-        self.declare_parameter('servo_pick.speedl_acc_rot_deg_s2', 60.0)
+        self.declare_parameter('servo_pick.speedl_acc_trans_mm_s2', 100.0)
+        self.declare_parameter('servo_pick.speedl_acc_rot_deg_s2', 30.0)
         # speedl(비-RT)은 명령이 끊겨도 스스로 멈추지 않는다(2026-07-07
         # probe_speedl_stream.py로 실측 확인) - SpeedlWatchdog가 이 시간 동안
         # pet()이 없으면 vel=0을 대신 발행한다. 단일 정지 명령으로 충분함도
