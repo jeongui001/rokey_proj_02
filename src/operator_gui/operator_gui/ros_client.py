@@ -16,7 +16,7 @@ from PyQt5.QtCore import QThread
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 from handover_interfaces.msg import GripperState
 
@@ -45,6 +45,8 @@ class _OperatorGuiNode(Node):
         self.create_subscription(String, '/robot/fault', self._on_fault, 10)
         self.create_subscription(
             CompressedImage, self._camera_topic, self._on_camera_image, 10)
+        self.create_subscription(Float32, '/stt/mic_level', self._on_mic_level, 10)
+        self.create_subscription(String, '/user_command/text', self._on_stt_command, 10)
         self._command_pub = self.create_publisher(String, '/user_command/text', 10)
 
     def publish_command(self, text: str) -> bool:
@@ -80,6 +82,16 @@ class _OperatorGuiNode(Node):
         if self._owner.on_camera_image is None:
             return
         self._owner.on_camera_image(bytes(msg.data))
+
+    def _on_mic_level(self, msg):
+        if self._owner.on_mic_level is None:
+            return
+        self._owner.on_mic_level(msg.data)
+
+    def _on_stt_command(self, msg):
+        if self._owner.on_stt_command is None:
+            return
+        self._owner.on_stt_command(msg.data)
 
 
 class RosSpinThread(QThread):
@@ -137,6 +149,8 @@ class RosClient:
         self.on_fault = None               # (message)
         self.on_camera_image = None        # (image_bytes)
         self.on_connection_changed = None  # (is_connected: bool)
+        self.on_mic_level = None           # (level: float, 0.0~1.0)
+        self.on_stt_command = None         # (text: str)
 
         self._node = _OperatorGuiNode(self, self.camera_topic)
         self._spin_thread = RosSpinThread(self._node)

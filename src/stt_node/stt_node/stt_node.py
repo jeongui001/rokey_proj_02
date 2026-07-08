@@ -6,7 +6,7 @@ import threading
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float32, String
 
 from ament_index_python.packages import get_package_share_directory
 from dotenv import load_dotenv
@@ -37,6 +37,9 @@ class SttNode(Node):
     def __init__(self):
         super().__init__('stt_node')
         self.pub_command = self.create_publisher(String, '/user_command/text', 10)  # 서브스크라이버: task_manager
+        # 서브스크라이버: operator_gui(마이크 음량 게이지) - 웨이크워드 대기 중에만
+        # 갱신된다(명령 녹음 5초 구간은 sounddevice 블로킹 호출이라 청크 단위 갱신이 없음).
+        self.pub_mic_level = self.create_publisher(Float32, '/stt/mic_level', 10)
 
         self.declare_parameter('mic.device_index', -1)  # -1이면 PyAudio 기본 입력 장치
         self.declare_parameter('mic.rate', 48000)
@@ -147,7 +150,9 @@ class SttNode(Node):
     # ---- 웨이크워드 (openwakeword, 로컬/무료) ----
 
     def _detect_wake_word(self) -> bool:
-        return self._wakeup_word.is_wakeup(self._mic.stream)
+        detected = self._wakeup_word.is_wakeup(self._mic.stream)
+        self.pub_mic_level.publish(Float32(data=self._wakeup_word.last_level))
+        return detected
 
     # ---- 명령 녹음 + OpenAI STT ----
 

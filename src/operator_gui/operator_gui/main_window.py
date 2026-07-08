@@ -188,6 +188,30 @@ CMD_STOP = '멈춰'
 CMD_RESET = '리셋'
 CMD_RESUME = '재개'
 
+# 카메라 영상 위 오버레이용 짧은 한글 표시 - task_manager.task_models.State/Safety와
+# 1:1 대응. 여기 없는 값(향후 새 state 추가 등)은 원래 문자열을 그대로 보여준다
+# (오버레이가 새 state를 몰라서 죽거나 빈 칸이 되지 않도록).
+STATE_OVERLAY_LABELS = {
+    'IDLE': '대기중',
+    'MOVE_TO_WATCH': '이동 중',
+    'DETECT_TRACK': '탐지 중',
+    'SERVO_PICK': '집는 중',
+    'VERIFY_GRASP': '파지 확인 중',
+    'MOVE_SAFE': '이동 중',
+    'APPROACH_HAND': '전달 접근 중',
+    'WAIT_PULL': '전달 대기 중',
+    'HOME': '홈 이동 중',
+    'MANUAL_MOVE': '수동 이동 중',
+    'CANCELLING': '취소 중',
+}
+# safety_state가 NORMAL이 아니면 작업 state보다 이걸 우선 표시한다(더 시급한 정보).
+SAFETY_OVERLAY_LABELS = {
+    'PROTECTIVE_STOP': '보호정지',
+    'RECOVERY_REQUIRED': '복구 필요',
+    'EMERGENCY_STOP': '비상정지',
+    'FAULT': '오류',
+}
+
 
 class MainWindow(QtWidgets.QMainWindow):
     # state, detail, operation_mode, safety_state, resumable
@@ -196,6 +220,8 @@ class MainWindow(QtWidgets.QMainWindow):
     fault_received = QtCore.pyqtSignal(str)
     connection_changed = QtCore.pyqtSignal(bool)
     camera_image_received = QtCore.pyqtSignal(bytes)
+    mic_level_received = QtCore.pyqtSignal(float)
+    stt_command_received = QtCore.pyqtSignal(str)
 
     def __init__(self, ros_client, camera_stale_timeout_s=None):
         super().__init__()
@@ -227,6 +253,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._build_ui()
         self._wire_signals()
         self._apply_button_policy()
+        self._reposition_camera_overlay()
 
         self._reconnect_timer = QtCore.QTimer(self)
         self._reconnect_timer.setInterval(int(self.ros_client.reconnect_interval_s * 1000))
@@ -300,6 +327,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_label.setAlignment(QtCore.Qt.AlignCenter)
         self.camera_label.setMinimumSize(320, 240)
 
+        # 카메라 영상 안쪽 우측 상단에 떠 있는 상태 오버레이. camera_label의 레이아웃
+        # 자식이 아니라 좌표를 직접 move()하는 "떠 있는" 자식 위젯이라, 카메라가
+        # 대기/멈춤 텍스트를 보여줄 때도(즉 pixmap이 없을 때도) 항상 그 위에 그려진다.
+        self.camera_overlay_label = QtWidgets.QLabel('-', self.camera_label)
+        self.camera_overlay_label.setStyleSheet(
+            f'font-family: {_MONO_FONT_STACK}; font-size: 12px; font-weight: 700; '
+            'padding: 4px 10px; border-radius: 3px; '
+            'background-color: rgba(5, 8, 13, 0.72); color: #cfe6f2;')
+        self.camera_overlay_label.adjustSize()
+
         # 오른쪽: 그리퍼 상태 + 명령 버튼 (모드 / 이동 / 비상 조치 / 명령 전송으로 그룹화)
         self.gripper_label = QtWidgets.QLabel('그리퍼: -')
         self.gripper_label.setStyleSheet(f'font-family: {_MONO_FONT_STACK}; font-size: 12px;')
@@ -364,6 +401,25 @@ class MainWindow(QtWidgets.QMainWindow):
         free_command_layout.addWidget(self.send_button)
         cmd_group.setLayout(free_command_layout)
 
+        # 마이크가 소리를 잘 잡고 있는지 눈으로 확인하기 위한 용도라 절대 dB 눈금은
+        # 표시하지 않는다 - 막대가 조용할 때 낮고 말할 때 올라가는지만 보면 된다.
+        # 게이지+라벨을 세로로 쌓지 않고 가로 한 줄로 배치해 그룹박스 세로 폭을
+        # 아낀다 - 우측 패널에 그룹박스가 이미 여러 개 쌓여있어 창 최소 높이가
+        # 화면 높이에 근접하면 최대화 버튼이 사실상 동작하지 않게 된다.
+        mic_group = QtWidgets.QGroupBox('음성 인식')
+        self.mic_level_bar = QtWidgets.QProgressBar()
+        self.mic_level_bar.setRange(0, 100)
+        self.mic_level_bar.setTextVisible(False)
+        self.mic_level_bar.setFixedSize(50, 10)
+        self.stt_command_label = QtWidgets.QLabel('마지막 명령어: -')
+        self.stt_command_label.setWordWrap(True)
+        self.stt_command_label.setMaximumHeight(34)  # 최대 2줄 - 긴 명령어도 그룹박스 높이를 무한정 늘리지 않는다
+        self.stt_command_label.setStyleSheet(f'font-family: {_MONO_FONT_STACK}; font-size: 12px;')
+        mic_layout = QtWidgets.QHBoxLayout()
+        mic_layout.addWidget(self.mic_level_bar)
+        mic_layout.addWidget(self.stt_command_label, stretch=1)
+        mic_group.setLayout(mic_layout)
+
         right_panel = QtWidgets.QVBoxLayout()
         right_panel.setSpacing(10)
         right_panel.addWidget(self.gripper_label)
@@ -372,6 +428,7 @@ class MainWindow(QtWidgets.QMainWindow):
         right_panel.addWidget(estop_group)
         right_panel.addStretch(1)
         right_panel.addWidget(cmd_group)
+        right_panel.addWidget(mic_group)
 
         right_container = QtWidgets.QWidget()
         right_container.setLayout(right_panel)
@@ -404,12 +461,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fault_received.connect(self._update_fault)
         self.connection_changed.connect(self._update_connection_status)
         self.camera_image_received.connect(self._update_camera_image)
+        self.mic_level_received.connect(self._update_mic_level)
+        self.stt_command_received.connect(self._update_stt_command)
 
         self.ros_client.on_task_status = self.task_status_received.emit
         self.ros_client.on_gripper_state = self.gripper_state_received.emit
         self.ros_client.on_fault = self.fault_received.emit
         self.ros_client.on_connection_changed = self.connection_changed.emit
         self.ros_client.on_camera_image = self.camera_image_received.emit
+        self.ros_client.on_mic_level = self.mic_level_received.emit
+        self.ros_client.on_stt_command = self.stt_command_received.emit
 
     # ---- 명령 전송 ----
 
@@ -455,6 +516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._apply_safety_state(safety_state)
         self._received_first_status = True
         self._apply_button_policy()
+        self._update_camera_overlay()
 
     def _style_safety_chip(self, widget, glow, tint):
         widget.setStyleSheet(
@@ -577,6 +639,28 @@ class MainWindow(QtWidgets.QMainWindow):
         # (safety_state는 위에서 이미 비정상으로 갱신했다). STOP/RESET은 정책 대상이
         # 아니므로 그대로 활성 상태를 유지한다.
         self._apply_button_policy()
+        self._update_camera_overlay()
+
+    # ---- 카메라 오버레이 (우측 상단, 로봇 현재 상태) ----
+
+    def _update_camera_overlay(self):
+        """카메라 영상이 대기/멈춤 상태라도(즉 pixmap이 없어도) 로봇이 지금 뭘
+        하고 있는지는 계속 보여준다 - 안전상태가 NORMAL이 아니면 작업 state보다
+        그걸 우선 표시한다(더 시급한 정보이므로)."""
+        if not self._received_first_status:
+            text = '-'
+        elif self._last_safety_state and self._last_safety_state != 'NORMAL':
+            text = SAFETY_OVERLAY_LABELS.get(self._last_safety_state, self._last_safety_state)
+        else:
+            text = STATE_OVERLAY_LABELS.get(self._last_state, self._last_state or '-')
+        self.camera_overlay_label.setText(text)
+        self._reposition_camera_overlay()
+
+    def _reposition_camera_overlay(self):
+        margin = 8
+        self.camera_overlay_label.adjustSize()
+        x = self.camera_label.width() - self.camera_overlay_label.width() - margin
+        self.camera_overlay_label.move(max(x, margin), margin)
 
     def _update_connection_status(self, connected):
         if connected:
@@ -592,6 +676,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 'padding: 6px 12px; border: 1px solid #ff4d5e; border-radius: 3px; '
                 'background-color: rgba(255, 77, 94, 0.18); color: #ff4d5e;')
         self._log('ROS2 연결됨' if connected else 'ROS2 연결 끊김')
+
+    # ---- 음성 인식 ----
+
+    def _update_mic_level(self, level):
+        self.mic_level_bar.setValue(int(min(max(level, 0.0), 1.0) * 100))
+
+    def _update_stt_command(self, text):
+        self.stt_command_label.setText(f'마지막 명령어: {text}')
 
     # ---- 카메라 ----
 
@@ -634,6 +726,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._render_camera_pixmap()
+        self._reposition_camera_overlay()
 
     # ---- 로그 ----
 
