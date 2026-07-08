@@ -55,7 +55,8 @@ class ServoLoop:
                  eps_descend, eps_grasp, n_stable, dt_latency,
                  timeout_s, t_lost_s,
                  innov_low=0.010, innov_high=0.040, w_alpha=0.3,
-                 z_close=0.02, diverge_n=5, cov_threshold=0.05):
+                 z_close=0.02, diverge_n=5, cov_threshold=0.05,
+                 q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
@@ -73,9 +74,18 @@ class ServoLoop:
         self.z_close = z_close           # 폐합 판정 z_gap 임계
         self.diverge_n = diverge_n       # 발산 판정에 볼 연속 오차 개수
         self.cov_threshold = cov_threshold  # 폐합 판정용 속도 공분산 임계
+        # 내부 KalmanXYZV로 그대로 전달되는 필터 노이즈 파라미터 (kalman.py 참고)
+        self.q_pos = q_pos
+        self.q_vel = q_vel
+        self.r_xy = r_xy
+        self.r_z = r_z
+        self.p0_vel_reset = p0_vel_reset
 
         self._state = ServoState.TRACKING
-        self._filter = KalmanXYZV()      # 실제 제어에 쓰이는 정밀 칼만 필터 (vision_node의 알파-베타 필터와 별개)
+        # 실제 제어에 쓰이는 정밀 칼만 필터 (vision_node의 알파-베타 필터와 별개)
+        self._filter = KalmanXYZV(
+            q_pos=self.q_pos, q_vel=self.q_vel, r_xy=self.r_xy, r_z=self.r_z,
+            p0_vel_reset=self.p0_vel_reset)
         self._w = 0.0                    # 피드포워드 신뢰 가중치(2.3절)
         self._last_track_time = None     # 마지막 ToolTrack의 header stamp (필터 dt 계산용)
         self._last_msg_time = None       # 마지막 ToolTrack을 "받은" 시각(monotonic) - t_lost 판정용
@@ -90,7 +100,9 @@ class ServoLoop:
         self.grasp_width_mm = grasp_width_mm
         self.grasp_force_n = grasp_force_n
         self._state = ServoState.TRACKING
-        self._filter = KalmanXYZV()
+        self._filter = KalmanXYZV(
+            q_pos=self.q_pos, q_vel=self.q_vel, r_xy=self.r_xy, r_z=self.r_z,
+            p0_vel_reset=self.p0_vel_reset)
         self._w = 0.0
         self._last_track_time = None
         self._last_msg_time = None

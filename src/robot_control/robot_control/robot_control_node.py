@@ -68,6 +68,26 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.dt_latency', 0.05)
         self.declare_parameter('servo.timeout', 5.0)
         self.declare_parameter('servo.t_lost', 0.3)
+        # innovation(예측-관측 잔차) 기반 피드포워드 가중치 w 및 폐합/발산 판정 임계값
+        # (servo_loop.py ServoLoop 참고) - 이전에는 코드 상수였으나, kp_xy 등 다른
+        # 서보 게인과 마찬가지로 실기 튜닝 대상이라 ROS 파라미터로 승격했다.
+        self.declare_parameter('servo.innov_low', 0.010)
+        self.declare_parameter('servo.innov_high', 0.040)
+        self.declare_parameter('servo.w_alpha', 0.3)
+        self.declare_parameter('servo.z_close', 0.02)
+        self.declare_parameter('servo.diverge_n', 5)
+        self.declare_parameter('servo.cov_threshold', 0.05)
+        # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
+        # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
+        self.declare_parameter('servo.kalman_q_pos', 1e-4)
+        self.declare_parameter('servo.kalman_q_vel', 1e-2)
+        self.declare_parameter('servo.kalman_r_xy', 1e-4)
+        self.declare_parameter('servo.kalman_r_z', 1e-4)
+        self.declare_parameter('servo.kalman_p0_vel_reset', 1.0)
+        # _validate_servo_command(task_executor.py)의 부동소수점 비교 허용오차 -
+        # 물리량이 아닌 수치 오차 마진이지만, 위 값들과 함께 한 곳에서 보이도록
+        # 승격했다.
+        self.declare_parameter('servo.command_validate_tolerance', 1e-6)
 
         self.declare_parameter('move.vel_deg_s', 30.0)
         self.declare_parameter('move.acc_deg_s2', 30.0)
@@ -117,9 +137,21 @@ class RobotControlNode(Node, TaskExecutor):
             self, 'safety.external_torque.direct_threshold_nm',
             [15.0, 15.0, 12.0, 10.0, 10.0, 10.0])
         self.declare_parameter('safety.external_torque.direct_reset_below_count', 20)
+        # DrflForceMonitor.stop()이 폴링 스레드 종료를 기다리는 타임아웃 - 내부 종료
+        # 안전 마진이었으나 다른 external_torque.* 값들과 함께 보이도록 승격했다.
+        self.declare_parameter('safety.external_torque.stop_join_timeout_s', 2.0)
         self.declare_parameter('safety.fault_stop_mode', 1)  # DR_QSTOP: Quick stop Cat.2
         self.declare_parameter('safety.state_poll_period_s', 0.1)
         self.declare_parameter('gripper_poll_period_s', 0.5)
+
+        # DoosanDriver(doosan_driver.py)가 dsr_msgs2 서비스를 부를 때 쓰는 통신
+        # 타임아웃/폴링 간격 - rg2.command_timeout_s 등과 같은 성격의 통신 타이밍
+        # 상수였으나 한 곳에서 보이도록 ROS 파라미터로 승격했다.
+        self.declare_parameter('doosan_driver.move_service_wait_timeout_s', 2.0)
+        self.declare_parameter('doosan_driver.service_wait_timeout_s', 1.0)
+        self.declare_parameter('doosan_driver.future_poll_interval_s', 0.01)
+        self.declare_parameter('doosan_driver.future_wait_timeout_s', 2.0)
+        self.declare_parameter('doosan_driver.compliance_future_wait_timeout_s', 3.0)
 
         # servo_pick 실제 하드웨어 실행을 위한 별도 게이트. hardware_enabled=true여도
         # 이 값이 false면 servo_pick Goal 자체를 거부한다 (기본값 false).
@@ -136,6 +168,10 @@ class RobotControlNode(Node, TaskExecutor):
         # pet()이 없으면 vel=0을 대신 발행한다. 단일 정지 명령으로 충분함도
         # 같은 실측으로 확인됨.
         self.declare_parameter('servo_pick.watchdog_timeout_s', 0.2)
+        # SpeedlWatchdog(speedl_watchdog.py)이 pet() 유무를 확인하는 내부 폴링 주기 -
+        # 통신 타이밍 상수였으나 다른 servo_pick.* 값들과 함께 한 곳에서 보이도록
+        # ROS 파라미터로 승격했다.
+        self.declare_parameter('servo_pick.watchdog_poll_interval_s', 0.05)
         # ToolTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
         # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다 (_compute_tool_track_tcp_offset).
         self.declare_parameter('servo_pick.tool_track_frame_id', 'base_link')
@@ -192,6 +228,17 @@ class RobotControlNode(Node, TaskExecutor):
             dt_latency=self.get_parameter('servo.dt_latency').value,
             timeout_s=self.get_parameter('servo.timeout').value,
             t_lost_s=self.get_parameter('servo.t_lost').value,
+            innov_low=self.get_parameter('servo.innov_low').value,
+            innov_high=self.get_parameter('servo.innov_high').value,
+            w_alpha=self.get_parameter('servo.w_alpha').value,
+            z_close=self.get_parameter('servo.z_close').value,
+            diverge_n=self.get_parameter('servo.diverge_n').value,
+            cov_threshold=self.get_parameter('servo.cov_threshold').value,
+            q_pos=self.get_parameter('servo.kalman_q_pos').value,
+            q_vel=self.get_parameter('servo.kalman_q_vel').value,
+            r_xy=self.get_parameter('servo.kalman_r_xy').value,
+            r_z=self.get_parameter('servo.kalman_r_z').value,
+            p0_vel_reset=self.get_parameter('servo.kalman_p0_vel_reset').value,
         )
 
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.
@@ -311,6 +358,8 @@ class RobotControlNode(Node, TaskExecutor):
                 poll_hz=self.get_parameter('safety.external_torque.direct_poll_hz').value,
                 reset_below_count=self.get_parameter(
                     'safety.external_torque.direct_reset_below_count').value,
+                stop_join_timeout_s=self.get_parameter(
+                    'safety.external_torque.stop_join_timeout_s').value,
             )
             self._drfl_force_monitor.start()
         except Exception as exc:

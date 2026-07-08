@@ -784,6 +784,21 @@ def test_validate_servo_command_accepts_within_limits(node):
     assert node._validate_servo_command(cmd) is True
 
 
+def test_servo_loop_wires_innovation_and_kalman_params_from_ros_params(node):
+    assert node.servo_loop.innov_low == node.get_parameter('servo.innov_low').value
+    assert node.servo_loop.innov_high == node.get_parameter('servo.innov_high').value
+    assert node.servo_loop.w_alpha == node.get_parameter('servo.w_alpha').value
+    assert node.servo_loop.z_close == node.get_parameter('servo.z_close').value
+    assert node.servo_loop.diverge_n == node.get_parameter('servo.diverge_n').value
+    assert node.servo_loop.cov_threshold == node.get_parameter('servo.cov_threshold').value
+    assert node.servo_loop._filter.q_pos == node.get_parameter('servo.kalman_q_pos').value
+    assert node.servo_loop._filter.q_vel == node.get_parameter('servo.kalman_q_vel').value
+    assert node.servo_loop._filter.r_xy == node.get_parameter('servo.kalman_r_xy').value
+    assert node.servo_loop._filter.r_z == node.get_parameter('servo.kalman_r_z').value
+    assert (node.servo_loop._filter.p0_vel_reset
+            == node.get_parameter('servo.kalman_p0_vel_reset').value)
+
+
 # ---- servo_pick ----
 
 def test_servo_pick_tick_continue(node):

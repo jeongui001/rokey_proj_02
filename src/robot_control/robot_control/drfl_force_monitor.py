@@ -23,7 +23,8 @@ class DrflForceMonitor:
     """
 
     def __init__(self, lib_path, robot_ip, robot_port, thresholds_nm,
-                 on_triggered, poll_hz=100.0, reset_below_count=20):
+                 on_triggered, poll_hz=100.0, reset_below_count=20,
+                 stop_join_timeout_s=2.0):
         if len(thresholds_nm) != 6:
             raise ValueError('thresholds_nm은 관절 6개 값이어야 합니다.')
         if poll_hz <= 0:
@@ -33,6 +34,7 @@ class DrflForceMonitor:
         self._on_triggered = on_triggered
         self._interval = 1.0 / float(poll_hz)
         self._reset_below_count = max(1, int(reset_below_count))
+        self._stop_join_timeout_s = float(stop_join_timeout_s)
         self._stop_event = threading.Event()
         self._thread = None
         self._ctrl = None
@@ -63,7 +65,7 @@ class DrflForceMonitor:
     def stop(self):
         self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=self._stop_join_timeout_s)
             self._thread = None
         if self._ctrl is not None:
             try:
