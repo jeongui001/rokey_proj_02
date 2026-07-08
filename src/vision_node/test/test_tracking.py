@@ -59,10 +59,12 @@ def test_tracker_first_frame_uses_highest_score_and_zero_velocity():
     def reconstruct(cx, cy):
         return (cx / 100.0, cy / 100.0, 0.05, True)
 
-    position, velocity, depth_valid = tracker.update(dets, 'spanner', reconstruct, stamp=0.0)
+    position, velocity, depth_valid, chosen_det = tracker.update(
+        dets, 'spanner', reconstruct, stamp=0.0)
     assert position == pytest.approx((0.25, 0.25, 0.05))
     assert velocity == pytest.approx((0.0, 0.0))
     assert depth_valid is True
+    assert chosen_det is dets[1]  # 최고 score 검출의 원본이 그대로 돌아와야 한다
 
 
 def test_tracker_second_frame_estimates_velocity():
@@ -71,7 +73,7 @@ def test_tracker_second_frame_estimates_velocity():
     dets2 = [FakeDetection('spanner', 0.9, 0, 0, 0, 0)]
 
     tracker.update(dets1, 'spanner', lambda cx, cy: (0.0, 0.0, 0.05, True), stamp=0.0)
-    position, velocity, _ = tracker.update(
+    position, velocity, _, _ = tracker.update(
         dets2, 'spanner', lambda cx, cy: (0.1, 0.0, 0.05, True), stamp=1.0)
 
     assert position[0] == pytest.approx(0.1, abs=1e-6)
@@ -82,7 +84,7 @@ def test_tracker_holds_last_valid_z_when_depth_invalid():
     tracker = ToolTracker()
     tracker.update([FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
                     lambda cx, cy: (0.0, 0.0, 0.05, True), stamp=0.0)
-    position, _, depth_valid = tracker.update(
+    position, _, depth_valid, _ = tracker.update(
         [FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
         lambda cx, cy: (0.1, 0.0, 999.0, False), stamp=0.1)
     assert depth_valid is False
@@ -102,5 +104,6 @@ def test_tracker_picks_nearest_candidate_to_previous_position():
     def reconstruct(cx, cy):
         return (1.0, 0.0, 0.05, True) if cx == 100 else (0.01, 0.0, 0.05, True)
 
-    position, _, _ = tracker.update(dets, 'spanner', reconstruct, stamp=0.1)
+    position, _, _, chosen_det = tracker.update(dets, 'spanner', reconstruct, stamp=0.1)
     assert position[0] == pytest.approx(0.01, abs=1e-3)
+    assert chosen_det is dets[1]  # 최근접 후보의 원본 검출이 돌아와야 한다

@@ -77,8 +77,10 @@ class ToolTracker:
         3D로 복원하는 함수. vision_node.py가 depth 이미지·intrinsics·tf를 클로저로
         캡처해서 넘겨준다(이 파일은 ROS 타입을 몰라도 되게 하기 위한 분리).
 
-        반환: (position, velocity, depth_valid) 또는 이번 프레임에 tool_class와
-        일치하는 검출이 하나도 없으면 None.
+        반환: (position, velocity, depth_valid, chosen_det) 또는 이번 프레임에
+        tool_class와 일치하는 검출이 하나도 없으면 None. chosen_det은 선택된 원본
+        검출(Detection2D) - 호출측이 그 bbox로 depth ROI를 잘라 장축(yaw)을 계산하는
+        데 쓴다.
         """
         # 1. 원하는 클래스의 검출만 후보로 추림
         candidates = [d for d in detections if d.class_name == tool_class]
@@ -92,18 +94,18 @@ class ToolTracker:
             cy = (d.y1 + d.y2) / 2.0
             r = reconstruct_fn(cx, cy)
             if r is not None:
-                reconstructed.append((r, d.score))
+                reconstructed.append((r, d.score, d))
         if not reconstructed:
             return None
 
         # 3. 후보 선택: 이전 추정이 없으면(첫 프레임) 최고 score, 있으면 최근접 매칭
         if self.position is None:
-            chosen, _ = max(reconstructed, key=lambda item: item[1])
+            chosen, _, chosen_det = max(reconstructed, key=lambda item: item[1])
         else:
             def dist(item):
                 r = item[0]
                 return math.dist((r[0], r[1], r[2]), self.position)
-            chosen, _ = min(reconstructed, key=dist)
+            chosen, _, chosen_det = min(reconstructed, key=dist)
 
         # 4. depth 무효 구간: z는 마지막 유효값으로 고정(전체 계획.md 2.7절)
         x, y, z, depth_valid = chosen
@@ -112,7 +114,8 @@ class ToolTracker:
         elif self.last_valid_z is not None:
             z = self.last_valid_z
 
-        return self._filter_update(x, y, z, depth_valid, stamp)
+        position, velocity, depth_valid = self._filter_update(x, y, z, depth_valid, stamp)
+        return position, velocity, depth_valid, chosen_det
 
     def _filter_update(self, x, y, z, depth_valid, stamp):
         """알파-베타 필터 한 스텝: 위치는 alpha로, 속도는 beta로 각각 스무딩."""
