@@ -358,7 +358,7 @@ class TaskExecutor:
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
         if not all(math.isfinite(v) for v in values):
             return False
-        tol = 1e-6
+        tol = self.get_parameter('servo.command_validate_tolerance').value
         v_max = abs(self.get_parameter('servo.v_max').value)
         descend_speed = abs(self.get_parameter('servo.descend_speed').value)
         if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol:
@@ -402,7 +402,9 @@ class TaskExecutor:
                     self.get_parameter(f'{accel_param_prefix}.watchdog_timeout_s').value),
                 on_timeout=lambda: self._doosan.publish_speedl(
                     ServoCommand(), accel_param_prefix=accel_param_prefix,
-                    period_param_name=period_parameter))
+                    period_param_name=period_parameter),
+                poll_interval_s=float(
+                    self.get_parameter(f'{accel_param_prefix}.watchdog_poll_interval_s').value))
             subscription = self.create_subscription(
                 message_type, topic, callback, 10,
                 callback_group=self.sensor_callback_group)
