@@ -1451,7 +1451,7 @@ def test_check_trigger_rejects_different_tool(node):
     _configure_trigger_params(node)
     node.current_tool = 'spanner'
 
-    assert node._check_trigger(_fresh_tool_track(node, tool_class='driver')) is False
+    assert node._check_trigger(_fresh_tool_track(node, tool_class='screw_driver')) is False
 
 
 def test_check_trigger_rejects_no_current_tool(node):

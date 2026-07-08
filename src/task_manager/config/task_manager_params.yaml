@@ -28,14 +28,14 @@
 
     # 공구별 grasp spec. width_mm/force_n은 servo_pick goal에 실제로 실어 보내는 값,
     # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위다.
-    # command_parser.py의 _TOOL_KEYWORDS 값과 반드시 일치해야 한다:
-    # water_bottle, spanner, driver, wrench, pliers, hammer.
+    # command_parser.py의 _TOOL_KEYWORDS 값(=YOLO 학습 클래스명)과 반드시 일치해야
+    # 한다: bottle, spanner, screw_driver, wrench, pliers, hammer.
     #
     # width_mm=80.0/force_n=30.0은 모든 공구에 우선 동일하게 적용한 테스트값이다
     # (공구 장난감류는 조건이 넉넉하지만, 500ml 물병을 기준으로 필요한 폭/힘에 맞춤).
     # verify_min/max_width_mm은 아직 미확정이라 -1.0으로 남겨뒀다.
     tools:
-      water_bottle:
+      bottle:
         width_mm: 80.0
         force_n: 30.0
         verify_min_width_mm: -1.0    # TODO(캘리브레이션 필요, mm)
@@ -45,7 +45,7 @@
         force_n: 30.0
         verify_min_width_mm: -1.0
         verify_max_width_mm: -1.0
-      driver:
+      screw_driver:
         # width_mm은 "닫힐 때 목표 폭"이다(RG2Client.close 참고) - 물체(드라이버
         # 손잡이)보다 넓으면 물체에 닿기도 전에 목표 폭에서 멈춰 grip_detected=False가
         # 된다(실기에서 80mm으로 이 문제 확인됨). 손잡이보다 확실히 좁은 값(거의
