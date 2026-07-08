@@ -1,0 +1,8 @@
+# stt_node 음성 명령 인식(웨이크워드 + OpenAI STT)에 필요한 pip 의존성.
+openwakeword     # 로컬/무료 웨이크워드 감지("헬로 로키", resource/hello_rokey_8332_32.tflite)
+pyaudio          # 웨이크워드 감지용 마이크 연속 스트림 캡처
+sounddevice      # 웨이크워드 감지 후 고정 구간 명령 녹음
+scipy            # WAV 저장(scipy.io.wavfile) + 리샘플링(48kHz -> 16kHz)
+numpy            # 오디오 버퍼 처리
+openai           # 녹음된 명령을 텍스트로 변환(whisper-1 API)
+python-dotenv    # resource/.env에서 OPENAI_API_KEY 로드

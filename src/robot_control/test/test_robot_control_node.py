@@ -749,14 +749,184 @@ def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
     assert result.success is False
 
 
-def test_execute_handover_approach_returns_not_implemented_when_gates_pass(node):
+def test_execute_handover_approach_dry_run_succeeds(node):
+    # hardware_enabled=False(기본) - hand_pose 없이도 흐름만 검증하고 바로 도착 처리.
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+def test_execute_handover_approach_dry_run_canceled(node, monkeypatch):
+    import time as time_module
+    node.set_parameters([Parameter('move.dry_run_duration_s', value=1.0)])
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    def fake_sleep(_s):
+        gh.is_cancel_requested = True
+
+    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.was_canceled is True
+    assert result.success is False
+
+
+def _make_hand_pose(x, y, z, frame_id='base_link'):
+    msg = PoseStamped()
+    msg.header.frame_id = frame_id
+    msg.pose.position.x = x
+    msg.pose.position.y = y
+    msg.pose.position.z = z
+    msg.pose.orientation.w = 1.0
+    return msg
+
+
+def _enable_handover_approach_hardware(node):
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('handover_approach.hardware_ready', value=True)])
+
+
+def test_execute_handover_approach_moves_toward_hand_and_stops_short(node, monkeypatch):
+    import time as time_module
+    _enable_handover_approach_hardware(node)
+    move_calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [0.0, 0.0, 0.0, 10.0, 20.0, 30.0]  # mm, deg
+
+        def move_line(self, goal_handle, pos6, vel2, acc2, **kwargs):
+            move_calls.append(pos6)
+            return True
+
+    node._doosan = _FakeDoosan()
+    hand_pose = _make_hand_pose(1.0, 0.0, 0.0)  # 손이 base_link 기준 +x 1m
+
+    def fake_sleep(_s):
+        node._pending_hand_pose = hand_pose
+
+    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert len(move_calls) == 1
+    target = move_calls[0]
+    # stop_distance_m(기본 5cm)만큼 못 미친 지점 = x=0.95m=950mm
+    assert target[0] == pytest.approx(950.0)
+    assert target[1] == pytest.approx(0.0)
+    assert target[2] == pytest.approx(0.0)
+    assert list(target[3:6]) == [10.0, 20.0, 30.0]  # 방향각은 현재 TCP 방향 그대로 유지
+    assert node._pending_hand_pose is None  # 사용 후 슬롯 정리됨
+
+
+def test_execute_handover_approach_arrives_without_moving_when_already_close(node, monkeypatch):
+    import time as time_module
+    _enable_handover_approach_hardware(node)
+    move_calls = []
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [0.0] * 6
+
+        def move_line(self, *a, **k):
+            move_calls.append(True)
+            return True
+
+    node._doosan = _FakeDoosan()
+    hand_pose = _make_hand_pose(0.02, 0.0, 0.0)  # stop_distance_m(기본 5cm)보다 가까움
+
+    def fake_sleep(_s):
+        node._pending_hand_pose = hand_pose
+
+    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert move_calls == []
+
+
+def test_execute_handover_approach_aborts_on_hand_pose_timeout(node, monkeypatch):
+    import time as time_module
+    _enable_handover_approach_hardware(node)
+    node.set_parameters([Parameter('handover_approach.timeout_s', value=0.0)])
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [0.0] * 6
+
+        def move_line(self, *a, **k):
+            return True
+
+    node._doosan = _FakeDoosan()
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
     gh = FakeGoalHandle(_goal('handover_approach'))
 
     result = node._execute_handover_approach(gh)
 
     assert gh.aborted is True
     assert result.success is False
-    assert result.message == 'handover_approach not yet implemented'
+    assert 'timeout' in result.message.lower()
+
+
+def test_execute_handover_approach_aborts_on_frame_id_mismatch(node, monkeypatch):
+    import time as time_module
+    _enable_handover_approach_hardware(node)
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [0.0] * 6
+
+        def move_line(self, *a, **k):
+            return True
+
+    node._doosan = _FakeDoosan()
+    bad_pose = _make_hand_pose(1.0, 0.0, 0.0, frame_id='camera_link')
+
+    def fake_sleep(_s):
+        node._pending_hand_pose = bad_pose
+
+    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+
+
+def test_execute_handover_approach_canceled_while_waiting_for_hand_pose(node, monkeypatch):
+    import time as time_module
+    _enable_handover_approach_hardware(node)
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [0.0] * 6
+
+        def move_line(self, *a, **k):
+            return True
+
+    node._doosan = _FakeDoosan()
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    def fake_sleep(_s):
+        gh.is_cancel_requested = True
+
+    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.was_canceled is True
+    assert result.success is False
 
 
 # ---- SpeedlStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----

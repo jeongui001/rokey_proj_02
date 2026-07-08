@@ -172,10 +172,17 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('handover_approach.hardware_ready', False)
         # 사용자가 지정한 접근 정지 거리(5cm) - 실측 협의값.
         self.declare_parameter('handover_approach.stop_distance_m', 0.05)
+        # hand_pose 수신 대기 타임아웃 - movel 서비스 자체의 왕복 타임아웃(move.timeout_s)과는
+        # 별개로, "메시지가 아예 안 온다"를 감지하기 위한 것이다.
         self.declare_parameter('handover_approach.timeout_s', 10.0)
         # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
         # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
         self.declare_parameter('handover_approach.hand_pose_frame_id', 'base_link')
+        # movel 이동 속도 - 사람에게 접근하는 동작이라 실측 전까지 보수적으로 낮게 둔다
+        # (named pose 이동인 move.vel_deg_s=30deg/s보다 훨씬 느린 속도). hardware_ready가
+        # 기본 false로 게이트되어 있어 실측/검증 전에는 어차피 실제 명령이 나가지 않는다.
+        self.declare_parameter('handover_approach.vel_mm_s', 30.0)
+        self.declare_parameter('handover_approach.acc_mm_s2', 100.0)
 
         self.hardware_enabled = bool(self.get_parameter('hardware_enabled').value)
         self.safety_monitor = SafetyMonitor(self)
@@ -236,6 +243,9 @@ class RobotControlNode(Node, TaskExecutor):
         # 서비스 호출을 하지 않기 위함).
         self._tcp_pose_cache = None
         self._tcp_pose_request_in_flight = False
+        # handover_approach가 /vision/hand_pose 1개를 받을 때까지 임시로 채워두는
+        # 슬롯 (_on_hand_pose_received/_wait_for_hand_pose 참고).
+        self._pending_hand_pose = None
         # servo_pick 또는 handover_approach가 실제로 실행 중일 때만 TCP 위치를
         # 갱신한다 - 불필요한 조회로 executor 스레드를 낭비하거나 안전상태 polling을
         # 지연시키지 않기 위함이다.

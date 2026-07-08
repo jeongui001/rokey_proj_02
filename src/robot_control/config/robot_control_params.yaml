@@ -73,12 +73,17 @@
       # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
       # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
 
-    # handover_safe 도착 후 작업자 손(/vision/hand_pose)에 접근 - 실제 접근 로직
-    # (movel 기반 단발성 이동)은 아직 구현 전이라 TODO 스텁 상태다.
+    # handover_safe 도착 후 작업자 손(/vision/hand_pose)에 접근 - movel 기반 단발성
+    # 이동(재계산 없음)으로 구현되어 있다. vision_node._track_hand가 아직 hand_pose를
+    # 발행하지 않는 동안에는 timeout_s 안에 메시지가 안 와서 ABORT로 끝난다(정상 fail-closed).
     handover_approach:
       hand_pose_frame_id: 'base_link'
       stop_distance_m: 0.05  # 사용자 확정값(5cm)
       timeout_s: 10.0
+      # movel 이동 속도 - 실측값이 없는 상태라 사람에게 접근하는 동작이므로 보수적으로
+      # 낮게 잡은 기본값이다(named pose 이동보다 훨씬 느림). 실측 후 조정 필요.
+      vel_mm_s: 30.0
+      acc_mm_s2: 100.0
       # hardware_ready는 vision_node._track_hand가 구현·검증되기 전까지 반드시
       # false로 유지한다(hand_pose의 frame_id/orientation 의미가 아직 미확정).
       # 기본값은 코드의 declare_parameter에 있으며 실수로 true를 적지 않기 위해

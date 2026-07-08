@@ -46,14 +46,11 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 값이며, 이 자체가 state/detail을 바꾸지는 않는다 (_on_status_publish_timer).
         self.declare_parameter('status_publish_period_s', 1.0)
 
-        # AUTO 설정 준비 게이트 - false(기본값)면 AUTO 모드 전환 자체는 되지만
+        # AUTO 설정 준비 게이트 - false(기본값)면 AUTO/MANUAL 모드 어느 쪽에서도
         # 실제 물체 가져오기 goal은 보내지 않는다 (_handle_fetch_tool 참고).
+        # fetch_tool 자체는 AUTO/MANUAL 모드 구분 없이 동작한다 - MANUAL은 여기에
+        # 개별 이동 명령(_handle_manual_move)을 추가로 더 허용할 뿐이다.
         self.declare_parameter('auto.config_ready', False)
-
-        # 임시 테스트 전용 게이트 - true일 때만 MANUAL 모드에서도 fetch_tool 명령을
-        # 허용한다(_handle_fetch_tool 참고). 기본값 false에서는 기존과 동일하게
-        # AUTO 모드에서만 공구 전달 명령이 동작한다.
-        self.declare_parameter('test_mode.allow_manual_fetch', False)
 
         # DETECT_TRACK 트리거 조건. 실제 캘리브레이션 전에는 -1/빈 문자열(미설정)로
         # 두어 _check_trigger가 항상 False를 반환하도록 한다 (fail-closed).
