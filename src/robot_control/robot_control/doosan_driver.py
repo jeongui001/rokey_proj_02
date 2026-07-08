@@ -225,9 +225,15 @@ class DoosanDriver:
         # accel_param_prefix/period_param_name으로 호출자(servo_pick 또는
         # handover_approach)에 맞는 자신의 파라미터를 쓴다 - 예전에는 항상
         # servo_pick 것만 썼던 교차배선을 여기서 바로잡는다.
+        #
+        # command.vx/vy/vz는 ServoLoop 내부 단위인 m/s이지만, SpeedlStream.vel의
+        # 병진 성분은 mm/s다 - speedl_acc_trans_mm_s2(가속도)와 동일한 mm 기반
+        # 관례이며, tools/probe_speedl_stream.py로 실기에서 mm/s 가정이 적당한
+        # 속도로 확인됐다(2026-07-08). 여기서 1000배 변환한다.
         message = self._SpeedlStream()
         message.vel = [
-            command.vx, command.vy, command.vz, 0.0, 0.0, command.yaw_rate]
+            command.vx * 1000.0, command.vy * 1000.0, command.vz * 1000.0,
+            0.0, 0.0, command.yaw_rate]
         message.acc = [
             self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_trans_mm_s2').value,
             self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_rot_deg_s2').value]
