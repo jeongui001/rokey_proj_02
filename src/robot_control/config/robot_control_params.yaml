@@ -59,10 +59,10 @@
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
       timeout: 5.0              # 서보 전체 타임아웃(s)
       t_lost: 0.3               # 추적 유실 판정 시간(s)
-      innov_low: 0.010   # 이 잔차 이하 -> w=1(피드포워드 완전 신뢰)
-      innov_high: 0.040  # 이 잔차 이상 -> w=0 + 속도 공분산 리셋
+      innov_low: 0.010   # 이 잔차(m) 이하 -> w=1(피드포워드 완전 신뢰)
+      innov_high: 0.040  # 이 잔차(m) 이상 -> w=0 + 속도 공분산 리셋
       w_alpha: 0.3        # w의 저역통과 스무딩 계수
-      z_close: 0.02       # 폐합 판정 z_gap 임계
+      z_close: 0.02       # 폐합 판정 z_gap(m) 임계
       diverge_n: 5        # 발산 판정에 볼 연속 오차 개수
       cov_threshold: 0.05 # 폐합 판정용 속도 공분산 임계
       kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
