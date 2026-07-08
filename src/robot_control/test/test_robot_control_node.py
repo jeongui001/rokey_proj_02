@@ -543,12 +543,11 @@ def test_tf_broadcast_timer_skips_cache_update_when_servo_pick_not_active(node):
             return [1.0] * 6
 
     node._doosan = _FakeDoosan()
-    node._tf_broadcaster.sendTransform = lambda msg: None
     node._tcp_tracking_active = False
 
     node._on_tf_broadcast_timer()
 
-    assert node._tcp_pose_cache is None  # TF는 방송되지만 TCP 캐시는 갱신 안 됨
+    assert node._tcp_pose_cache is None  # servo_pick이 활성화되지 않으면 캐시는 갱신 안 됨
 
 
 def test_tf_broadcast_timer_skips_cache_update_when_not_normal(node):
@@ -559,7 +558,6 @@ def test_tf_broadcast_timer_skips_cache_update_when_not_normal(node):
             return [1.0] * 6
 
     node._doosan = _FakeDoosan()
-    node._tf_broadcaster.sendTransform = lambda msg: None
     node._tcp_tracking_active = True
     node.safety_state = SafetyState.FAULT
 
@@ -576,7 +574,6 @@ def test_tf_broadcast_timer_updates_cache_on_success(node):
             return [10.0, 20.0, 30.0, 0.0, 0.0, 0.0]
 
     node._doosan = _FakeDoosan()
-    node._tf_broadcaster.sendTransform = lambda msg: None
     node._tcp_tracking_active = True
 
     node._on_tf_broadcast_timer()
@@ -609,8 +606,7 @@ def test_tf_broadcast_timer_does_not_reuse_stale_value_after_failed_lookup(node)
 
 def test_tf_broadcast_timer_serializes_overlapping_requests(node):
     # servo_pick 실행 중 타이머가 재진입해도 이미 요청이 진행 중이면 새
-    # GetCurrentPosx 호출을 겹쳐서 시작하지 않는다(TF 방송분도 포함해 하나의
-    # 스트림이므로 여기서 겹치지 않으면 TCP 캐시/TF 방송 모두 안전하다).
+    # GetCurrentPosx 호출을 겹쳐서 시작하지 않는다.
     calls = []
 
     class _FakeDoosan:
@@ -622,7 +618,6 @@ def test_tf_broadcast_timer_serializes_overlapping_requests(node):
 
     node.hardware_enabled = True
     node._doosan = _FakeDoosan()
-    node._tf_broadcaster.sendTransform = lambda msg: None
     node._tcp_tracking_active = True
 
     node._on_tf_broadcast_timer()
@@ -2067,17 +2062,10 @@ def test_gripper_timer_publishes_state(node):
     assert published[0].grip_detected is True
 
 
-def test_tf_broadcast_timer_does_nothing_when_hardware_disabled(node):
-    # hardware_enabled 기본값은 False - 실제 자세가 없으니 방송하지 않는다.
-    published = []
-    node._tf_broadcaster.sendTransform = published.append
-
-    node._on_tf_broadcast_timer()
-
-    assert published == []
-
-
 def test_tf_broadcast_timer_does_nothing_when_posx_unavailable(node):
+    # base_link -> link_6 TF는 이제 이 노드가 방송하지 않는다(dsr_bringup2의
+    # robot_state_publisher가 담당) - GetCurrentPosx가 실패해도 TCP 캐시가
+    # None으로 유지되는지만 확인한다.
     node.hardware_enabled = True
 
     class _FakeDoosan:
@@ -2085,64 +2073,10 @@ def test_tf_broadcast_timer_does_nothing_when_posx_unavailable(node):
             return None
 
     node._doosan = _FakeDoosan()
-    published = []
-    node._tf_broadcaster.sendTransform = published.append
 
     node._on_tf_broadcast_timer()
 
-    assert published == []
-
-
-def test_tf_broadcast_timer_publishes_base_link_to_flange(node):
-    node.hardware_enabled = True
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [100.0, 200.0, 300.0, 10.0, 20.0, 30.0]  # mm, ZYZ deg
-
-    node._doosan = _FakeDoosan()
-    published = []
-    node._tf_broadcaster.sendTransform = published.append
-
-    node._on_tf_broadcast_timer()
-
-    assert len(published) == 1
-    msg = published[0]
-    assert msg.header.frame_id == 'base_link'
-    assert msg.child_frame_id == 'link_6'
-    # mm -> m 변환 확인
-    assert msg.transform.translation.x == pytest.approx(0.1)
-    assert msg.transform.translation.y == pytest.approx(0.2)
-    assert msg.transform.translation.z == pytest.approx(0.3)
-    # 단위 쿼터니언인지만 확인 (구체적 회전값은 scipy 변환에 위임)
-    quat_norm = (
-        msg.transform.rotation.x ** 2 + msg.transform.rotation.y ** 2
-        + msg.transform.rotation.z ** 2 + msg.transform.rotation.w ** 2)
-    assert quat_norm == pytest.approx(1.0, abs=1e-6)
-
-
-def test_tf_broadcast_timer_skips_when_previous_call_still_in_flight(node):
-    """2026-07-08 실기 검증 중 발견한 스레드 고갈 버그의 회귀 테스트: 이전 GetCurrentPosx
-    응답을 기다리는 중이면 겹쳐서 새로 호출하지 않아야 한다(TF 방송과 TCP 캐시
-    갱신이 이제 이 타이머 하나로 합쳐져 있으므로, 이 가드가 곧 둘 다를 보호한다)."""
-    node.hardware_enabled = True
-    node._tcp_pose_request_in_flight = True
-
-    calls = []
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            calls.append(1)
-            return [100.0, 200.0, 300.0, 10.0, 20.0, 30.0]
-
-    node._doosan = _FakeDoosan()
-    published = []
-    node._tf_broadcaster.sendTransform = published.append
-
-    node._on_tf_broadcast_timer()
-
-    assert calls == []
-    assert published == []
+    assert node._tcp_pose_cache is None
 
 
 def test_state_poll_timer_silent_when_no_fault(node):
