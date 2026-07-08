@@ -2046,6 +2046,60 @@ def test_gripper_timer_publishes_state(node):
     assert published[0].grip_detected is True
 
 
+def test_tf_broadcast_timer_does_nothing_when_hardware_disabled(node):
+    # hardware_enabled 기본값은 False - 실제 자세가 없으니 방송하지 않는다.
+    published = []
+    node._tf_broadcaster.sendTransform = published.append
+
+    node._on_tf_broadcast_timer()
+
+    assert published == []
+
+
+def test_tf_broadcast_timer_does_nothing_when_posx_unavailable(node):
+    node.hardware_enabled = True
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return None
+
+    node._doosan = _FakeDoosan()
+    published = []
+    node._tf_broadcaster.sendTransform = published.append
+
+    node._on_tf_broadcast_timer()
+
+    assert published == []
+
+
+def test_tf_broadcast_timer_publishes_base_link_to_flange(node):
+    node.hardware_enabled = True
+
+    class _FakeDoosan:
+        def get_current_posx(self, ref=0):
+            return [100.0, 200.0, 300.0, 10.0, 20.0, 30.0]  # mm, ZYZ deg
+
+    node._doosan = _FakeDoosan()
+    published = []
+    node._tf_broadcaster.sendTransform = published.append
+
+    node._on_tf_broadcast_timer()
+
+    assert len(published) == 1
+    msg = published[0]
+    assert msg.header.frame_id == 'base_link'
+    assert msg.child_frame_id == 'flange'
+    # mm -> m 변환 확인
+    assert msg.transform.translation.x == pytest.approx(0.1)
+    assert msg.transform.translation.y == pytest.approx(0.2)
+    assert msg.transform.translation.z == pytest.approx(0.3)
+    # 단위 쿼터니언인지만 확인 (구체적 회전값은 scipy 변환에 위임)
+    quat_norm = (
+        msg.transform.rotation.x ** 2 + msg.transform.rotation.y ** 2
+        + msg.transform.rotation.z ** 2 + msg.transform.rotation.w ** 2)
+    assert quat_norm == pytest.approx(1.0, abs=1e-6)
+
+
 def test_state_poll_timer_silent_when_no_fault(node):
     node._read_robot_state = lambda: {
         'robot_state': DoosanRobotState.STANDBY, 'ext_torque': [0.0] * 6, 'tool_force': [0.0] * 6}

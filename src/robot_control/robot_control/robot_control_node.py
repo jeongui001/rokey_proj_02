@@ -1,6 +1,7 @@
 import threading
 
 import rclpy
+from geometry_msgs.msg import TransformStamped
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -8,6 +9,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
+from tf2_ros import TransformBroadcaster
 
 from handover_interfaces.action import RobotTask
 from handover_interfaces.msg import GripperState
@@ -133,6 +135,15 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('safety.debug_log_tool_force', False)
         self.declare_parameter('gripper_poll_period_s', 0.5)
 
+        # base_link -> flange TF를 계속 방송한다 - vision_node/tool_detection_node가
+        # "이미지가 찍힌 시각의 로봇 자세"를 tf2로 조회할 수 있게 하기 위함이다
+        # (로봇이 이동 중이어도 검출 시점의 좌표를 얻을 수 있음). flange 이후
+        # (flange -> camera_link 등)는 각 카메라 노드가 자신의 hand-eye 캘리브레이션으로
+        # 별도 방송/계산한다 - 여기서는 로봇 자세만 책임진다.
+        self.declare_parameter('tf_broadcast.period_s', 0.02)
+        self.declare_parameter('tf_broadcast.parent_frame_id', 'base_link')
+        self.declare_parameter('tf_broadcast.child_frame_id', 'flange')
+
         # servo_pick 실제 하드웨어 실행을 위한 별도 게이트. hardware_enabled=true여도
         # 이 값이 false면 servo_pick Goal 자체를 거부한다 (기본값 false).
         # 이유: 현재 ToolTrack.pose는 base_link 절대좌표로 정의되어 있는데
@@ -216,6 +227,7 @@ class RobotControlNode(Node, TaskExecutor):
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.
         self.pub_gripper_state = self.create_publisher(GripperState, '/gripper/state', 10)
         self.pub_fault = self.create_publisher(String, '/robot/fault', 10)
+        self._tf_broadcaster = TransformBroadcaster(self)
 
         self._init_doosan_driver()
 
@@ -253,6 +265,9 @@ class RobotControlNode(Node, TaskExecutor):
         self._gripper_timer = self.create_timer(
             self.get_parameter('gripper_poll_period_s').value,
             self._on_gripper_timer, callback_group=self.sensor_callback_group)
+        self._tf_broadcast_timer = self.create_timer(
+            self.get_parameter('tf_broadcast.period_s').value,
+            self._on_tf_broadcast_timer, callback_group=self.sensor_callback_group)
         self._state_poll_timer = self.create_timer(
             self.get_parameter('safety.state_poll_period_s').value,
             self._on_state_poll_timer, callback_group=self.sensor_callback_group)
@@ -425,6 +440,34 @@ class RobotControlNode(Node, TaskExecutor):
         msg.width_mm = width_mm
         msg.grip_detected = grip_detected
         self.pub_gripper_state.publish(msg)
+
+    def _on_tf_broadcast_timer(self):
+        """base_link -> flange TF를 방송한다. 로봇이 이동 중에도 vision_node/
+        tool_detection_node가 "이미지가 찍힌 시각"의 로봇 자세를 tf2로 조회할 수
+        있게 하기 위함이다(그 뒤 flange -> camera_link는 각 카메라 노드의
+        hand-eye 캘리브레이션이 별도로 책임진다). dry-run(hardware_enabled=false)
+        에서는 실제 자세가 없으므로 방송하지 않는다."""
+        if not self.hardware_enabled or self._doosan is None:
+            return
+        pos6 = self._doosan.get_current_posx(ref=0)
+        if pos6 is None:
+            return
+        from scipy.spatial.transform import Rotation  # dry-run에서는 필요 없는 지연 임포트
+        x_mm, y_mm, z_mm, a_deg, b_deg, c_deg = pos6
+        quat = Rotation.from_euler('ZYZ', [a_deg, b_deg, c_deg], degrees=True).as_quat()
+
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.get_parameter('tf_broadcast.parent_frame_id').value
+        msg.child_frame_id = self.get_parameter('tf_broadcast.child_frame_id').value
+        msg.transform.translation.x = x_mm / 1000.0
+        msg.transform.translation.y = y_mm / 1000.0
+        msg.transform.translation.z = z_mm / 1000.0
+        msg.transform.rotation.x = float(quat[0])
+        msg.transform.rotation.y = float(quat[1])
+        msg.transform.rotation.z = float(quat[2])
+        msg.transform.rotation.w = float(quat[3])
+        self._tf_broadcaster.sendTransform(msg)
 
     # ---- /robot/recover ----
 

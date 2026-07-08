@@ -135,6 +135,25 @@ def posx_to_matrix(posx):
     return T
 
 
+def quat_translation_to_matrix(translation, quaternion):
+    """translation=(x,y,z), quaternion=(x,y,z,w) -> 4x4 변환행렬.
+
+    tf2 TransformStamped(geometry_msgs.msg.Transform)의 translation/rotation을
+    그대로 뽑아 넘기면, posx_to_matrix 등 이 모듈의 다른 4x4 행렬과 그대로
+    행렬곱(@)할 수 있는 형태로 바꿔준다. tracking.py에도 비슷한 변환이 있지만
+    그쪽은 중첩 리스트를 쓰고 이 모듈은 numpy를 쓰므로(posx_to_matrix와 맞춰
+    행렬곱하기 위해) 별도로 둔다."""
+    x, y, z, w = quaternion
+    T = np.eye(4)
+    T[:3, :3] = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+    T[:3, 3] = translation
+    return T
+
+
 def yaw_deg_to_quaternion(yaw_deg):
     """Z축 회전 yaw(deg) -> 쿼터니언 (x, y, z, w)."""
     half = np.deg2rad(yaw_deg) / 2.0

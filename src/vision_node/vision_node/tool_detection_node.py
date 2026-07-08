@@ -19,12 +19,14 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
+from tf2_ros import Buffer, TransformException, TransformListener
 
 from handover_interfaces.msg import Detection2D, DetectionArray, ToolTrack
 
 from vision_node.grasp_geometry import (
-    AxisSmoother, is_bbox_at_edge, patch_median_depth, posx_to_matrix,
+    AxisSmoother, is_bbox_at_edge, patch_median_depth, quat_translation_to_matrix,
     tool_axis_from_depth, yaw_deg_to_quaternion,
 )
 
@@ -70,7 +72,6 @@ class ToolDetectionNode(Node):
         self.declare_parameter('hand_eye_path', _default_resource('T_gripper2camera.npy'))
         self.declare_parameter('conf', 0.25)
         self.declare_parameter('tool_class', '')       # ''=최고 score 검출 추적, 지정 시 그 클래스만
-        self.declare_parameter('watch_posx', [0.0])    # 관찰 자세 posx 6원소(mm, ZYZ deg). 기본(6원소 아님)=카메라 좌표 발행
         self.declare_parameter('yaw_depth_band_m', 0.008)  # 공구 윗면에서 이보다 깊은 픽셀은 벨트로 보고 제외
         self.declare_parameter('axis_smooth_alpha', 0.25)
         self.declare_parameter('depth_valid_min_ratio', 0.2)  # 패치 유효 비율이 이 미만이면 depth_valid=False
@@ -82,17 +83,22 @@ class ToolDetectionNode(Node):
         self.valid_min_ratio = self.get_parameter('depth_valid_min_ratio').value
         self.show_window = self.get_parameter('show_window').value
 
-        # base <- camera 변환 (단계 6과 동일): 6원소 posx가 주어졌을 때만 활성
-        watch_posx = list(self.get_parameter('watch_posx').value)
-        self.T_base2cam = None
-        if len(watch_posx) == 6:
-            T_g2c = np.load(self.get_parameter('hand_eye_path').value)
-            self.T_base2cam = posx_to_matrix(watch_posx) @ T_g2c
+        # base <- camera 변환: 고정된 관찰 자세(watch_posx) 대신, robot_control이 매
+        # 프레임 방송하는 TF(base_link -> flange)를 그때그때 조회해 hand-eye(T_gripper2cam)와
+        # 합성한다 - 로봇이 이동하며 검출해도(예: servo_pick 도중) 그 순간의 자세를 반영할
+        # 수 있다(_lookup_base_to_cam_matrix 참고). hand_eye_path 파일이 없으면(캘리브레이션
+        # 미완료) 카메라 좌표계로만 발행한다.
+        hand_eye_path = self.get_parameter('hand_eye_path').value
+        self.T_gripper2cam = None
+        if hand_eye_path and os.path.exists(hand_eye_path):
+            self.T_gripper2cam = np.load(hand_eye_path)
             self.frame_id = 'base_link'
-            self.get_logger().info(f'베이스 변환 활성: watch_posx={watch_posx}')
+            self.get_logger().info('베이스 변환 활성 - base_link -> flange는 매 프레임 TF로 조회')
         else:
             self.frame_id = 'camera_color_optical_frame'
-            self.get_logger().info('watch_posx 미설정 - 카메라 광학 좌표계(m)로 발행')
+            self.get_logger().info('hand_eye_path 미설정/파일 없음 - 카메라 광학 좌표계(m)로 발행')
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
 
         from ultralytics import YOLO  # import가 느려서(수 초) 노드 초기화 시점에 수행
         self.model = YOLO(self.get_parameter('model_path').value)
@@ -156,7 +162,8 @@ class ToolDetectionNode(Node):
 
         target_idx = self._pick_target_idx(detections)
         if target_idx is not None:
-            track = self._make_tool_track(detections[target_idx], infos[target_idx], stamp)
+            T_base2cam = self._lookup_base_to_cam_matrix(stamp)
+            track = self._make_tool_track(detections[target_idx], infos[target_idx], stamp, T_base2cam)
             if track is not None:
                 self.pub_tool_track.publish(track)
 
@@ -210,8 +217,38 @@ class ToolDetectionNode(Node):
             info['rect'] = rect
         return info
 
-    def _make_tool_track(self, det, info, stamp):
-        """검출 1건 + 사전 계산된 info -> ToolTrack. 단계 6(베이스 변환)을 수행한다."""
+    def _lookup_base_to_cam_matrix(self, stamp):
+        """base_link -> camera 변환행렬을 매 프레임 새로 계산한다.
+
+        robot_control이 방송하는 TF(base_link -> flange, "이미지가 찍힌 시각" 기준)를
+        조회해 저장된 hand-eye(flange -> camera, self.T_gripper2cam)와 합성한다 -
+        고정된 watch_posx 한 값 대신, 로봇이 이동 중에도 그 순간의 자세를 반영한다.
+
+        hand-eye가 아예 없으면(카메라 좌표계 모드) None. TF 조회가 실패하면(아직
+        robot_control이 안 떴거나 일시적 지연) 이번 프레임만 None - 호출측은 이 경우
+        base_link 좌표 발행을 건너뛰어야 한다(잘못된 frame_id로 잘못된 좌표를
+        내보내지 않기 위함)."""
+        if self.T_gripper2cam is None:
+            return None
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'base_link', 'flange', stamp, timeout=Duration(seconds=0.1))
+        except TransformException as ex:
+            self.get_logger().warn(
+                f'TF(base_link->flange) 조회 실패 - 이번 프레임은 3D 발행을 건너뜁니다: {ex}',
+                throttle_duration_sec=1.0)
+            return None
+        t, q = tf.transform.translation, tf.transform.rotation
+        T_base2flange = quat_translation_to_matrix((t.x, t.y, t.z), (q.x, q.y, q.z, q.w))
+        return T_base2flange @ self.T_gripper2cam
+
+    def _make_tool_track(self, det, info, stamp, T_base2cam):
+        """검출 1건 + 사전 계산된 info -> ToolTrack. 단계 6(베이스 변환)을 수행한다.
+
+        T_base2cam은 _lookup_base_to_cam_matrix가 이번 프레임에 대해 계산한 값이다
+        (카메라 좌표계 모드거나 이번 프레임 TF 조회에 실패하면 None)."""
+        if self.T_gripper2cam is not None and T_base2cam is None:
+            return None  # base_link 모드인데 이번 프레임 TF를 못 얻음 - 건너뜀
         z_m = info['z_m']
         depth_valid = z_m is not None and info['valid_ratio'] >= self.valid_min_ratio
 
@@ -236,14 +273,14 @@ class ToolDetectionNode(Node):
         track.depth_valid = bool(depth_valid)
         track.approaching = False  # 접근 판정은 속도 추정(정의 측 칼만) 통합 시 채움 - 흐름도 12
 
-        if self.T_base2cam is not None:
+        if T_base2cam is not None:
             # 카메라 좌표(m) -> mm로 바꿔 베이스 좌표계로 (hand-eye/posx가 mm 단위)
-            bx, by, bz, _ = self.T_base2cam @ np.array([X * 1000.0, Y * 1000.0, Z * 1000.0, 1.0])
+            bx, by, bz, _ = T_base2cam @ np.array([X * 1000.0, Y * 1000.0, Z * 1000.0, 1.0])
             track.pose.position.x, track.pose.position.y, track.pose.position.z = bx, by, bz
             if yaw_deg is not None:
                 # 그립축 방향벡터(이미지 평면)를 베이스 좌표계로 회전 (top-down 전제)
                 d_cam = np.array([np.cos(np.deg2rad(yaw_deg)), np.sin(np.deg2rad(yaw_deg)), 0.0])
-                d_base = self.T_base2cam[:3, :3] @ d_cam
+                d_base = T_base2cam[:3, :3] @ d_cam
                 yaw_deg = np.degrees(np.arctan2(d_base[1], d_base[0])) % 180
         else:
             track.pose.position.x, track.pose.position.y, track.pose.position.z = X, Y, Z
