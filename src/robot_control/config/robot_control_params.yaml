@@ -164,8 +164,10 @@
       # roboton(dsr_bringup2) 실행 인자에 맞춘 값이다 - 다른 환경이면 경로/IP를
       # 맞게 바꿔야 한다.
       external_torque:
-        # 다른 환경이면 이 PC의 cobot_ws 설치 경로에 맞게 반드시 변경해야 한다.
-        drfl_lib_path: '/home/youngjin/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
+        # '~'는 robot_control_node._init_drfl_force_monitor에서 os.path.expanduser로
+        # 실행 계정의 홈 디렉터리로 치환된다 - 사용자명을 하드코딩하지 않기 위함.
+        # cobot_ws 설치 경로 자체가 다른 환경이면 이 부분은 여전히 변경해야 한다.
+        drfl_lib_path: '~/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
         robot_ip: '192.168.1.100'  # M0609 실제 IP - roboton(dsr_bringup2) 실행 인자와 일치해야 함
         robot_port: 12345          # M0609 DRFL 포트
         direct_poll_hz: 100.0      # DRFL 직접 연결 외력 폴링 주파수(Hz)

@@ -1,3 +1,4 @@
+import os
 import threading
 
 import rclpy
@@ -362,7 +363,8 @@ class RobotControlNode(Node, TaskExecutor):
             thresholds = self.get_parameter(
                 'safety.external_torque.direct_threshold_nm').value
             self._drfl_force_monitor = DrflForceMonitor(
-                lib_path=self.get_parameter('safety.external_torque.drfl_lib_path').value,
+                lib_path=os.path.expanduser(
+                    self.get_parameter('safety.external_torque.drfl_lib_path').value),
                 robot_ip=self.get_parameter('safety.external_torque.robot_ip').value,
                 robot_port=int(self.get_parameter('safety.external_torque.robot_port').value),
                 thresholds_nm=thresholds,
