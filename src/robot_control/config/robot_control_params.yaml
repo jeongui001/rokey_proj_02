@@ -7,23 +7,23 @@
 # (robot_control_node._call_move_service 참고).
 /**:
   ros__parameters:
-    hardware_enabled: false  # 실제 M0609/RG2를 사용하려면 true로 명시적으로 설정
+    hardware_enabled: true  # 실제 M0609/RG2를 사용하려면 true로 명시적으로 설정
 
     robot_id: 'dsr01'  # launch의 namespace와 일치해야 함 (DoosanBootcamp 예제 관례)
 
-    rg2_ip: '192.168.1.1'
-    rg2_port: 502
-    rg2_gripper: 'rg2'
+    rg2_ip: '192.168.1.1'  # RG2 그리퍼 Modbus TCP IP - 실제 환경에 맞게 변경
+    rg2_port: 502  # RG2 그리퍼 Modbus TCP 포트
+    rg2_gripper: 'rg2'  # 그리퍼 모델('rg2' 또는 'rg6') - MAX_WIDTH_MM/MAX_FORCE_N 매핑에 사용
 
     # RG2 open/close 명령이 busy=0(완료)이 될 때까지 기다리는 통신 타임아웃/폴링
     # 주기 - 하드웨어 캘리브레이션 값이 아니라 통신 타이밍 설정이므로 보수적인
     # 기본값을 명시했다. 실기 환경에 맞게 조정 가능하다.
     rg2:
-      command_timeout_s: 5.0
-      poll_interval_s: 0.05
+      command_timeout_s: 5.0  # RG2 명령 완료(busy=0) 대기 타임아웃
+      poll_interval_s: 0.05   # busy 비트 확인 폴링 주기
       # open() 완료 후 최종 폭이 "최대 폭에 도달했다"고 참고로 판단할 때 허용할
       # 오차(mm) - 실측으로 확정된 값이 아니라 통신/기구적 오차를 감안한 여유값이다.
-      open_width_tolerance_mm: 2.0
+      open_width_tolerance_mm: 2.0 # 그리퍼를 최대로 열라 했는데 최대로 안여는 상황을 확인하기 위해 존재한다.
 
     # named_poses.<name>은 실측한 6축 관절각(degree)이 준비되면 여기에 주석을 풀고
     # 채워 넣는다. 빈 배열([])을 파라미터 override로 명시하면 rclpy가 배열 타입을
@@ -31,14 +31,12 @@
     # 값이 없는 named pose는 아예 이 파일에 키를 적지 않는다 - 코드 쪽 기본값([])이
     # 그대로 적용되며, 그 경우 해당 named pose로의 이동은 명확한 실패로 처리된다
     # (robot_control_node._call_move_service 참고).
-    #
-    # handover_safe: 작업대 전체가 보이는 자세 - handover_approach(/vision/hand_pose를
-    # 1회 수신해 movel로 단발 접근)의 출발점으로 쓰인다.
     named_poses:
-      home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]
-      front: [0.0, 0.0, 90.0, 0.0, 0.0, 0.0]
-      up: [0.0, 0.0, 90.0, 0.0, -90.0, 0.0]
+      home: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]  # 기본 대기 자세 - HOME 단계에서 복귀 지점
+      front: [0.0, 0.0, 90.0, 0.0, 0.0, 0.0]  # 정면 자세 - MANUAL_MOVE 전용(자동 파이프라인에서는 미사용)
+      up: [0.0, 0.0, 90.0, 0.0, -90.0, 0.0]   # 위쪽을 보는 자세 - MANUAL_MOVE 전용(자동 파이프라인에서는 미사용)
       down: [0.0, 0.0, 90.0, 0.0, 90.0, 0.0]  # home과 동일 자세로 확인됨(의도된 값)
+      # 감시 자세 - MOVE_TO_WATCH 단계(vision TRACK_TOOL 전환과 함께 사용).
       # base 좌표 기준(참고용, 실제로는 위 관절각이 사용됨):
       # [446.3, -215.69, 291.05, 52.87, 178.53, 51.69] (x,y,z mm / rx,ry,rz deg)
       watch: [-27.26, 21.12, 49.15, 1.69, 109.48, -28.31]
@@ -46,15 +44,56 @@
       # 305.78, 4.82, 141, -23.12])은 작업대 전체가 안 보이는 프레이밍이었다.
       handover_safe: [-0.06, -28.49, 93.99, -4.39, 91.0, 3.03]
 
+    # 칼만 ServoLoop(servo_loop.py) 게인/판정 임계값 - kp_xy 등은 원래부터 ROS
+    # 파라미터였고, innov_*/kalman_* 는 코드 상수였다가 같은 이유(실기 튜닝
+    # 대상)로 여기 승격했다. 값은 모두 코드 기본값과 동일 - 실기 테스트 전까지는
+    # 그대로 두고, 튜닝 시 이 섹션만 고치면 된다.
+    servo:
+      kp_xy: 1.2               # 수평 P 게인, 클수록 오차에 민감하게 반응
+      kp_yaw: 1.0               # yaw P 게인(현재 yaw=0 고정이라 미사용), 클수록 오차에 민감
+      v_max: 0.25               # 수평 속도 상한(m/s), 
+      descend_speed: 0.10       # 하강 속도(m/s)
+      eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작
+      eps_grasp: 0.005          # 폐합 판정 수평 오차 임계(m)
+      n_stable: 5               # 폐합 판정에 필요한 연속 안정 주기 수
+      dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
+      timeout: 5.0              # 서보 전체 타임아웃(s)
+      t_lost: 0.3               # 추적 유실 판정 시간(s)
+      innov_low: 0.010   # 이 잔차(m) 이하 -> w=1(피드포워드 완전 신뢰)
+      innov_high: 0.040  # 이 잔차(m) 이상 -> w=0 + 속도 공분산 리셋
+      w_alpha: 0.3        # w의 저역통과 스무딩 계수
+      z_close: 0.02       # 폐합 판정 z_gap(m) 임계
+      diverge_n: 5        # 발산 판정에 볼 연속 오차 개수
+      cov_threshold: 0.05 # 폐합 판정용 속도 공분산 임계
+      kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
+      kalman_q_vel: 1.0e-2      # 프로세스 노이즈(속도)
+      kalman_r_xy: 1.0e-4       # 측정 노이즈(x,y)
+      kalman_r_z: 1.0e-4        # 측정 노이즈(z)
+      kalman_p0_vel_reset: 1.0  # 방향전환 감지 시 속도 공분산 리셋값
+      # _validate_servo_command(task_executor.py)의 부동소수점 비교 허용오차 -
+      # 물리량이 아닌 수치 오차 마진이지만 한 곳에서 보이도록 승격했다.
+      command_validate_tolerance: 1.0e-6
+
+    # DoosanDriver(doosan_driver.py)가 dsr_msgs2 서비스를 부를 때 쓰는 통신
+    # 타임아웃/폴링 간격 - rg2.command_timeout_s 등과 같은 성격의 통신 타이밍
+    # 상수였으나 한 곳에서 보이도록 ROS 파라미터로 승격했다.
+    doosan_driver:
+      move_service_wait_timeout_s: 2.0        # move_joint/move_line 서비스 연결 확인
+      service_wait_timeout_s: 1.0             # 그 외 서비스(move_stop 등) 연결 확인
+      future_poll_interval_s: 0.01            # _wait_for_future 내부 폴링 간격
+      future_wait_timeout_s: 2.0              # 대부분의 서비스 응답 대기
+      compliance_future_wait_timeout_s: 3.0   # task/release_compliance_ctrl 응답 대기
+
     move:
-      vel_deg_s: 30.0
-      acc_deg_s2: 30.0
-      timeout_s: 30.0
+      vel_deg_s: 30.0    # movej 관절 속도(deg/s)
+      acc_deg_s2: 30.0   # movej 관절 가속도(deg/s^2)
+      timeout_s: 30.0    # move 서비스 응답 대기 타임아웃(s)
 
     # hardware_enabled=false(dry-run)에서는 실측 관절값이 없는 named pose도 상태
     # 흐름 시험을 위해 이동을 허용한다. hardware_enabled=true에서는 이 값과 무관하게
     # 빈 named pose를 절대 허용하지 않는다 (robot_control_node._call_move_service 참고).
     dry_run:
+      # true면 관절값 미설정 named pose도 dry-run 이동을 허용(상태 흐름 시험용)
       allow_unconfigured_named_poses: true
 
     servo_pick:
@@ -68,6 +107,9 @@
       # TCP 위치 캐시를 갱신하는 주기. ToolTrack 콜백마다 동기 호출하지 않고
       # rate-limited하게 별도 타이머로 갱신해 GetCurrentPosx 호출 과부하를 막는다.
       tcp_pose_refresh_period_s: 0.05
+      # SpeedlWatchdog(speedl_watchdog.py)이 pet() 유무를 확인하는 내부 폴링 주기 -
+      # 통신 타이밍 상수였다가 다른 servo_pick.* 값들과 함께 보이도록 승격했다.
+      watchdog_poll_interval_s: 0.05
       # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
       # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlStream 단위,
       # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
@@ -77,6 +119,8 @@
     # 이동(재계산 없음)으로 구현되어 있다. vision_node._track_hand가 아직 hand_pose를
     # 발행하지 않는 동안에는 timeout_s 안에 메시지가 안 와서 ABORT로 끝난다(정상 fail-closed).
     handover_approach:
+      # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
+      # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
       hand_pose_frame_id: 'base_link'
       stop_distance_m: 0.05  # 사용자 확정값(5cm)
       timeout_s: 10.0
@@ -94,7 +138,7 @@
       # 미설정(-1)이면 당김 감지가 항상 비활성화된다(오탐 방지가 기본값).
       pull_axis_index: -1     # 0=x,1=y,2=z,3=rx,4=ry,5=rz (tool_force 기준)
       pull_direction_sign: 1  # 1 또는 -1
-      pull_force_threshold_n: 15.0
+      pull_force_threshold_n: 15.0  # 이 값(N)을 넘으면 당김으로 판정 - 실기 튜닝 대상
 
     safety:
       # 외력 감지는 dsr_msgs2 ROS 서비스가 아니라 DRFL 라이브러리(libdsr_hardware2.so)에
@@ -113,22 +157,34 @@
       # J1/J2=163, J3=96, J4~J6=50 Nm)을 참고해 베이스 쪽은 둔감하게, 사람 손이 닿기
       # 쉬운 손목 쪽(J4~J6)은 예민하게 잡은 추정값이다 - 아직 관절별 실측(정지 시
       # 변화 폭 / 접촉 시 변화 폭) 전이라 재조정이 필요하다. 한번 넘으면 FAULT가
-      # 뜨고, 그 뒤로 연속 direct_reset_below_count번 미만이어야(히스테리시스)
-      # "다시 안전해졌다"고 본다 - 임계값 근처에서 깜빡이지 않게 하기 위함이다.
+      # 뜨고(on_triggered, edge-trigger라 계속 초과해도 재호출 안 됨), 그 뒤로 연속
+      # direct_reset_below_count번 미만이어야(히스테리시스) DrflForceMonitor 내부
+      # 트립 래치가 풀려 다음 초과 시 다시 on_triggered를 호출할 수 있게 재무장된다
+      # - 임계값 근처에서 반복 알림이 깜빡이지 않게 하기 위함이다. 주의: 이건
+      # DrflForceMonitor 내부 재무장일 뿐, 노드의 FAULT 상태 자체를 해제하지는
+      # 않는다 - FAULT 해제는 /robot/recover(SafetyMonitor.recover)가 그 시점의
+      # 외력을 다시 측정해 별도로 판정한다.
       #
       # drfl_lib_path/robot_ip/robot_port는 이 PC의 cobot_ws 설치 경로와
       # roboton(dsr_bringup2) 실행 인자에 맞춘 값이다 - 다른 환경이면 경로/IP를
       # 맞게 바꿔야 한다.
       external_torque:
-        drfl_lib_path: '/home/youngjin/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
-        robot_ip: '192.168.1.100'
-        robot_port: 12345
-        direct_poll_hz: 100.0
+        # '~'는 robot_control_node._init_drfl_force_monitor에서 os.path.expanduser로
+        # 실행 계정의 홈 디렉터리로 치환된다 - 사용자명을 하드코딩하지 않기 위함.
+        # cobot_ws 설치 경로 자체가 다른 환경이면 이 부분은 여전히 변경해야 한다.
+        drfl_lib_path: '~/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
+        robot_ip: '192.168.1.100'  # M0609 실제 IP - roboton(dsr_bringup2) 실행 인자와 일치해야 함
+        robot_port: 12345          # M0609 DRFL 포트
+        direct_poll_hz: 100.0      # DRFL 직접 연결 외력 폴링 주파수(Hz)
         direct_threshold_nm: [15.0, 15.0, 12.0, 10.0, 10.0, 10.0]  # TODO: 관절별 실기 캘리브레이션 필요
-        direct_reset_below_count: 20
+        direct_reset_below_count: 20  # on_triggered 재무장까지 연속 임계값 미만 횟수(히스테리시스) - FAULT 자체 해제는 아님, 아래 참고
+        # DrflForceMonitor.stop()이 폴링 스레드 종료를 기다리는 타임아웃 - 내부
+        # 종료 안전 마진이었으나 다른 external_torque.* 값들과 함께 승격했다.
+        stop_join_timeout_s: 2.0
       fault_stop_mode: 1  # TODO(전문가 검토 필요): MoveStop stop_mode 0~3 중 선택
       # DRFL 직접 연결 도입 전에는 이 폴링 주기 자체를 줄여서 두산 자체 반응
       # 속도와 격차를 줄이려 했으나(0.1 -> 0.02), 외력 감지를 DrflForceMonitor로
       # 완전히 옮기면서 그 이유가 없어져 기본값(0.1)으로 되돌렸다 - 이 폴링은 이제
-      # robot_state(두산 자체 안전 상태) 확인과 /task/status 갱신 용도로만 쓰인다.
+      # robot_state(두산 자체 안전 상태) 조회 및 FAULT 판정(_on_state_poll_timer)
+      # 용도로만 쓰인다.
       state_poll_period_s: 0.1

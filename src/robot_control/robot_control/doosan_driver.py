@@ -76,15 +76,29 @@ class DoosanDriver:
     def _response_success(response) -> bool:
         return bool(response is not None and response.success)
 
+    def _move_service_wait_timeout_s(self) -> float:
+        return float(self._node.get_parameter('doosan_driver.move_service_wait_timeout_s').value)
+
+    def _service_wait_timeout_s(self) -> float:
+        return float(self._node.get_parameter('doosan_driver.service_wait_timeout_s').value)
+
+    def _future_wait_timeout_s(self) -> float:
+        return float(self._node.get_parameter('doosan_driver.future_wait_timeout_s').value)
+
+    def _compliance_future_wait_timeout_s(self) -> float:
+        return float(
+            self._node.get_parameter('doosan_driver.compliance_future_wait_timeout_s').value)
+
     def _wait_for_future(self, future, timeout_s):
+        poll_interval_s = self._node.get_parameter('doosan_driver.future_poll_interval_s').value
         deadline = time.monotonic() + timeout_s
         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
-            time.sleep(0.01)
+            time.sleep(poll_interval_s)
         return future.result() if future.done() else None
 
     def _call_move_with_cancel(
             self, client, request, goal_handle, poll_interval_s, timeout_s):
-        if not client.wait_for_service(timeout_sec=2.0):
+        if not client.wait_for_service(timeout_sec=self._move_service_wait_timeout_s()):
             self._node.get_logger().error(f'{client.srv_name} 서비스 연결 실패')
             return False
         future = client.call_async(request)
@@ -96,7 +110,7 @@ class DoosanDriver:
             unsafe = self._node.safety_state != SafetyState.NORMAL
             if canceled or unsafe:
                 self.stop(self._node.get_parameter('safety.fault_stop_mode').value)
-                self._wait_for_future(future, 2.0)
+                self._wait_for_future(future, self._future_wait_timeout_s())
                 return False
             if time.monotonic() - start > timeout_s:
                 self._node.get_logger().error('move 서비스 응답 타임아웃')
@@ -139,26 +153,31 @@ class DoosanDriver:
             self._cli_move_line, request, goal_handle, poll_interval_s, timeout_s)
 
     def stop(self, stop_mode=1) -> bool:
-        if not self._cli_move_stop.wait_for_service(timeout_sec=1.0):
+        if not self._cli_move_stop.wait_for_service(timeout_sec=self._service_wait_timeout_s()):
             self._node.get_logger().error('motion/move_stop 서비스 연결 실패')
             return False
         request = self._MoveStop.Request()
         request.stop_mode = int(stop_mode)
-        response = self._wait_for_future(self._cli_move_stop.call_async(request), 2.0)
+        response = self._wait_for_future(
+            self._cli_move_stop.call_async(request), self._future_wait_timeout_s())
         return self._response_success(response)
 
     def get_robot_state(self):
-        if not self._cli_get_robot_state.wait_for_service(timeout_sec=1.0):
+        if not self._cli_get_robot_state.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             return None
         response = self._wait_for_future(
-            self._cli_get_robot_state.call_async(self._GetRobotState.Request()), 2.0)
+            self._cli_get_robot_state.call_async(self._GetRobotState.Request()),
+            self._future_wait_timeout_s())
         return int(response.robot_state) if self._response_success(response) else None
 
     def get_external_torque(self):
-        if not self._cli_get_ext_torque.wait_for_service(timeout_sec=1.0):
+        if not self._cli_get_ext_torque.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             return None
         response = self._wait_for_future(
-            self._cli_get_ext_torque.call_async(self._GetExternalTorque.Request()), 2.0)
+            self._cli_get_ext_torque.call_async(self._GetExternalTorque.Request()),
+            self._future_wait_timeout_s())
         return list(response.ext_torque) if self._response_success(response) else None
 
     def get_tool_force(self, ref=0):
@@ -166,19 +185,23 @@ class DoosanDriver:
             self._node.get_logger().error(
                 f'get_tool_force ref={ref}: BASE=0 또는 WORLD=2만 허용')
             return None
-        if not self._cli_get_tool_force.wait_for_service(timeout_sec=1.0):
+        if not self._cli_get_tool_force.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             return None
         request = self._GetToolForce.Request()
         request.ref = int(ref)
-        response = self._wait_for_future(self._cli_get_tool_force.call_async(request), 2.0)
+        response = self._wait_for_future(
+            self._cli_get_tool_force.call_async(request), self._future_wait_timeout_s())
         return list(response.tool_force) if self._response_success(response) else None
 
     def get_current_posx(self, ref=0):
-        if not self._cli_get_current_posx.wait_for_service(timeout_sec=1.0):
+        if not self._cli_get_current_posx.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             return None
         request = self._GetCurrentPosx.Request()
         request.ref = int(ref)
-        response = self._wait_for_future(self._cli_get_current_posx.call_async(request), 2.0)
+        response = self._wait_for_future(
+            self._cli_get_current_posx.call_async(request), self._future_wait_timeout_s())
         if not self._response_success(response) or not response.task_pos_info:
             return None
         data = list(response.task_pos_info[0].data)
@@ -188,11 +211,13 @@ class DoosanDriver:
         return pos6 if all(math.isfinite(value) for value in pos6) else None
 
     def set_robot_control(self, code) -> bool:
-        if not self._cli_set_robot_control.wait_for_service(timeout_sec=1.0):
+        if not self._cli_set_robot_control.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             return False
         request = self._SetRobotControl.Request()
         request.robot_control = int(code)
-        response = self._wait_for_future(self._cli_set_robot_control.call_async(request), 2.0)
+        response = self._wait_for_future(
+            self._cli_set_robot_control.call_async(request), self._future_wait_timeout_s())
         return self._response_success(response)
 
     def publish_speedl(self, command, *, accel_param_prefix, period_param_name):
@@ -200,9 +225,15 @@ class DoosanDriver:
         # accel_param_prefix/period_param_name으로 호출자(servo_pick 또는
         # handover_approach)에 맞는 자신의 파라미터를 쓴다 - 예전에는 항상
         # servo_pick 것만 썼던 교차배선을 여기서 바로잡는다.
+        #
+        # command.vx/vy/vz는 ServoLoop 내부 단위인 m/s이지만, SpeedlStream.vel의
+        # 병진 성분은 mm/s다 - speedl_acc_trans_mm_s2(가속도)와 동일한 mm 기반
+        # 관례이며, tools/probe_speedl_stream.py로 실기에서 mm/s 가정이 적당한
+        # 속도로 확인됐다(2026-07-08). 여기서 1000배 변환한다.
         message = self._SpeedlStream()
         message.vel = [
-            command.vx, command.vy, command.vz, 0.0, 0.0, command.yaw_rate]
+            command.vx * 1000.0, command.vy * 1000.0, command.vz * 1000.0,
+            0.0, 0.0, command.yaw_rate]
         message.acc = [
             self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_trans_mm_s2').value,
             self._node.get_parameter(f'{accel_param_prefix}.speedl_acc_rot_deg_s2').value]
@@ -210,7 +241,8 @@ class DoosanDriver:
         self._pub_speedl.publish(message)
 
     def enable_compliance(self):
-        if not self._cli_task_compliance.wait_for_service(timeout_sec=1.0):
+        if not self._cli_task_compliance.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             raise RuntimeError('task_compliance_ctrl 서비스 연결 실패')
         request = self._TaskComplianceCtrl.Request()
         request.stx = list(
@@ -219,16 +251,17 @@ class DoosanDriver:
         request.time = self._node.get_parameter(
             'handover_hold.compliance_transition_s').value
         response = self._wait_for_future(
-            self._cli_task_compliance.call_async(request), 3.0)
+            self._cli_task_compliance.call_async(request), self._compliance_future_wait_timeout_s())
         if not self._response_success(response):
             raise RuntimeError('task_compliance_ctrl 실패')
 
     def disable_compliance(self):
-        if not self._cli_release_compliance.wait_for_service(timeout_sec=1.0):
+        if not self._cli_release_compliance.wait_for_service(
+                timeout_sec=self._service_wait_timeout_s()):
             raise RuntimeError('release_compliance_ctrl 서비스 연결 실패')
         response = self._wait_for_future(
-            self._cli_release_compliance.call_async(
-                self._ReleaseComplianceCtrl.Request()), 3.0)
+            self._cli_release_compliance.call_async(self._ReleaseComplianceCtrl.Request()),
+            self._compliance_future_wait_timeout_s())
         if not self._response_success(response):
             raise RuntimeError('release_compliance_ctrl 실패')
 
