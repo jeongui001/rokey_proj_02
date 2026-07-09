@@ -272,7 +272,10 @@ class RG2Client:
             max_width)
         if self.last_status != RG2Status.SUCCESS:
             if self._node is not None:
-                self._node.get_logger().error(f'RG2 open 명령이 실패했습니다(status={self.last_status}).')
+                self._node.get_logger().error(
+                    f'RG2 open 명령이 실패했습니다 '
+                    f'(status={self.last_status}, gripper={self.gripper}, '
+                    f'max_width_mm={max_width}, max_force_n={max_force}).')
             return False
         tolerance = self._open_width_tolerance_mm()
         if self.last_width_mm is not None and self.last_width_mm < max_width - tolerance:
@@ -291,7 +294,9 @@ class RG2Client:
             if self._node is not None:
                 self._node.get_logger().error(
                     f'RG2 close width/force 입력값이 범위를 벗어났습니다: '
-                    f'width_mm={width_mm}, force_n={force_n}')
+                    f'gripper={self.gripper}, width_mm={width_mm}, force_n={force_n}, '
+                    f'max_width_mm={self.MAX_WIDTH_MM.get(self.gripper)}, '
+                    f'max_force_n={self.MAX_FORCE_N.get(self.gripper)}')
             return False
         if not self.hardware_enabled:
             self._sim_width_mm = width_mm
@@ -307,7 +312,10 @@ class RG2Client:
             self.MAX_WIDTH_MM[self.gripper])
         if self.last_status != RG2Status.SUCCESS:
             if self._node is not None:
-                self._node.get_logger().error(f'RG2 close 명령이 실패했습니다(status={self.last_status}).')
+                self._node.get_logger().error(
+                    f'RG2 close 명령이 실패했습니다 '
+                    f'(status={self.last_status}, gripper={self.gripper}, '
+                    f'width_mm={width_mm}, force_n={force_n}).')
         return self.last_status == RG2Status.SUCCESS
 
     def get_state(self):
