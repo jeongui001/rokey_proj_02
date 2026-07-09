@@ -267,18 +267,11 @@ class TaskExecutor:
     def _servo_pick_tick(self):
         abort_reason = self.servo_loop.should_abort()
         if abort_reason is not None:
-            self._debug_event(
-                'WARN', 'SERVO_ABORT', abort_reason,
-                'servo_pick 중단 조건이 발생했습니다.',
-                self.servo_loop.debug_snapshot(),
-                log=True)
+            self.get_logger().warn(f'servo_pick 중단 조건 발생: {abort_reason}')
             return ('ABORT', abort_reason)
         if self.servo_loop.should_close():
-            self._debug_event(
-                'INFO', 'SERVO_CLOSE_READY', 'criteria_met',
-                'servo_pick 폐합 조건을 만족했습니다.',
-                self.servo_loop.debug_snapshot(),
-                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+            if bool(self.get_parameter('debug.log_servo_decisions').value):
+                self.get_logger().info('servo_pick 폐합 조건을 만족했습니다.')
             return ('CLOSE', None)
         return ('CONTINUE', None)
 
@@ -290,25 +283,16 @@ class TaskExecutor:
         ServoLoop(m 단위, ToolTrack과 동일)에 맞게 변환한다."""
         tcp_pose_mm = self._get_current_tcp_posx()
         if tcp_pose_mm is None:
-            self._debug_event(
-                'WARN', 'SERVO_SKIP', 'tcp_pose_unavailable',
+            self.get_logger().warn(
                 'TCP 위치 캐시가 없거나 오래되어 이번 servo tick을 건너뜁니다.',
-                {'hardware_enabled': self.hardware_enabled},
-                throttle_s=1.0,
-                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+                throttle_duration_sec=1.0)
             return None
         tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
         command = self.servo_loop.step(tcp_pose_m, time.monotonic())
         if bool(self.get_parameter('debug.log_servo_decisions').value):
-            self._debug_event(
-                'INFO', 'SERVO_STEP', 'command_computed',
-                'servo_pick 속도 명령 계산 결과입니다.',
-                {
-                    'tcp_pose_m': tcp_pose_m,
-                    'servo': self.servo_loop.debug_snapshot(),
-                },
-                throttle_s=0.5,
-                log=True)
+            self.get_logger().info(
+                f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m}',
+                throttle_duration_sec=0.5)
         return command
 
     def _get_current_tcp_posx(self, max_age_parameter='servo_pick.tcp_pose_max_age_s'):
@@ -347,23 +331,14 @@ class TaskExecutor:
         if message.header.frame_id != expected_frame:
             self.get_logger().error(
                 f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
-            self._debug_event(
-                'WARN', 'TOOL_TRACK_REJECT', 'frame_mismatch',
-                'ToolTrack frame_id가 servo_pick 기준과 다릅니다.',
-                {'expected': expected_frame, 'actual': message.header.frame_id},
-                throttle_s=1.0,
-                log=True)
             return False
         position = message.pose.position
         valid = all(math.isfinite(value) for value in (
             position.x, position.y, position.z))
         if not valid:
-            self._debug_event(
-                'WARN', 'TOOL_TRACK_REJECT', 'invalid_position',
-                'ToolTrack 좌표가 NaN/Inf입니다.',
-                {'x': position.x, 'y': position.y, 'z': position.z},
-                throttle_s=1.0,
-                log=True)
+            self.get_logger().warn(
+                f'ToolTrack 좌표가 NaN/Inf입니다: ({position.x}, {position.y}, {position.z})',
+                throttle_duration_sec=1.0)
         return valid
 
     def _validate_servo_command(self, cmd) -> bool:
@@ -372,28 +347,19 @@ class TaskExecutor:
         한 번 더 확인해 유효하지 않은 값이 그대로 나가지 않게 한다."""
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
         if not all(math.isfinite(v) for v in values):
-            self._debug_event(
-                'ERROR', 'SERVO_COMMAND_REJECT', 'nonfinite',
-                '서보 속도 명령에 NaN/Inf가 포함되어 있습니다.',
-                {'values': values, 'servo': self.servo_loop.debug_snapshot()},
-                log=True)
+            self.get_logger().error(f'서보 속도 명령에 NaN/Inf가 포함되어 있습니다: {values}')
             return False
         tol = self.get_parameter('servo.command_validate_tolerance').value
         v_max = abs(self.get_parameter('servo.v_max').value)
         descend_speed = abs(self.get_parameter('servo.descend_speed').value)
         if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol:
-            self._debug_event(
-                'ERROR', 'SERVO_COMMAND_REJECT', 'xy_or_yaw_limit',
-                '서보 속도 명령이 v_max 제한을 넘었습니다.',
-                {'vx': cmd.vx, 'vy': cmd.vy, 'yaw_rate': cmd.yaw_rate, 'v_max': v_max, 'tol': tol},
-                log=True)
+            self.get_logger().error(
+                f'서보 속도 명령이 v_max({v_max}) 제한을 넘었습니다: '
+                f'vx={cmd.vx}, vy={cmd.vy}, yaw_rate={cmd.yaw_rate}')
             return False
         if abs(cmd.vz) > descend_speed + tol:
-            self._debug_event(
-                'ERROR', 'SERVO_COMMAND_REJECT', 'z_limit',
-                '서보 z 속도 명령이 descend_speed 제한을 넘었습니다.',
-                {'vz': cmd.vz, 'descend_speed': descend_speed, 'tol': tol},
-                log=True)
+            self.get_logger().error(
+                f'서보 z 속도 명령이 descend_speed({descend_speed}) 제한을 넘었습니다: vz={cmd.vz}')
             return False
         return True
 
@@ -484,11 +450,6 @@ class TaskExecutor:
                 outcome, detail = 'ABORT', f'{name} aborted - rclpy 종료 중'
         except Exception as exc:
             self.get_logger().error(f'{name} 실행 중 예외: {exc}')
-            self._debug_event(
-                'ERROR', 'TRACKING_EXCEPTION', name,
-                'tracking 실행 루프에서 예외가 발생했습니다.',
-                {'error': str(exc)},
-                log=True)
             stop_ok = self._cleanup_stop_motion()
             if goal_handle.is_cancel_requested and stop_ok:
                 outcome, detail = 'CANCELED', f'{name} canceled after exception: {exc}'
@@ -569,9 +530,13 @@ class TaskExecutor:
                 return self._finish_tracking_result(
                     goal_handle, 'CANCELED', 'servo_pick canceled during RG2 close')
             detail = f'servo_pick RG2 close 실패(status={self.rg2_client.last_status})'
+            self._checkpoint_event('D', 'gripper_closed', 'FAIL', detail)
             self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
             return self._finish_tracking_result(goal_handle, 'FAULT', detail)
 
+        self._checkpoint_event(
+            'D', 'gripper_closed', 'PASS', '그리퍼가 정상적으로 닫혔습니다.',
+            {'grasp_width_mm': request.grasp_width_mm, 'grasp_force_n': request.grasp_force_n})
         width_mm, grip_detected = self.rg2_client.get_state()
         # 그리퍼 폐합이 끝난 뒤에도 servo_pick 마지막 vx/vy 명령이 남아있을 수 있으므로
         # (vz는 step()에서 z 도착 시 이미 0으로 고정됨) 여기서 확실히 정지시킨다.
@@ -591,23 +556,14 @@ class TaskExecutor:
         if message.header.frame_id != expected_frame:
             self.get_logger().error(
                 f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
-            self._debug_event(
-                'WARN', 'HAND_TRACK_REJECT', 'frame_mismatch',
-                'HandTrack frame_id가 handover_servo 기준과 다릅니다.',
-                {'expected': expected_frame, 'actual': message.header.frame_id},
-                throttle_s=1.0,
-                log=True)
             return False
         position = message.pose.position
         valid = all(math.isfinite(value) for value in (
             position.x, position.y, position.z))
         if not valid:
-            self._debug_event(
-                'WARN', 'HAND_TRACK_REJECT', 'invalid_position',
-                'HandTrack 좌표가 NaN/Inf입니다.',
-                {'x': position.x, 'y': position.y, 'z': position.z},
-                throttle_s=1.0,
-                log=True)
+            self.get_logger().warn(
+                f'HandTrack 좌표가 NaN/Inf입니다: ({position.x}, {position.y}, {position.z})',
+                throttle_duration_sec=1.0)
         return valid
 
     def _validate_handover_servo_command(self, cmd) -> bool:
@@ -617,22 +573,15 @@ class TaskExecutor:
         검사한다."""
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
         if not all(math.isfinite(v) for v in values):
-            self._debug_event(
-                'ERROR', 'SERVO_COMMAND_REJECT', 'nonfinite',
-                '서보 속도 명령에 NaN/Inf가 포함되어 있습니다.',
-                {'values': values, 'servo': self.hand_servo_loop.debug_snapshot()},
-                log=True)
+            self.get_logger().error(f'서보 속도 명령에 NaN/Inf가 포함되어 있습니다: {values}')
             return False
         tol = self.get_parameter('handover_servo.command_validate_tolerance').value
         v_max = abs(self.get_parameter('handover_servo.v_max').value)
         if (abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol
                 or abs(cmd.vz) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol):
-            self._debug_event(
-                'ERROR', 'SERVO_COMMAND_REJECT', 'limit',
-                '서보 속도 명령이 v_max 제한을 넘었습니다.',
-                {'vx': cmd.vx, 'vy': cmd.vy, 'vz': cmd.vz, 'yaw_rate': cmd.yaw_rate,
-                 'v_max': v_max, 'tol': tol},
-                log=True)
+            self.get_logger().error(
+                f'서보 속도 명령이 v_max({v_max}) 제한을 넘었습니다: '
+                f'vx={cmd.vx}, vy={cmd.vy}, vz={cmd.vz}, yaw_rate={cmd.yaw_rate}')
             return False
         return True
 
@@ -647,41 +596,25 @@ class TaskExecutor:
         """_servo_pick_step과 동일 형태 - 캐시된 TCP 위치를 HandServoLoop.step에 넘긴다."""
         tcp_pose_mm = self._get_current_tcp_posx('handover_servo.tcp_pose_max_age_s')
         if tcp_pose_mm is None:
-            self._debug_event(
-                'WARN', 'SERVO_SKIP', 'tcp_pose_unavailable',
+            self.get_logger().warn(
                 'TCP 위치 캐시가 없거나 오래되어 이번 handover_approach tick을 건너뜁니다.',
-                {'hardware_enabled': self.hardware_enabled},
-                throttle_s=1.0,
-                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+                throttle_duration_sec=1.0)
             return None
         tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
         command = self.hand_servo_loop.step(tcp_pose_m, time.monotonic())
         if bool(self.get_parameter('debug.log_servo_decisions').value):
-            self._debug_event(
-                'INFO', 'SERVO_STEP', 'command_computed',
-                'handover_approach 속도 명령 계산 결과입니다.',
-                {
-                    'tcp_pose_m': tcp_pose_m,
-                    'servo': self.hand_servo_loop.debug_snapshot(),
-                },
-                throttle_s=0.5,
-                log=True)
+            self.get_logger().info(
+                f'handover_approach 속도 명령 계산: tcp_pose_m={tcp_pose_m}',
+                throttle_duration_sec=0.5)
         return command
 
     def _handover_approach_tick(self):
         state, reason = self.hand_servo_loop.tick()
         if state == 'ABORT':
-            self._debug_event(
-                'WARN', 'SERVO_ABORT', reason,
-                'handover_approach 중단 조건이 발생했습니다.',
-                self.hand_servo_loop.debug_snapshot(),
-                log=True)
+            self.get_logger().warn(f'handover_approach 중단 조건 발생: {reason}')
         elif state == 'STOP':
-            self._debug_event(
-                'INFO', 'SERVO_STOP', reason,
-                'handover_approach가 주먹 확정으로 정지합니다.',
-                self.hand_servo_loop.debug_snapshot(),
-                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+            if bool(self.get_parameter('debug.log_servo_decisions').value):
+                self.get_logger().info('handover_approach가 주먹 확정으로 정지합니다.')
         return state, reason
 
     def _execute_handover_approach(self, goal_handle):
@@ -810,6 +743,8 @@ class TaskExecutor:
         try:
             self._enable_compliance()
             compliance_on = True
+            self._checkpoint_event(
+                'I', 'compliance_mode_active', 'PASS', '컴플라이언스 모드가 가동되었습니다.')
             outcome = self.safety_monitor.wait_for_pull(
                 goal_handle, self._is_pull_detected, self._is_fresh_robot_state)
             if outcome == 'CANCELED':
@@ -822,6 +757,7 @@ class TaskExecutor:
                 detail = (
                     'handover_hold 취소 cleanup 실패 '
                     f'(move_stop={stop_ok}, compliance={compliance_ok})')
+                self._checkpoint_event('I', 'compliance_mode_ended', 'FAIL', detail)
                 self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                 return self._finish_tracking_result(goal_handle, 'FAULT', detail)
             if outcome != 'PULLED':
@@ -832,8 +768,11 @@ class TaskExecutor:
             compliance_on = False
             if not compliance_ok:
                 detail = 'handover_hold compliance 해제 실패 - RG2를 열지 않습니다.'
+                self._checkpoint_event('I', 'compliance_mode_ended', 'FAIL', detail)
                 self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                 return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+            self._checkpoint_event(
+                'I', 'compliance_mode_ended', 'PASS', '컴플라이언스 모드가 종료되었습니다.')
             if goal_handle.is_cancel_requested:
                 self._cleanup_stop_motion()
                 return self._finish_tracking_result(
@@ -851,8 +790,11 @@ class TaskExecutor:
                         goal_handle, 'CANCELED',
                         'handover_hold canceled during RG2 open')
                 detail = f'handover_hold RG2 open 실패(status={self.rg2_client.last_status})'
+                self._checkpoint_event('I', 'gripper_opened_on_pull', 'FAIL', detail)
                 self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                 return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+            self._checkpoint_event(
+                'I', 'gripper_opened_on_pull', 'PASS', '당김 감지 후 그리퍼가 개방되었습니다.')
             return self._finish_tracking_result(
                 goal_handle, 'ARRIVED', 'pull_detected, released')
         except Exception as exc:

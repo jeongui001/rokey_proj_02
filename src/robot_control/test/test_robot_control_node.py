@@ -2626,3 +2626,106 @@ def test_goal_callback_unmapped_target_does_not_publish_checkpoint(node):
     node._goal_callback(_goal('move_named', named_target='front'))
 
     assert published == []
+
+
+# ---- servo_pick/handover_hold 체크포인트 (파이프라인 점검.md 대응, Task 6) ----
+
+class _FakeRg2Client:
+    def __init__(self, close_ok=True, open_ok=True):
+        self.close_ok = close_ok
+        self.open_ok = open_ok
+        self.last_status = RG2Status.SUCCESS
+        self.close_calls = []
+        self.open_calls = []
+
+    def close(self, width_mm, force_n, goal_handle=None):
+        self.close_calls.append((width_mm, force_n))
+        if not self.close_ok:
+            self.last_status = RG2Status.COMMUNICATION_ERROR
+        return self.close_ok
+
+    def open(self, goal_handle=None):
+        self.open_calls.append(1)
+        if not self.open_ok:
+            self.last_status = RG2Status.COMMUNICATION_ERROR
+        return self.open_ok
+
+    def get_state(self):
+        return (20.0, True)
+
+
+def test_servo_pick_close_success_publishes_gripper_closed_pass(node, monkeypatch):
+    node.rg2_client = _FakeRg2Client(close_ok=True)
+    monkeypatch.setattr(
+        node, '_run_rt_tracking', lambda goal_handle, **kw: ('ARRIVED', ''))
+    published = []
+    node.pub_debug_events.publish = published.append
+    goal_handle = FakeGoalHandle(_goal('servo_pick'))
+    goal_handle.request.grasp_width_mm = 20.0
+    goal_handle.request.grasp_force_n = 10.0
+    goal_handle.request.tool_class = 'spanner'
+
+    node._execute_servo_pick(goal_handle)
+
+    payloads = [json.loads(p.data) for p in published]
+    matches = [p for p in payloads if p['checkpoint_id'] == 'gripper_closed']
+    assert len(matches) == 1
+    assert matches[0]['phase'] == 'D'
+    assert matches[0]['status'] == 'PASS'
+
+
+def test_servo_pick_close_failure_publishes_gripper_closed_fail(node, monkeypatch):
+    node.rg2_client = _FakeRg2Client(close_ok=False)
+    monkeypatch.setattr(
+        node, '_run_rt_tracking', lambda goal_handle, **kw: ('ARRIVED', ''))
+    published = []
+    node.pub_debug_events.publish = published.append
+    goal_handle = FakeGoalHandle(_goal('servo_pick'))
+    goal_handle.request.grasp_width_mm = 20.0
+    goal_handle.request.grasp_force_n = 10.0
+    goal_handle.request.tool_class = 'spanner'
+
+    node._execute_servo_pick(goal_handle)
+
+    payload = json.loads(published[-1].data)
+    assert payload['checkpoint_id'] == 'gripper_closed'
+    assert payload['status'] == 'FAIL'
+
+
+def test_handover_hold_success_publishes_compliance_and_gripper_open_checkpoints(node, monkeypatch):
+    node.rg2_client = _FakeRg2Client(open_ok=True)
+    monkeypatch.setattr(node, '_enable_compliance', lambda: None)
+    monkeypatch.setattr(node, '_disable_compliance', lambda: None)
+    monkeypatch.setattr(
+        node.safety_monitor, 'wait_for_pull', lambda *a, **k: 'PULLED')
+    published = []
+    node.pub_debug_events.publish = published.append
+    goal_handle = FakeGoalHandle(_goal('handover_hold'))
+
+    node._execute_handover_hold(goal_handle)
+
+    payloads = [json.loads(p.data) for p in published]
+    checkpoint_ids = [p['checkpoint_id'] for p in payloads]
+    assert 'compliance_mode_active' in checkpoint_ids
+    assert 'compliance_mode_ended' in checkpoint_ids
+    assert 'gripper_opened_on_pull' in checkpoint_ids
+    for payload in payloads:
+        assert payload['phase'] == 'I'
+        assert payload['status'] == 'PASS'
+
+
+def test_handover_hold_open_failure_publishes_gripper_opened_on_pull_fail(node, monkeypatch):
+    node.rg2_client = _FakeRg2Client(open_ok=False)
+    monkeypatch.setattr(node, '_enable_compliance', lambda: None)
+    monkeypatch.setattr(node, '_disable_compliance', lambda: None)
+    monkeypatch.setattr(
+        node.safety_monitor, 'wait_for_pull', lambda *a, **k: 'PULLED')
+    published = []
+    node.pub_debug_events.publish = published.append
+    goal_handle = FakeGoalHandle(_goal('handover_hold'))
+
+    node._execute_handover_hold(goal_handle)
+
+    payloads = [json.loads(p.data) for p in published]
+    matches = [p for p in payloads if p['checkpoint_id'] == 'gripper_opened_on_pull']
+    assert matches[-1]['status'] == 'FAIL'
