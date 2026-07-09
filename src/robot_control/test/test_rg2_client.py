@@ -317,6 +317,9 @@ def test_close_stops_waiting_when_node_safety_state_not_normal(monkeypatch):
             class _L:
                 def warn(self, *a, **k):
                     pass
+
+                def error(self, *a, **k):
+                    pass
             return _L()
 
     client = RG2Client(ip='192.168.1.1', hardware_enabled=True, node=_FakeNode())
@@ -416,9 +419,13 @@ def _make_fake_node(retry_count=0, backoff_s=0.0, safety_state='NORMAL'):
     class _Logger:
         def __init__(self):
             self.warnings = []
+            self.errors = []
 
         def warn(self, msg, *a, **k):
             self.warnings.append(msg)
+
+        def error(self, msg, *a, **k):
+            self.errors.append(msg)
 
     class _FakeNode:
         def __init__(self):
