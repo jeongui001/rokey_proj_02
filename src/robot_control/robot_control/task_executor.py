@@ -268,8 +268,18 @@ class TaskExecutor:
     def _servo_pick_tick(self):
         abort_reason = self.servo_loop.should_abort()
         if abort_reason is not None:
+            self._debug_event(
+                'WARN', 'SERVO_ABORT', abort_reason,
+                'servo_pick 중단 조건이 발생했습니다.',
+                self.servo_loop.debug_snapshot(),
+                log=True)
             return ('ABORT', abort_reason)
         if self.servo_loop.should_close():
+            self._debug_event(
+                'INFO', 'SERVO_CLOSE_READY', 'criteria_met',
+                'servo_pick 폐합 조건을 만족했습니다.',
+                self.servo_loop.debug_snapshot(),
+                log=bool(self.get_parameter('debug.log_servo_decisions').value))
             return ('CLOSE', None)
         return ('CONTINUE', None)
 
@@ -281,9 +291,26 @@ class TaskExecutor:
         ServoLoop(m 단위, ToolTrack과 동일)에 맞게 변환한다."""
         tcp_pose_mm = self._get_current_tcp_posx()
         if tcp_pose_mm is None:
+            self._debug_event(
+                'WARN', 'SERVO_SKIP', 'tcp_pose_unavailable',
+                'TCP 위치 캐시가 없거나 오래되어 이번 servo tick을 건너뜁니다.',
+                {'hardware_enabled': self.hardware_enabled},
+                throttle_s=1.0,
+                log=bool(self.get_parameter('debug.log_servo_decisions').value))
             return None
         tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
-        return self.servo_loop.step(tcp_pose_m, time.monotonic())
+        command = self.servo_loop.step(tcp_pose_m, time.monotonic())
+        if bool(self.get_parameter('debug.log_servo_decisions').value):
+            self._debug_event(
+                'INFO', 'SERVO_STEP', 'command_computed',
+                'servo_pick 속도 명령 계산 결과입니다.',
+                {
+                    'tcp_pose_m': tcp_pose_m,
+                    'servo': self.servo_loop.debug_snapshot(),
+                },
+                throttle_s=0.5,
+                log=True)
+        return command
 
     def _get_current_tcp_posx(self):
         """캐시된 최신 TCP 위치를 [x,y,z,rx,ry,rz](mm/deg)로 반환한다.
@@ -320,10 +347,24 @@ class TaskExecutor:
         if message.header.frame_id != expected_frame:
             self.get_logger().error(
                 f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
+            self._debug_event(
+                'WARN', 'TOOL_TRACK_REJECT', 'frame_mismatch',
+                'ToolTrack frame_id가 servo_pick 기준과 다릅니다.',
+                {'expected': expected_frame, 'actual': message.header.frame_id},
+                throttle_s=1.0,
+                log=True)
             return False
         position = message.pose.position
-        return all(math.isfinite(value) for value in (
+        valid = all(math.isfinite(value) for value in (
             position.x, position.y, position.z))
+        if not valid:
+            self._debug_event(
+                'WARN', 'TOOL_TRACK_REJECT', 'invalid_position',
+                'ToolTrack 좌표가 NaN/Inf입니다.',
+                {'x': position.x, 'y': position.y, 'z': position.z},
+                throttle_s=1.0,
+                log=True)
+        return valid
 
     def _validate_servo_command(self, cmd) -> bool:
         """속도 명령을 실제로 발행하기 직전 마지막 안전 검사. ServoLoop.step()이
@@ -331,13 +372,28 @@ class TaskExecutor:
         한 번 더 확인해 유효하지 않은 값이 그대로 나가지 않게 한다."""
         values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
         if not all(math.isfinite(v) for v in values):
+            self._debug_event(
+                'ERROR', 'SERVO_COMMAND_REJECT', 'nonfinite',
+                '서보 속도 명령에 NaN/Inf가 포함되어 있습니다.',
+                {'values': values, 'servo': self.servo_loop.debug_snapshot()},
+                log=True)
             return False
         tol = self.get_parameter('servo.command_validate_tolerance').value
         v_max = abs(self.get_parameter('servo.v_max').value)
         descend_speed = abs(self.get_parameter('servo.descend_speed').value)
         if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol:
+            self._debug_event(
+                'ERROR', 'SERVO_COMMAND_REJECT', 'xy_or_yaw_limit',
+                '서보 속도 명령이 v_max 제한을 넘었습니다.',
+                {'vx': cmd.vx, 'vy': cmd.vy, 'yaw_rate': cmd.yaw_rate, 'v_max': v_max, 'tol': tol},
+                log=True)
             return False
         if abs(cmd.vz) > descend_speed + tol:
+            self._debug_event(
+                'ERROR', 'SERVO_COMMAND_REJECT', 'z_limit',
+                '서보 z 속도 명령이 descend_speed 제한을 넘었습니다.',
+                {'vz': cmd.vz, 'descend_speed': descend_speed, 'tol': tol},
+                log=True)
             return False
         return True
 
@@ -429,6 +485,11 @@ class TaskExecutor:
                 outcome, detail = 'ABORT', f'{name} aborted - rclpy 종료 중'
         except Exception as exc:
             self.get_logger().error(f'{name} 실행 중 예외: {exc}')
+            self._debug_event(
+                'ERROR', 'TRACKING_EXCEPTION', name,
+                'tracking 실행 루프에서 예외가 발생했습니다.',
+                {'error': str(exc)},
+                log=True)
             stop_ok = self._cleanup_stop_motion()
             if goal_handle.is_cancel_requested and stop_ok:
                 outcome, detail = 'CANCELED', f'{name} canceled after exception: {exc}'
@@ -597,6 +658,17 @@ class TaskExecutor:
             if (hand_pose.header.frame_id != expected_frame
                     or not all(
                         math.isfinite(v) for v in (position.x, position.y, position.z))):
+                self._debug_event(
+                    'WARN', 'HAND_POSE_REJECT', 'frame_or_position_invalid',
+                    'handover_approach가 hand_pose를 거부했습니다.',
+                    {
+                        'expected_frame': expected_frame,
+                        'actual_frame': hand_pose.header.frame_id,
+                        'x': position.x,
+                        'y': position.y,
+                        'z': position.z,
+                    },
+                    log=True)
                 return self._finish_tracking_result(
                     goal_handle, 'ABORT',
                     'handover_approach aborted - hand_pose frame_id/좌표 무효 '
@@ -620,6 +692,16 @@ class TaskExecutor:
             hand_m = [position.x, position.y, position.z]
             delta = [hand_m[i] - tcp_m[i] for i in range(3)]
             distance_m = math.sqrt(sum(d * d for d in delta))
+            self._debug_event(
+                'INFO', 'HANDOVER_APPROACH', 'hand_pose_received',
+                'handover_approach 목표 손 위치와 TCP 거리를 계산했습니다.',
+                {
+                    'hand_m': hand_m,
+                    'tcp_m': tcp_m,
+                    'distance_m': distance_m,
+                    'stop_distance_m': self.get_parameter('handover_approach.stop_distance_m').value,
+                },
+                log=bool(self.get_parameter('debug.log_servo_decisions').value))
 
             stop_distance_m = self.get_parameter('handover_approach.stop_distance_m').value
             if distance_m <= stop_distance_m:

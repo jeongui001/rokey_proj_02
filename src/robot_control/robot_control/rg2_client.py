@@ -93,6 +93,14 @@ class RG2Client:
                 0.0, float(self._node.get_parameter('rg2.communication_retry_backoff_s').value))
         return self._DEFAULT_COMMUNICATION_RETRY_BACKOFF_S
 
+    def _debug_event(self, level, reason, message, data=None, *, log=False):
+        # DEBUG_LOG: robot_control_node의 /debug/events 헬퍼가 있을 때만 구조화 이벤트를 남긴다.
+        if self._node is not None and hasattr(self._node, '_debug_event'):
+            self._node._debug_event(
+                level, 'RG2', reason, message, data,
+                throttle_s=1.0 if level != 'INFO' else None,
+                log=log)
+
     def _validate_inputs(self, width_mm: float, force_n: float) -> bool:
         if self.gripper not in self.MAX_WIDTH_MM or self.gripper not in self.MAX_FORCE_N:
             return False
@@ -245,6 +253,11 @@ class RG2Client:
             if self._node is not None:
                 self._node.get_logger().warn(
                     f'RG2 통신 오류 - 재시도 {attempt}/{retries}')
+            self._debug_event(
+                'WARN', 'communication_retry',
+                'RG2 통신 오류로 명령을 재시도합니다.',
+                {'attempt': attempt, 'retries': retries},
+                log=True)
             time.sleep(backoff_s)
 
     def open(self, goal_handle=None) -> bool:
@@ -253,6 +266,11 @@ class RG2Client:
         self.last_grip_detected = None
         if self.gripper not in self.MAX_WIDTH_MM or self.gripper not in self.MAX_FORCE_N:
             self.last_status = RG2Status.INVALID_INPUT
+            self._debug_event(
+                'ERROR', 'invalid_gripper',
+                '지원하지 않는 RG2/RG6 gripper 이름입니다.',
+                {'gripper': self.gripper},
+                log=True)
             return False
         max_width = self.MAX_WIDTH_MM[self.gripper]
         max_force = self.MAX_FORCE_N[self.gripper]
@@ -269,6 +287,11 @@ class RG2Client:
             [int(max_force * 10), int(max_width * 10), self._CMD_GRIP_W_OFFSET],
             max_width)
         if self.last_status != RG2Status.SUCCESS:
+            self._debug_event(
+                'ERROR', self.last_status,
+                'RG2 open 명령이 실패했습니다.',
+                {'gripper': self.gripper, 'max_width_mm': max_width, 'max_force_n': max_force},
+                log=True)
             return False
         tolerance = self._open_width_tolerance_mm()
         if self.last_width_mm is not None and self.last_width_mm < max_width - tolerance:
@@ -276,6 +299,15 @@ class RG2Client:
                 self._node.get_logger().warn(
                     f'RG2 open 최종 폭 {self.last_width_mm}mm가 '
                     f'허용오차 {tolerance}mm 밖입니다.')
+            self._debug_event(
+                'WARN', 'open_width_below_expected',
+                'RG2 open 최종 폭이 최대폭 허용오차 밖입니다.',
+                {
+                    'final_width_mm': self.last_width_mm,
+                    'max_width_mm': max_width,
+                    'tolerance_mm': tolerance,
+                },
+                log=True)
         return True
 
     def close(self, width_mm: float, force_n: float, goal_handle=None) -> bool:
@@ -284,6 +316,17 @@ class RG2Client:
         self.last_grip_detected = None
         if not self._validate_inputs(width_mm, force_n):
             self.last_status = RG2Status.INVALID_INPUT
+            self._debug_event(
+                'ERROR', 'invalid_close_input',
+                'RG2 close width/force 입력값이 범위를 벗어났습니다.',
+                {
+                    'gripper': self.gripper,
+                    'width_mm': width_mm,
+                    'force_n': force_n,
+                    'max_width_mm': self.MAX_WIDTH_MM.get(self.gripper),
+                    'max_force_n': self.MAX_FORCE_N.get(self.gripper),
+                },
+                log=True)
             return False
         if not self.hardware_enabled:
             self._sim_width_mm = width_mm
@@ -297,6 +340,12 @@ class RG2Client:
             goal_handle,
             [int(force_n * 10), int(width_mm * 10), self._CMD_GRIP_W_OFFSET],
             self.MAX_WIDTH_MM[self.gripper])
+        if self.last_status != RG2Status.SUCCESS:
+            self._debug_event(
+                'ERROR', self.last_status,
+                'RG2 close 명령이 실패했습니다.',
+                {'width_mm': width_mm, 'force_n': force_n, 'gripper': self.gripper},
+                log=True)
         return self.last_status == RG2Status.SUCCESS
 
     def get_state(self):

@@ -93,6 +93,11 @@ class ServoLoop:
         self._stable_count = 0           # eps_grasp 이내로 연속 몇 주기째인지
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
+        self._last_e_xy_norm = None      # DEBUG_LOG: 최근 xy 오차(m)
+        self._last_command = ServoCommand()  # DEBUG_LOG: 최근 속도 명령
+        self._last_innovation_xy = None  # DEBUG_LOG: 최근 Kalman innovation(m)
+        self._last_w_target = None       # DEBUG_LOG: 최근 feed-forward 목표 가중치
+        self._last_depth_valid = None    # DEBUG_LOG: 최근 ToolTrack depth_valid
 
     def start(self, tool_class, grasp_width_mm, grasp_force_n):
         """servo_pick goal 수신 시 1회 호출 - 모든 내부 상태를 초기화한다."""
@@ -110,6 +115,11 @@ class ServoLoop:
         self._stable_count = 0
         self._error_history = []
         self._last_z_gap = None
+        self._last_e_xy_norm = None
+        self._last_command = ServoCommand()
+        self._last_innovation_xy = None
+        self._last_w_target = None
+        self._last_depth_valid = None
 
     def on_tool_track(self, msg):
         """/vision/tool_track 수신마다 호출 - 칼만 필터를 갱신하고 innovation으로
@@ -123,6 +133,7 @@ class ServoLoop:
             self._filter.initialize(pos.x, pos.y, pos.z)
             self._last_track_time = stamp
             self._last_msg_time = now
+            self._last_depth_valid = bool(msg.depth_valid)
             return
 
         dt = max(stamp - self._last_track_time, 1e-3)
@@ -133,6 +144,8 @@ class ServoLoop:
             innov_xy = self._filter.update_xyz([pos.x, pos.y, pos.z])
         else:
             innov_xy = self._filter.update_xy_only([pos.x, pos.y])
+        self._last_innovation_xy = float(innov_xy)
+        self._last_depth_valid = bool(msg.depth_valid)
 
         # innovation(예측-관측 잔차) 크기로 w를 결정: 작으면 등속 가정 유효(w->1),
         # 크면 위반(w->0) + 속도 공분산 리셋으로 필터를 빠르게 재수렴시킴
@@ -144,6 +157,7 @@ class ServoLoop:
         else:
             span = self.innov_high - self.innov_low
             w_target = 1.0 - (innov_xy - self.innov_low) / span
+        self._last_w_target = float(w_target)
 
         # w_target을 바로 쓰지 않고 저역통과 필터로 스무딩 - 잔차 노이즈로 인한 채터링 방지
         self._w = self.w_alpha * w_target + (1.0 - self.w_alpha) * self._w
@@ -155,7 +169,8 @@ class ServoLoop:
         tcp_pose: 현재 TCP pose(base_link 기준 x,y,z,rx,ry,rz). now: time.monotonic() 값."""
         if not self._filter._initialized:
             # 아직 ToolTrack을 한 번도 못 받았으면 정지 명령
-            return ServoCommand()
+            self._last_command = ServoCommand()
+            return self._last_command
 
         # p_ref = 필터 추정 위치를 Δt_lat만큼 앞으로 외삽한 "지금 목표로 삼아야 할 위치"
         p_ref = self._filter.predict_position(self.dt_latency)
@@ -165,6 +180,7 @@ class ServoLoop:
         e_x = p_ref[0] - tcp_x
         e_y = p_ref[1] - tcp_y
         e_xy_norm = float(np.hypot(e_x, e_y))
+        self._last_e_xy_norm = e_xy_norm
 
         # 발산 판정용 오차 이력 (최근 diverge_n개만 유지)
         self._error_history.append(e_xy_norm)
@@ -196,7 +212,8 @@ class ServoLoop:
         else:
             self._stable_count = 0
 
-        return ServoCommand(vx=vx, vy=vy, vz=vz, yaw_rate=0.0)
+        self._last_command = ServoCommand(vx=vx, vy=vy, vz=vz, yaw_rate=0.0)
+        return self._last_command
 
     def get_state(self):
         """RobotTask Feedback.state로 그대로 노출되는 현재 서보 상태."""
@@ -229,3 +246,32 @@ class ServoLoop:
         # 참고: "공구가 방향 전환하여 시야 이탈 예상"(2.8절)은 판정 기준이 모호해
         # 과설계 우려가 있으므로 1차 구현 범위에서 제외했다. 실측 후 필요하면 추가한다.
         return None
+
+    def debug_snapshot(self):
+        """DEBUG_LOG: ROS 노드가 고주기 로그를 throttle해서 남길 때 쓰는 서보 내부 수치."""
+        position = None
+        velocity = None
+        if self._filter._initialized:
+            position = [float(v) for v in self._filter.position]
+            velocity = [float(v) for v in self._filter.velocity]
+        return {
+            'state': self._state,
+            'filter_initialized': bool(self._filter._initialized),
+            'w': float(self._w),
+            'w_target': self._last_w_target,
+            'innovation_xy_m': self._last_innovation_xy,
+            'e_xy_norm_m': self._last_e_xy_norm,
+            'stable_count': self._stable_count,
+            'last_z_gap_m': self._last_z_gap,
+            'velocity_covariance_trace': float(self._filter.velocity_covariance_trace),
+            'error_history_m': [float(v) for v in self._error_history],
+            'depth_valid': self._last_depth_valid,
+            'position_m': position,
+            'velocity_m_s': velocity,
+            'cmd_m_s': {
+                'vx': float(self._last_command.vx),
+                'vy': float(self._last_command.vy),
+                'vz': float(self._last_command.vz),
+                'yaw_rate': float(self._last_command.yaw_rate),
+            },
+        }

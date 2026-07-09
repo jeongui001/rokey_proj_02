@@ -46,7 +46,9 @@ class _OperatorGuiNode(Node):
         self.create_subscription(
             CompressedImage, self._camera_topic, self._on_camera_image, 10)
         self.create_subscription(Float32, '/stt/mic_level', self._on_mic_level, 10)
+        self.create_subscription(String, '/stt/status', self._on_stt_status, 10)
         self.create_subscription(String, '/user_command/text', self._on_stt_command, 10)
+        self.create_subscription(String, '/debug/events', self._on_debug_event, 10)
         self._command_pub = self.create_publisher(String, '/user_command/text', 10)
 
     def publish_command(self, text: str) -> bool:
@@ -92,6 +94,26 @@ class _OperatorGuiNode(Node):
         if self._owner.on_stt_command is None:
             return
         self._owner.on_stt_command(msg.data)
+
+    def _on_stt_status(self, msg):
+        if self._owner.on_stt_status is None:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        self._owner.on_stt_status(
+            payload.get('state', ''), payload.get('detail', ''),
+            payload.get('data', {}) or {})
+
+    def _on_debug_event(self, msg):
+        if self._owner.on_debug_event is None:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        self._owner.on_debug_event(payload)
 
 
 class RosSpinThread(QThread):
@@ -150,7 +172,9 @@ class RosClient:
         self.on_camera_image = None        # (image_bytes)
         self.on_connection_changed = None  # (is_connected: bool)
         self.on_mic_level = None           # (level: float, 0.0~1.0)
+        self.on_stt_status = None          # (state: str, detail: str, data: dict)
         self.on_stt_command = None         # (text: str)
+        self.on_debug_event = None         # (payload: dict)
 
         self._node = _OperatorGuiNode(self, self.camera_topic)
         self._spin_thread = RosSpinThread(self._node)

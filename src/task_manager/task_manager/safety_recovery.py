@@ -40,6 +40,16 @@ class SafetyRecovery:
         self._stop_recovery_timeout_timer()
         self.safety_state = safety_state
         self._publish_status(detail=detail)
+        self._debug_event(
+            'ERROR', 'FAULT_ENTER', safety_state,
+            'task_manager가 FAULT/안전정지 상태로 진입했습니다.',
+            {
+                'detail': detail,
+                'state_before_fault': self._resume_state,
+                'resume_kind': self._resume_kind,
+                'current_tool': self.current_tool,
+            },
+            log=True)
         self._request_cancel(lambda: None)
 
     def _on_fault(self, msg):
@@ -72,6 +82,11 @@ class SafetyRecovery:
 
         if self.safety_state != Safety.NORMAL:
             self._publish_status(detail='안전 정지 상태 - 리셋이 필요합니다.')
+            self._debug_event(
+                'WARN', 'COMMAND_REJECT', 'safety_not_normal',
+                '안전 정지 상태라 사용자 명령을 거부했습니다.',
+                {'command': msg.data, 'safety_state': self.safety_state},
+                throttle_s=1.0)
             return
 
         if cmd_type == Command.MODE_SWITCH:
@@ -86,6 +101,11 @@ class SafetyRecovery:
             self._handle_resume()
         else:
             self._publish_status(detail='명령을 이해하지 못했습니다. 다시 말씀해주세요.')
+            self._debug_event(
+                'WARN', 'COMMAND_REJECT', 'unknown_command',
+                '사용자 명령을 파싱하지 못했습니다.',
+                {'command': msg.data},
+                throttle_s=1.0)
 
     def _handle_reset(self):
         if self.safety_state == Safety.NORMAL:

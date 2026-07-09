@@ -1,6 +1,7 @@
 import math
 import os
 import time
+from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -10,6 +11,7 @@ DEFAULT_CAMERA_STALE_TIMEOUT_S = 2.0
 # 위 timeout과 무관하게, 화면 갱신 자체를 확인하는 주기(ms). timeout보다 충분히
 # 짧게 유지해 멈춤 표시가 늦게 뜨지 않게 한다.
 _CAMERA_STALE_CHECK_INTERVAL_MS = 300
+_MAX_DEBUG_EVENTS = 200
 
 _MONO_FONT_STACK = '"Cascadia Code", "DejaVu Sans Mono", "Consolas", monospace'
 
@@ -117,6 +119,16 @@ QPushButton#dangerButton:hover {{
     background-color: #ff4d5e;
     color: #05080d;
 }}
+QPushButton#warningButton {{
+    background-color: transparent;
+    color: #ffd166;
+    border: 1px solid #ffd166;
+    font-weight: 700;
+}}
+QPushButton#warningButton:checked {{
+    background-color: rgba(255, 209, 102, 0.18);
+    color: #ffd166;
+}}
 QLineEdit {{
     background-color: #0c141d;
     color: #cfe6f2;
@@ -221,7 +233,9 @@ class MainWindow(QtWidgets.QMainWindow):
     connection_changed = QtCore.pyqtSignal(bool)
     camera_image_received = QtCore.pyqtSignal(bytes)
     mic_level_received = QtCore.pyqtSignal(float)
+    stt_status_received = QtCore.pyqtSignal(str, str, object)
     stt_command_received = QtCore.pyqtSignal(str)
+    debug_event_received = QtCore.pyqtSignal(object)
 
     def __init__(self, ros_client, camera_stale_timeout_s=None):
         super().__init__()
@@ -249,6 +263,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._camera_stale = False
         # 초기 /task/status를 받기 전에는 이동/모드 버튼을 안전하게 비활성화해 둔다.
         self._received_first_status = False
+        self._debug_events = deque(maxlen=_MAX_DEBUG_EVENTS)
+        self._unseen_debug_count = 0
 
         self._build_ui()
         self._wire_signals()
@@ -286,6 +302,9 @@ class MainWindow(QtWidgets.QMainWindow):
             label.setStyleSheet(_chip_base)
         self.detail_label.setStyleSheet(
             'font-size: 12px; color: #5f7c8e; padding: 6px 4px;')
+        self.detail_label.setMinimumWidth(0)
+        self.detail_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         self.safety_label.setStyleSheet(_chip_base)
 
         top_bar = QtWidgets.QHBoxLayout()
@@ -295,6 +314,12 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.state_label)
         top_bar.addWidget(self.safety_label)
         top_bar.addWidget(self.detail_label, stretch=1)
+        self.debug_toggle_button = QtWidgets.QPushButton('오류 확인')
+        self.debug_toggle_button.setObjectName('warningButton')
+        self.debug_toggle_button.setCheckable(True)
+        self.debug_toggle_button.setMinimumWidth(76)
+        self.debug_toggle_button.clicked.connect(self._toggle_debug_panel)
+        top_bar.addWidget(self.debug_toggle_button)
 
         self.fault_banner = QtWidgets.QLabel('')
         self.fault_banner.setStyleSheet(
@@ -325,7 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.camera_label = QtWidgets.QLabel('카메라 대기 중...')
         self.camera_label.setObjectName('cameraLabel')
         self.camera_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.camera_label.setMinimumSize(320, 240)
+        self.camera_label.setMinimumSize(280, 200)
 
         # 카메라 영상 안쪽 우측 상단에 떠 있는 상태 오버레이. camera_label의 레이아웃
         # 자식이 아니라 좌표를 직접 move()하는 "떠 있는" 자식 위젯이라, 카메라가
@@ -410,12 +435,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mic_level_bar = QtWidgets.QProgressBar()
         self.mic_level_bar.setRange(0, 100)
         self.mic_level_bar.setTextVisible(False)
-        self.mic_level_bar.setFixedSize(50, 10)
+        self.mic_level_bar.setFixedHeight(16)
         self.stt_command_label = QtWidgets.QLabel('마지막 명령어: -')
         self.stt_command_label.setWordWrap(True)
         self.stt_command_label.setMaximumHeight(34)  # 최대 2줄 - 긴 명령어도 그룹박스 높이를 무한정 늘리지 않는다
         self.stt_command_label.setStyleSheet(f'font-family: {_MONO_FONT_STACK}; font-size: 12px;')
-        mic_layout = QtWidgets.QHBoxLayout()
+        self.stt_status_label = QtWidgets.QLabel('대기 중')
+        self.stt_status_label.setStyleSheet('color: #ffd166; font-size: 12px; font-weight: 600;')
+        mic_layout = QtWidgets.QVBoxLayout()
+        mic_layout.addWidget(self.stt_status_label)
         mic_layout.addWidget(self.mic_level_bar)
         mic_layout.addWidget(self.stt_command_label, stretch=1)
         mic_group.setLayout(mic_layout)
@@ -432,21 +460,44 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_container = QtWidgets.QWidget()
         right_container.setLayout(right_panel)
-        right_container.setMaximumWidth(280)
-
-        middle_layout = QtWidgets.QHBoxLayout()
-        middle_layout.addWidget(self.camera_label, stretch=2)
-        middle_layout.addWidget(right_container, stretch=1)
+        right_container.setMinimumWidth(320)
+        right_container.setMaximumWidth(360)
 
         # 하단: 시간순 로그 - 최소 10줄 이상 보이도록 높이를 확보한다.
+        self.debug_panel = QtWidgets.QGroupBox('오류 확인')
+        self.debug_log_view = QtWidgets.QListWidget()
+        self.debug_log_view.setMinimumHeight(80)
+        self.debug_log_view.itemClicked.connect(self._show_debug_event_detail)
+        self.clear_debug_button = QtWidgets.QPushButton('비우기')
+        self.clear_debug_button.clicked.connect(self._clear_debug_events)
+        debug_header = QtWidgets.QHBoxLayout()
+        debug_header.addStretch(1)
+        debug_header.addWidget(self.clear_debug_button)
+        debug_layout = QtWidgets.QVBoxLayout()
+        debug_layout.addLayout(debug_header)
+        debug_layout.addWidget(self.debug_log_view)
+        self.debug_panel.setLayout(debug_layout)
+        self.debug_panel.setMaximumHeight(190)
+        self.debug_panel.hide()
+
         self.log_view = QtWidgets.QListWidget()
-        self.log_view.setMinimumHeight(220)
+        self.log_view.setMinimumHeight(90)
+
+        left_column = QtWidgets.QVBoxLayout()
+        left_column.addWidget(self.camera_label, stretch=1)
+        left_column.addWidget(self.debug_panel)
+        left_column.addWidget(self.log_view, stretch=0)
+        left_widget = QtWidgets.QWidget()
+        left_widget.setLayout(left_column)
+
+        middle_layout = QtWidgets.QHBoxLayout()
+        middle_layout.addWidget(left_widget, stretch=1)
+        middle_layout.addWidget(right_container, stretch=0)
 
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(top_bar)
         layout.addWidget(self.fault_banner)
         layout.addLayout(middle_layout, stretch=1)
-        layout.addWidget(self.log_view, stretch=1)
         layout.setSpacing(10)
         layout.setContentsMargins(12, 12, 12, 12)
 
@@ -454,6 +505,7 @@ class MainWindow(QtWidgets.QMainWindow):
         container.setLayout(layout)
         self.setCentralWidget(container)
         self.resize(960, 680)
+        self.setMinimumSize(720, 480)
 
     def _wire_signals(self):
         self.task_status_received.connect(self._update_task_status)
@@ -462,7 +514,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.connection_changed.connect(self._update_connection_status)
         self.camera_image_received.connect(self._update_camera_image)
         self.mic_level_received.connect(self._update_mic_level)
+        self.stt_status_received.connect(self._update_stt_status)
         self.stt_command_received.connect(self._update_stt_command)
+        self.debug_event_received.connect(self._update_debug_event)
 
         self.ros_client.on_task_status = self.task_status_received.emit
         self.ros_client.on_gripper_state = self.gripper_state_received.emit
@@ -470,7 +524,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.ros_client.on_connection_changed = self.connection_changed.emit
         self.ros_client.on_camera_image = self.camera_image_received.emit
         self.ros_client.on_mic_level = self.mic_level_received.emit
+        self.ros_client.on_stt_status = self.stt_status_received.emit
         self.ros_client.on_stt_command = self.stt_command_received.emit
+        self.ros_client.on_debug_event = self.debug_event_received.emit
 
     # ---- 명령 전송 ----
 
@@ -682,8 +738,88 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_mic_level(self, level):
         self.mic_level_bar.setValue(int(min(max(level, 0.0), 1.0) * 100))
 
+    def _update_stt_status(self, state, detail, data):
+        text = detail or state or '대기 중'
+        self.stt_status_label.setText(text)
+        if state == 'wakeword_detected':
+            self._log(text)
+        elif state in ('error', 'silent_skipped'):
+            self._log(f'음성 인식: {text}')
+
     def _update_stt_command(self, text):
         self.stt_command_label.setText(f'마지막 명령어: {text}')
+
+    # ---- 디버그 이벤트 ----
+
+    def _toggle_debug_panel(self, checked):
+        self.debug_panel.setVisible(bool(checked))
+        if checked:
+            self._unseen_debug_count = 0
+            self._refresh_debug_button_text()
+
+    def _clear_debug_events(self):
+        self._debug_events.clear()
+        self.debug_log_view.clear()
+        self._unseen_debug_count = 0
+        self._refresh_debug_button_text()
+
+    def _refresh_debug_button_text(self):
+        if self._unseen_debug_count > 0:
+            self.debug_toggle_button.setText(f'오류 확인 ({self._unseen_debug_count})')
+        else:
+            self.debug_toggle_button.setText('오류 확인')
+
+    @staticmethod
+    def _format_debug_event(payload):
+        node = payload.get('node', '-')
+        level = payload.get('level', '-')
+        category = payload.get('category', '-')
+        reason = payload.get('reason', '-')
+        message = payload.get('message', '')
+        data = payload.get('data') or {}
+        compact_data = ''
+        if data:
+            pairs = []
+            for key in sorted(data.keys())[:4]:
+                value = data[key]
+                if isinstance(value, float):
+                    value = f'{value:.4g}'
+                pairs.append(f'{key}={value}')
+            compact_data = ' | ' + ', '.join(pairs)
+        return f'[{level}] {node}/{category} reason={reason} {message}{compact_data}'
+
+    def _update_debug_event(self, payload):
+        if not isinstance(payload, dict):
+            return
+        level = payload.get('level', '')
+        if level not in ('WARN', 'ERROR', 'FAULT'):
+            return
+        self._debug_events.append(payload)
+        item = QtWidgets.QListWidgetItem(self._format_debug_event(payload))
+        if level == 'WARN':
+            item.setForeground(QtGui.QColor('#ffd166'))
+        else:
+            item.setForeground(QtGui.QColor('#ff4d5e'))
+        item.setData(QtCore.Qt.UserRole, payload)
+        self.debug_log_view.addItem(item)
+        while self.debug_log_view.count() > _MAX_DEBUG_EVENTS:
+            self.debug_log_view.takeItem(0)
+        self.debug_log_view.scrollToBottom()
+        if not self.debug_panel.isVisible():
+            self._unseen_debug_count += 1
+            self._refresh_debug_button_text()
+        self._log(f'디버그 이벤트: {self._format_debug_event(payload)}')
+
+    def _show_debug_event_detail(self, item):
+        payload = item.data(QtCore.Qt.UserRole)
+        if not isinstance(payload, dict):
+            return
+        data = payload.get('data') or {}
+        detail = self._format_debug_event(payload)
+        if data:
+            detail = f'{detail}\n\n수치:\n' + '\n'.join(
+                f'- {key}: {value}' for key, value in sorted(data.items()))
+        QtWidgets.QMessageBox.information(self, '오류 확인', detail)
 
     # ---- 카메라 ----
 

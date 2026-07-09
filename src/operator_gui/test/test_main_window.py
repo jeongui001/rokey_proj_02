@@ -281,6 +281,36 @@ def test_stt_command_updates_label(window, qtbot):
     assert '스패너 갖다줘' in window.stt_command_label.text()
 
 
+def test_stt_status_updates_label(window, qtbot):
+    with qtbot.waitSignal(window.stt_status_received, timeout=1000):
+        window.ros_client.on_stt_status(
+            'wakeword_detected', 'wakeWord가 인식되었습니다. 명령어를 말해주세요.', {})
+
+    assert '명령어를 말해주세요' in window.stt_status_label.text()
+
+
+def test_debug_event_button_collects_warn_events(window, qtbot):
+    payload = {
+        'node': 'vision_node',
+        'level': 'WARN',
+        'category': 'TRACK_TOOL',
+        'reason': 'target_missing',
+        'message': '요청한 tool_class의 유효 3D 추적 결과가 없습니다.',
+        'data': {'looking_for': 'wrench'},
+    }
+
+    with qtbot.waitSignal(window.debug_event_received, timeout=1000):
+        window.ros_client.on_debug_event(payload)
+
+    assert window.debug_log_view.count() == 1
+    assert window.debug_toggle_button.text() == '오류 확인 (1)'
+
+    qtbot.mouseClick(window.debug_toggle_button, Qt.LeftButton)
+
+    assert window.debug_panel.isVisible()
+    assert window.debug_toggle_button.text() == '오류 확인'
+
+
 # ---- 연결 상태 ----
 
 def test_connection_status_changes_update_label_and_log(window, qtbot):

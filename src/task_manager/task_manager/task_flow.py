@@ -226,43 +226,82 @@ class TaskFlow:
         판정한다. 조건은 모두 ROS 파라미터로 관리하며(trigger.*), 미합의 값은
         sentinel(-1/빈 문자열)로 두어 항상 False(트리거 안 됨)를 반환하게 한다
         (config_ready=false와 별개의 방어선)."""
+        def reject(reason, message, data=None):
+            self._debug_event(
+                'WARN', 'TRIGGER_REJECT', reason, message, data,
+                throttle_s=1.0, log=False)
+            return False
         if self.current_tool is None:
-            return False
+            return reject('no_current_tool', 'current_tool이 없어 ToolTrack을 무시합니다.')
         if tool_track_msg.tool_class != self.current_tool:
-            return False
+            return reject(
+                'class_mismatch', '요청 공구와 검출 공구가 다릅니다.',
+                {'expected': self.current_tool, 'actual': tool_track_msg.tool_class})
 
         confidence = tool_track_msg.confidence
         if not math.isfinite(confidence) or confidence < 0.0 or confidence > 1.0:
-            return False  # NaN/Inf 또는 유효 범위(0.0~1.0) 밖의 confidence는 항상 거부
+            return reject(
+                'invalid_confidence',
+                'confidence가 NaN/Inf이거나 0.0~1.0 범위를 벗어났습니다.',
+                {'confidence': confidence})
         min_confidence = float(self.get_parameter('trigger.min_confidence').value)
         if min_confidence < 0.0 or confidence < min_confidence:
-            return False
+            return reject(
+                'low_confidence',
+                'confidence가 트리거 기준보다 낮거나 기준값이 미설정입니다.',
+                {'confidence': confidence, 'min_confidence': min_confidence})
 
         if (bool(self.get_parameter('trigger.require_depth_valid').value)
                 and not tool_track_msg.depth_valid):
-            return False
+            return reject(
+                'depth_invalid', 'depth_valid=false라 트리거하지 않습니다.',
+                {'require_depth_valid': True})
         if (bool(self.get_parameter('trigger.require_approaching').value)
                 and not tool_track_msg.approaching):
-            return False
+            return reject(
+                'not_approaching', 'approaching=false라 트리거하지 않습니다.',
+                {'require_approaching': True})
 
         required_frame_id = self.get_parameter('trigger.required_frame_id').value
         if not required_frame_id or tool_track_msg.header.frame_id != required_frame_id:
-            return False
+            return reject(
+                'frame_mismatch',
+                'ToolTrack frame_id가 트리거 기준과 다르거나 기준값이 미설정입니다.',
+                {'expected': required_frame_id, 'actual': tool_track_msg.header.frame_id})
 
         max_track_age_s = float(self.get_parameter('trigger.max_track_age_s').value)
         if max_track_age_s < 0.0:
-            return False
+            return reject(
+                'track_age_unconfigured', 'max_track_age_s가 미설정이라 트리거하지 않습니다.',
+                {'max_track_age_s': max_track_age_s})
         stamp = tool_track_msg.header.stamp
         msg_time_s = stamp.sec + stamp.nanosec * 1e-9
         now_s = self.get_clock().now().nanoseconds * 1e-9
         age_s = now_s - msg_time_s
         if age_s < 0.0 or age_s > max_track_age_s:
-            return False
+            return reject(
+                'track_age_out_of_range',
+                'ToolTrack 타임스탬프가 너무 오래됐거나 미래 시각입니다.',
+                {'age_s': age_s, 'max_track_age_s': max_track_age_s})
 
         position = tool_track_msg.pose.position
         if not all(math.isfinite(v) for v in (position.x, position.y, position.z)):
-            return False
+            return reject(
+                'invalid_position',
+                'ToolTrack 좌표가 NaN/Inf입니다.',
+                {'x': position.x, 'y': position.y, 'z': position.z})
 
+        self._debug_event(
+            'INFO', 'TRIGGER_ACCEPT', 'criteria_met', 'servo_pick 트리거 기준을 통과했습니다.',
+            {
+                'tool_class': tool_track_msg.tool_class,
+                'confidence': confidence,
+                'frame_id': tool_track_msg.header.frame_id,
+                'age_s': age_s,
+                'depth_valid': bool(tool_track_msg.depth_valid),
+                'approaching': bool(tool_track_msg.approaching),
+            },
+            throttle_s=1.0, log=False)
         return True
 
     def _get_grasp_spec(self, tool_class: str):
@@ -271,6 +310,10 @@ class TaskFlow:
         None을 반환한다 - 호출측은 이 경우 (0.0, 0.0) 같은 값으로 조용히 servo_pick을
         보내지 않아야 한다."""
         if tool_class not in SUPPORTED_TOOL_CLASSES:
+            self._debug_event(
+                'WARN', 'GRASP_SPEC_REJECT', 'unsupported_tool',
+                '지원하지 않는 tool_class라 grasp spec을 읽지 않습니다.',
+                {'tool_class': tool_class}, throttle_s=1.0)
             return None
         prefix = f'tools.{tool_class}'
         width_mm = float(self.get_parameter(f'{prefix}.width_mm').value)
@@ -280,13 +323,40 @@ class TaskFlow:
 
         if not all(math.isfinite(v) for v in (
                 width_mm, force_n, verify_min_width_mm, verify_max_width_mm)):
+            self._debug_event(
+                'WARN', 'GRASP_SPEC_REJECT', 'nonfinite_value',
+                'grasp spec에 NaN/Inf가 포함되어 있습니다.',
+                {'tool_class': tool_class}, throttle_s=1.0)
             return None  # NaN/Inf가 하나라도 있으면 신뢰할 수 없다
 
         if width_mm <= 0.0 or force_n <= 0.0:
+            self._debug_event(
+                'WARN', 'GRASP_SPEC_REJECT', 'open_close_unconfigured',
+                'width_mm 또는 force_n이 미설정/무효입니다.',
+                {'tool_class': tool_class, 'width_mm': width_mm, 'force_n': force_n},
+                throttle_s=1.0)
             return None  # 미설정 - 추측값으로 servo_pick을 보내지 않는다
         if verify_min_width_mm < 0.0 or verify_max_width_mm <= 0.0:
+            self._debug_event(
+                'WARN', 'GRASP_SPEC_REJECT', 'verify_range_unconfigured',
+                '파지 검증 폭 범위가 미설정/무효입니다.',
+                {
+                    'tool_class': tool_class,
+                    'verify_min_width_mm': verify_min_width_mm,
+                    'verify_max_width_mm': verify_max_width_mm,
+                },
+                throttle_s=1.0)
             return None
         if verify_min_width_mm > verify_max_width_mm:
+            self._debug_event(
+                'WARN', 'GRASP_SPEC_REJECT', 'verify_range_inverted',
+                'verify_min_width_mm가 verify_max_width_mm보다 큽니다.',
+                {
+                    'tool_class': tool_class,
+                    'verify_min_width_mm': verify_min_width_mm,
+                    'verify_max_width_mm': verify_max_width_mm,
+                },
+                throttle_s=1.0)
             return None  # 설정 오류
 
         return GraspSpec(
@@ -344,10 +414,19 @@ class TaskFlow:
 
     def _handle_servo_pick_result(self, result):
         if not result.success:
-            if result.message in ('lost', 'timeout', 'diverged'):
+            recoverable = ('lost', 'tracking_lost', 'timeout', 'diverged', 'diverging')
+            if result.message in recoverable:
+                self._debug_event(
+                    'WARN', 'SERVO_PICK_FAIL', result.message,
+                    'servo_pick 실패를 재검출 가능한 사유로 판단해 DETECT_TRACK으로 복귀합니다.',
+                    {'recoverable_reasons': recoverable}, log=True)
                 self._set_state(State.DETECT_TRACK, detail=result.message)
                 self._start_detect_track_timer()
             else:
+                self._debug_event(
+                    'ERROR', 'SERVO_PICK_FAIL', 'unrecoverable_reason',
+                    'servo_pick 실패 사유가 재검출 정책에 없어 FAULT로 전환합니다.',
+                    {'result_message': result.message}, log=True)
                 self._enter_fault(result.message)
             return
         self._set_state(State.VERIFY_GRASP)
@@ -356,6 +435,15 @@ class TaskFlow:
             self._set_state(State.MOVE_SAFE, detail=f'{self.current_tool} 파지 완료')
             self._send_robot_goal('move_named', named_target='handover_safe')
             return
+        self._debug_event(
+            'WARN', 'VERIFY_GRASP_FAIL', 'criteria_not_met',
+            'servo_pick은 성공했지만 파지 검증 기준을 통과하지 못했습니다.',
+            {
+                'grip_detected': bool(result.grip_detected),
+                'final_width_mm': result.final_width_mm,
+                'active_spec': self._active_grasp_spec.__dict__ if self._active_grasp_spec else None,
+            },
+            log=True)
         self._verify_grasp_retries += 1
         max_retries = self.get_parameter('verify_grasp_max_retries').value
         if self._verify_grasp_retries > max_retries:

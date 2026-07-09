@@ -29,6 +29,11 @@ class ActionCoordinator:
         self._recovery_in_progress = False
         self.safety_state = Safety.FAULT
         self._publish_status(detail='취소 확인 타임아웃 - 안전을 위해 FAULT로 전환합니다.')
+        self._debug_event(
+            'ERROR', 'ACTION_CANCEL', 'timeout',
+            'goal 취소 완료를 제한 시간 안에 확인하지 못했습니다.',
+            {'state': self.state},
+            log=True)
 
     # ---- Action 취소 (STOP / 모드 전환 / Fault 공용) ----
 
@@ -81,6 +86,11 @@ class ActionCoordinator:
         self._set_vision_mode(SetVisionMode.Request.OFF)
         self._publish_status(
             detail=f'{context_label} 예외: {exc} - 안전을 위해 FAULT로 전환합니다.')
+        self._debug_event(
+            'ERROR', 'ACTION_EXCEPTION', context_label,
+            'RobotTask action 통신 경계에서 예외가 발생했습니다.',
+            {'error': str(exc), 'state': self.state},
+            log=True)
 
     # ---- 안전/고장 처리 ----
 
@@ -88,6 +98,11 @@ class ActionCoordinator:
                          grasp_width_mm=0.0, grasp_force_n=0.0):
         if self._goal_in_progress:
             self.get_logger().warn(f'{task_type} 요청 무시 - 이미 진행 중인 goal이 있습니다.')
+            self._debug_event(
+                'WARN', 'GOAL_SEND_SKIP', 'goal_in_progress',
+                '이미 진행 중인 goal이 있어 새 goal 송신을 생략했습니다.',
+                {'task_type': task_type, 'state': self.state},
+                throttle_s=1.0)
             return
         self._goal_in_progress = True
         self._goal_generation += 1

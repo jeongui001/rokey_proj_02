@@ -1,3 +1,4 @@
+import json
 import os
 import threading
 import time
@@ -157,6 +158,11 @@ class RobotControlNode(Node, TaskExecutor):
         # 실측으로 잡을 때만 켠다 - 기본 실행에서는 로그 스팸을 피하기 위해 false.
         self.declare_parameter('safety.debug_log_tool_force', False)
         self.declare_parameter('gripper_poll_period_s', 0.5)
+        # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
+        self.declare_parameter('debug.publish_events', True)
+        self.declare_parameter('debug.log_servo_decisions', False)
+        self.declare_parameter('debug.log_safety_samples', False)
+        self.declare_parameter('debug.log_gripper', False)
 
         # base_link -> link_6 TF는 이 노드가 방송하지 않는다. dsr_bringup2가 띄우는
         # /dsr01/robot_state_publisher가 /dsr01/joint_states(실측 100Hz, ros2_control)로
@@ -285,6 +291,7 @@ class RobotControlNode(Node, TaskExecutor):
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.
         self.pub_gripper_state = self.create_publisher(GripperState, '/gripper/state', 10)
         self.pub_fault = self.create_publisher(String, '/robot/fault', 10)
+        self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
 
         self._init_doosan_driver()
 
@@ -343,6 +350,43 @@ class RobotControlNode(Node, TaskExecutor):
     def safety_state(self, value):
         self.safety_monitor.state = value
 
+    def _debug_event(
+            self, level, category, reason, message, data=None,
+            *, throttle_s=None, log=False):
+        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트."""
+        now = time.monotonic()
+        key = (level, category, reason)
+        if throttle_s is not None:
+            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            if now - last < throttle_s:
+                return
+            if not hasattr(self, '_debug_event_last'):
+                self._debug_event_last = {}
+            self._debug_event_last[key] = now
+        payload = {
+            'node': self.get_name(),
+            'level': level,
+            'category': category,
+            'reason': reason,
+            'message': message,
+            'data': data or {},
+            'stamp_monotonic': now,
+        }
+        if bool(self.get_parameter('debug.publish_events').value):
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self.pub_debug_events.publish(msg)
+        if log:
+            text = (
+                f'[ROBOT][{category}] level={level} reason={reason} '
+                f'message={message} data={payload["data"]}')
+            if level in ('ERROR', 'FAULT'):
+                self.get_logger().error(text)
+            elif level == 'WARN':
+                self.get_logger().warn(text)
+            else:
+                self.get_logger().info(text)
+
     @property
     def _latest_robot_state(self):
         return self.safety_monitor.latest_robot_state
@@ -385,6 +429,10 @@ class RobotControlNode(Node, TaskExecutor):
             fault_msg = String()
             fault_msg.data = f'{FaultPrefix.FAULT}DoosanDriver 초기화 실패: {exc}'
             self.pub_fault.publish(fault_msg)
+            self._debug_event(
+                'ERROR', 'INIT', 'doosan_driver_init_failed',
+                'DoosanDriver 초기화에 실패했습니다.',
+                {'error': str(exc)}, log=True)
             return
         self._init_drfl_force_monitor()
 
@@ -423,6 +471,11 @@ class RobotControlNode(Node, TaskExecutor):
         reason = (
             f'{FaultPrefix.FAULT}예상하지 못한 외력이 감지되었습니다(이동 중 포함 직접 감지) '
             f'(joint={joint_index + 1}, 값={value:.1f} Nm, 기준={threshold:.1f} Nm).')
+        self._debug_event(
+            'ERROR', 'SAFETY_FORCE_TRIGGER', 'external_torque_threshold',
+            'DRFL 직접 외력 감지가 임계값을 넘었습니다.',
+            {'joint': joint_index + 1, 'value_nm': value, 'threshold_nm': threshold},
+            log=True)
         self.safety_monitor.declare_fault(reason)
 
     def destroy_node(self):
@@ -435,24 +488,45 @@ class RobotControlNode(Node, TaskExecutor):
     def _goal_callback(self, goal_request):
         if self.safety_state != SafetyState.NORMAL:
             self.get_logger().warn(f'Goal 거부 - safety_state={self.safety_state}')
+            self._debug_event(
+                'WARN', 'GOAL_REJECT', 'safety_not_normal',
+                '안전상태가 NORMAL이 아니어서 goal을 거부했습니다.',
+                {'task_type': goal_request.task_type, 'safety_state': self.safety_state},
+                log=True)
             return GoalResponse.REJECT
         if goal_request.task_type not in self._handlers:
             self.get_logger().warn(f'Goal 거부 - 알 수 없는 task_type: {goal_request.task_type}')
+            self._debug_event(
+                'WARN', 'GOAL_REJECT', 'unknown_task_type',
+                '알 수 없는 RobotTask task_type입니다.',
+                {'task_type': goal_request.task_type}, log=True)
             return GoalResponse.REJECT
         if (goal_request.task_type == 'servo_pick' and self.hardware_enabled
                 and not self.get_parameter('servo_pick.hardware_ready').value):
             self.get_logger().warn(
                 'Goal 거부 - servo_pick.hardware_ready=false (ToolTrack 좌표 변환 미검증)')
+            self._debug_event(
+                'WARN', 'GOAL_REJECT', 'servo_pick_hardware_not_ready',
+                'servo_pick.hardware_ready=false라 실제 서보 goal을 거부했습니다.',
+                {'hardware_enabled': self.hardware_enabled}, log=True)
             return GoalResponse.REJECT
         if (goal_request.task_type == 'handover_approach' and self.hardware_enabled
                 and not self.get_parameter('handover_approach.hardware_ready').value):
             self.get_logger().warn(
                 'Goal 거부 - handover_approach.hardware_ready=false (hand_pose 좌표 변환 미검증)')
+            self._debug_event(
+                'WARN', 'GOAL_REJECT', 'handover_approach_hardware_not_ready',
+                'handover_approach.hardware_ready=false라 접근 goal을 거부했습니다.',
+                {'hardware_enabled': self.hardware_enabled}, log=True)
             return GoalResponse.REJECT
         # goal 수락 경쟁(TOCTOU) 방지: 락 안에서 원자적으로 하나만 예약한다.
         with self._goal_lock:
             if self._goal_reserved:
                 self.get_logger().warn('Goal 거부 - 이미 실행 중(또는 취소 처리 중)인 goal이 있습니다.')
+                self._debug_event(
+                    'WARN', 'GOAL_REJECT', 'goal_reserved',
+                    '이미 실행 중인 goal이 있어 새 goal을 거부했습니다.',
+                    {'task_type': goal_request.task_type}, log=True)
                 return GoalResponse.REJECT
             self._goal_reserved = True
         return GoalResponse.ACCEPT
@@ -490,6 +564,18 @@ class RobotControlNode(Node, TaskExecutor):
                     f'fz={tool_force[2]:.1f} mx={tool_force[3]:.1f} my={tool_force[4]:.1f} '
                     f'mz={tool_force[5]:.1f} (N, Nm / DR_BASE 기준)',
                     throttle_duration_sec=1.0)
+        if bool(self.get_parameter('debug.log_safety_samples').value):
+            self._debug_event(
+                'INFO', 'SAFETY_SAMPLE', 'poll',
+                '안전 상태 샘플입니다.',
+                {
+                    'robot_state': state.get('robot_state') if isinstance(state, dict) else None,
+                    'tool_force': state.get('tool_force') if isinstance(state, dict) else None,
+                    'ext_torque': state.get('ext_torque') if isinstance(state, dict) else None,
+                    'sample_seq': state.get('sample_seq') if isinstance(state, dict) else None,
+                },
+                throttle_s=1.0,
+                log=True)
         reason = self._check_fault(state)
         if reason is not None and reason != self._last_fault_reason:
             self._declare_fault(reason)
@@ -500,6 +586,13 @@ class RobotControlNode(Node, TaskExecutor):
         msg.width_mm = width_mm
         msg.grip_detected = grip_detected
         self.pub_gripper_state.publish(msg)
+        if bool(self.get_parameter('debug.log_gripper').value):
+            self._debug_event(
+                'INFO', 'GRIPPER_SAMPLE', 'poll',
+                'RG2 상태 샘플입니다.',
+                {'width_mm': width_mm, 'grip_detected': bool(grip_detected)},
+                throttle_s=1.0,
+                log=True)
 
     def _on_tf_broadcast_timer(self):
         """GetCurrentPosx를 폴링해 servo_pick의 TCP 위치 캐시(_tcp_pose_cache)를

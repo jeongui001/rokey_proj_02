@@ -23,14 +23,19 @@ class _FakeOwner:
         self.fault_calls = []
         self.camera_image_calls = []
         self.mic_level_calls = []
+        self.stt_status_calls = []
         self.stt_command_calls = []
+        self.debug_event_calls = []
         self.on_task_status = lambda state, detail, mode, safety, resumable: (
             self.task_status_calls.append((state, detail, mode, safety, resumable)))
         self.on_gripper_state = lambda width, grip: self.gripper_state_calls.append((width, grip))
         self.on_fault = lambda msg: self.fault_calls.append(msg)
         self.on_camera_image = lambda data: self.camera_image_calls.append(data)
         self.on_mic_level = lambda level: self.mic_level_calls.append(level)
+        self.on_stt_status = lambda state, detail, data: self.stt_status_calls.append(
+            (state, detail, data))
         self.on_stt_command = lambda text: self.stt_command_calls.append(text)
+        self.on_debug_event = lambda payload: self.debug_event_calls.append(payload)
 
 
 @pytest.fixture
@@ -119,6 +124,31 @@ def test_stt_command_callback_forwards_text(node, owner, peer):
 
     assert _spin_until(node, lambda: owner.stt_command_calls)
     assert owner.stt_command_calls == ['스패너 갖다줘']
+
+
+def test_stt_status_callback_parses_json(node, owner, peer):
+    pub = peer.create_publisher(String, '/stt/status', 10)
+    time.sleep(0.3)
+    pub.publish(String(data='{"state": "wakeword_detected", "detail": "말해주세요", "data": {"rms": 10}}'))
+
+    assert _spin_until(node, lambda: owner.stt_status_calls)
+    assert owner.stt_status_calls == [('wakeword_detected', '말해주세요', {'rms': 10})]
+
+
+def test_debug_event_callback_parses_json(node, owner, peer):
+    pub = peer.create_publisher(String, '/debug/events', 10)
+    time.sleep(0.3)
+    pub.publish(String(
+        data='{"node": "vision_node", "level": "WARN", '
+             '"category": "TRACK_TOOL", "reason": "target_missing"}'))
+
+    assert _spin_until(node, lambda: owner.debug_event_calls)
+    assert owner.debug_event_calls == [{
+        'node': 'vision_node',
+        'level': 'WARN',
+        'category': 'TRACK_TOOL',
+        'reason': 'target_missing',
+    }]
 
 
 def test_publish_command_sends_message(node, peer):

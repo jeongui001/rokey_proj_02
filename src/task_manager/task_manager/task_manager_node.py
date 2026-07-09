@@ -1,4 +1,5 @@
 import json
+import time
 
 import rclpy
 from rclpy.action import ActionClient
@@ -45,6 +46,9 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 받을 수 있도록 /task/status를 주기적으로 재발행한다. 순수 통신 목적의
         # 값이며, 이 자체가 state/detail을 바꾸지는 않는다 (_on_status_publish_timer).
         self.declare_parameter('status_publish_period_s', 1.0)
+        # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
+        self.declare_parameter('debug.publish_events', True)
+        self.declare_parameter('debug.log_task_decisions', False)
 
         # AUTO 설정 준비 게이트 - false(기본값)면 AUTO/MANUAL 모드 어느 쪽에서도
         # 실제 물체 가져오기 goal은 보내지 않는다 (_handle_fetch_tool 참고).
@@ -123,6 +127,7 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
             durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.pub_status = self.create_publisher(String, '/task/status', status_qos)
+        self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
         self.sub_command = self.create_subscription(
             String, '/user_command/text', self._on_user_command, 10)
         self.sub_tool_track = self.create_subscription(
@@ -142,6 +147,43 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 초기화가 끝난 뒤 초기 상태(IDLE/MANUAL/NORMAL)를 즉시 한 번 발행한다 -
         # 초기 연결된 GUI가 첫 상태를 기다리지 않게 한다.
         self._publish_status(detail='')
+
+    def _debug_event(
+            self, level, category, reason, message, data=None,
+            *, throttle_s=None, log=False):
+        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트."""
+        now = time.monotonic()
+        key = (level, category, reason)
+        if throttle_s is not None:
+            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            if now - last < throttle_s:
+                return
+            if not hasattr(self, '_debug_event_last'):
+                self._debug_event_last = {}
+            self._debug_event_last[key] = now
+        payload = {
+            'node': self.get_name(),
+            'level': level,
+            'category': category,
+            'reason': reason,
+            'message': message,
+            'data': data or {},
+            'stamp_monotonic': now,
+        }
+        if bool(self.get_parameter('debug.publish_events').value):
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self.pub_debug_events.publish(msg)
+        if log or bool(self.get_parameter('debug.log_task_decisions').value):
+            text = (
+                f'[TASK][{category}] level={level} reason={reason} '
+                f'message={message} data={payload["data"]}')
+            if level in ('ERROR', 'FAULT'):
+                self.get_logger().error(text)
+            elif level == 'WARN':
+                self.get_logger().warn(text)
+            else:
+                self.get_logger().info(text)
 
     def _publish_status(self, detail=''):
         self._last_status_detail = detail
@@ -168,8 +210,14 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         self._publish_status(self._last_status_detail)
 
     def _set_state(self, new_state, detail=''):
+        old_state = self.state
         self.state = new_state
         self._publish_status(detail)
+        if old_state != new_state:
+            self._debug_event(
+                'INFO', 'STATE', 'state_transition', 'task state changed',
+                {'from': old_state, 'to': new_state, 'detail': detail},
+                log=False)
 
     # ---- 업무 상태 타이머 정리 (DETECT_TRACK / WAIT_PULL) ----
 
