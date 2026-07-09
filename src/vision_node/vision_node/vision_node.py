@@ -11,16 +11,15 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from tf2_ros import Buffer, TransformListener, TransformException
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
-from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 
-from handover_interfaces.msg import ToolTrack, DetectionArray
+from handover_interfaces.msg import ToolTrack, HandTrack, DetectionArray
 from handover_interfaces.srv import SetVisionMode
 
 from vision_node.tracking import (
     ToolTracker, pixel_to_camera_xyz, transform_to_matrix, camera_to_base, is_approaching,
 )
-from vision_node.hand_tracking import create_hands_detector, detect_hand_wrist_pixel
+from vision_node.hand_tracking import create_hands_detector, detect_hand_landmarks, is_fist
 from vision_node.grasp_geometry import (
     AxisSmoother, is_bbox_at_edge, patch_median_depth, tool_axis_from_depth,
     yaw_deg_to_quaternion,
@@ -79,6 +78,11 @@ class VisionNode(Node):
         # 개발/모니터링용 bbox+축 오버레이 이미지 발행 여부 (전체 계획.md 4.6절 계약 -
         # operator_gui가 구독 예정). 매 프레임 인코딩 비용이 있으니 필요 없으면 끌 수 있게 파라미터화.
         self.declare_parameter('vision.publish_debug_image', True)
+        # 주먹 확정에 필요한 연속 프레임 수 - 매 프레임 판별 결과가 떨려도(관절 각도가
+        # 경계값 근처일 때) 한두 프레임 잘못 잡혔다고 바로 로봇을 멈추지 않게 디바운스한다.
+        # HandTrack.fist는 이미 이 확인을 거친 "확정된" 값이라는 계약이라(robot_control의
+        # HandServoLoop는 재확인 없이 바로 정지 처리), 여기서 debounce를 책임진다.
+        self.declare_parameter('vision.fist_confirm_frames', 5)
         # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
         self.declare_parameter('debug.log_vision_decisions', False)
@@ -98,9 +102,10 @@ class VisionNode(Node):
         self.axis_smoother = AxisSmoother(
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
         self._hands_detector = None  # 지연 생성 (TRACK_HAND 최초 진입 시 create_hands_detector() 호출)
+        self._fist_confirm_count = 0  # 연속으로 주먹으로 판별된 프레임 수(_on_set_mode에서 리셋)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
-        self.pub_hand_pose = self.create_publisher(PoseStamped, '/vision/hand_pose', 10)  # 서브스크라이버: task_manager
+        self.pub_hand_track = self.create_publisher(HandTrack, '/vision/hand_track', 10)  # 서브스크라이버: robot_control(handover_approach 중 직접 구독)
         self.pub_debug_image = self.create_publisher(
             CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
@@ -185,6 +190,8 @@ class VisionNode(Node):
         if request.mode == SetVisionMode.Request.TRACK_TOOL:
             self.tracker.reset()
             self.axis_smoother.reset(request.tool_class)  # 이전 사이클의 축 이력도 함께 초기화
+        elif request.mode == SetVisionMode.Request.TRACK_HAND:
+            self._fist_confirm_count = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
         return response
@@ -224,10 +231,10 @@ class VisionNode(Node):
             if track is not None:
                 self.pub_tool_track.publish(track)
         elif self.mode == SetVisionMode.Request.TRACK_HAND:
-            hand_pose = self._safe_call(
+            hand_track = self._safe_call(
                 self._track_hand, color_msg, depth_msg, info_msg, tf_at_stamp, default=None)
-            if hand_pose is not None:
-                self.pub_hand_pose.publish(hand_pose)
+            if hand_track is not None:
+                self.pub_hand_track.publish(hand_track)
         # mode == OFF면 아무것도 안 하고 그냥 리턴 (프레임 버림)
 
     def _tf_matrix(self, tf_at_stamp):
@@ -491,53 +498,81 @@ class VisionNode(Node):
         self.pub_debug_image.publish(msg)
 
     def _track_hand(self, color_msg, depth_msg, info_msg, tf_at_stamp):
-        """MediaPipe로 손목을 검출해 PoseStamped를 만든다."""
+        """MediaPipe로 매 프레임 손 위치·주먹 여부를 판별해 HandTrack을 만든다.
+
+        ToolTrack과 달리 미검출/복원 실패 프레임도 detected=False로 계속 발행한다 -
+        robot_control의 HandServoLoop는 "마지막으로 메시지를 받은 시각"으로 손 유실
+        (t_lost_s)을 판정하므로(should_abort와 동일한 설계), 이 노드가 조용히 멈추지
+        않고 매 프레임 신호를 보내야 한다. 반환값은 절대 None이 아니다(_safe_call의
+        NotImplementedError 경로만 예외)."""
+        track = HandTrack()
+        track.header = color_msg.header
+        track.header.frame_id = 'base_link'
+        track.pose.orientation.w = 1.0  # 손 자세는 위치만 쓰고 방향은 무시
+
         if self._hands_detector is None:
             self._hands_detector = create_hands_detector()
 
         image = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-        wrist_px = detect_hand_wrist_pixel(self._hands_detector, image)
-        if wrist_px is None:
+        landmarks, confidence = detect_hand_landmarks(self._hands_detector, image)
+        if landmarks is None:
+            self._fist_confirm_count = 0
             self._debug_event(
                 'WARN', 'TRACK_HAND', 'hand_missing',
-                'MediaPipe가 손목 픽셀을 찾지 못했습니다.',
+                'MediaPipe가 손을 찾지 못했습니다.',
                 throttle_s=1.0)
-            return None  # 손 미검출 - task_manager의 hand_detect_timeout_s가 폴백 처리
+            track.detected = False
+            return track
 
+        h, w = image.shape[:2]
+        px, py = int(landmarks[0].x * w), int(landmarks[0].y * h)  # 0번 = 손목(WRIST)
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-        px, py = wrist_px
         if not (0 <= py < depth_image.shape[0] and 0 <= px < depth_image.shape[1]):
+            self._fist_confirm_count = 0
             self._debug_event(
                 'WARN', 'TRACK_HAND', 'pixel_out_of_bounds',
                 '손목 픽셀이 depth 이미지 범위를 벗어났습니다.',
                 {'px': px, 'py': py, 'width': depth_image.shape[1], 'height': depth_image.shape[0]},
                 throttle_s=1.0)
-            return None
+            track.detected = False
+            return track
         depth_m = float(depth_image[py, px]) / 1000.0
         if depth_m <= 0.0:
+            self._fist_confirm_count = 0
             self._debug_event(
                 'WARN', 'TRACK_HAND', 'invalid_depth',
                 '손목 픽셀 depth가 0 이하입니다.',
                 {'px': px, 'py': py, 'raw_depth_mm': int(depth_image[py, px])},
                 throttle_s=1.0)
-            return None
+            track.detected = False
+            return track
 
         fx, fy, ppx, ppy = (float(info_msg.k[0]), float(info_msg.k[4]),
                             float(info_msg.k[2]), float(info_msg.k[5]))
         cam_xyz = pixel_to_camera_xyz(px, py, depth_m, fx, fy, ppx, ppy)
         base_xyz = camera_to_base(cam_xyz, self._tf_matrix(tf_at_stamp))
 
-        pose = PoseStamped()
-        pose.header = color_msg.header
-        pose.header.frame_id = 'base_link'
-        pose.pose.position.x, pose.pose.position.y, pose.pose.position.z = base_xyz
-        pose.pose.orientation.w = 1.0  # 손 자세는 위치만 쓰고 방향은 무시
+        raw_fist = is_fist(landmarks)
+        self._fist_confirm_count = self._fist_confirm_count + 1 if raw_fist else 0
+        fist_confirm_frames = self.get_parameter('vision.fist_confirm_frames').value
+        confirmed_fist = self._fist_confirm_count >= fist_confirm_frames
+
+        track.pose.position.x, track.pose.position.y, track.pose.position.z = base_xyz
+        track.detected = True
+        track.fist = confirmed_fist
+        track.confidence = confidence
         self._debug_event(
-            'INFO', 'TRACK_HAND', 'hand_pose',
-            'base_link 기준 hand_pose를 발행합니다.',
-            {'px': px, 'py': py, 'depth_m': depth_m, 'base_xyz': [float(v) for v in base_xyz]},
+            'INFO', 'TRACK_HAND', 'hand_track',
+            'base_link 기준 hand_track을 발행합니다.',
+            {
+                'px': px, 'py': py, 'depth_m': depth_m,
+                'base_xyz': [float(v) for v in base_xyz],
+                'raw_fist': raw_fist,
+                'fist_confirm_count': self._fist_confirm_count,
+                'confirmed_fist': confirmed_fist,
+            },
             throttle_s=1.0)
-        return pose
+        return track
 
 
 def main(args=None):

@@ -129,23 +129,25 @@
       # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
       # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
 
-    # handover_safe 도착 후 작업자 손(/vision/hand_pose)에 접근 - movel 기반 단발성
-    # 이동(재계산 없음)으로 구현되어 있다. vision_node._track_hand가 아직 hand_pose를
-    # 발행하지 않는 동안에는 timeout_s 안에 메시지가 안 와서 ABORT로 끝난다(정상 fail-closed).
-    handover_approach:
-      # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
-      # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
-      hand_pose_frame_id: 'base_link'
-      stop_distance_m: 0.05  # 사용자 확정값(5cm)
-      timeout_s: 10.0
-      # movel 이동 속도 - 실측값이 없는 상태라 사람에게 접근하는 동작이므로 보수적으로
-      # 낮게 잡은 기본값이다(named pose 이동보다 훨씬 느림). 실측 후 조정 필요.
-      vel_mm_s: 30.0
-      acc_mm_s2: 100.0
-      # hardware_ready는 vision_node._track_hand가 구현·검증되기 전까지 반드시
-      # false로 유지한다(hand_pose의 frame_id/orientation 의미가 아직 미확정).
-      # 기본값은 코드의 declare_parameter에 있으며 실수로 true를 적지 않기 위해
-      # 여기서는 다시 명시하지 않는다.
+    # handover_safe 도착 후 작업자 손(/vision/hand_track)에 연속 접근 - servo_pick과
+    # 동일한 speedl 기반 RT 서보 루프(HandServoLoop)로 구현되어 있다. vision_node가
+    # 아직 hand_track을 연속 발행/주먹 판정하지 않는 동안에는 hardware_ready=false로
+    # 게이트되어 실제 명령이 나가지 않는다(정상 fail-closed).
+    handover_servo:
+      # HandTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
+      hand_track_frame_id: 'base_link'
+      tcp_pose_max_age_s: 0.2
+      watchdog_poll_interval_s: 0.05
+      kp_xy: 1.2
+      kp_z: 1.2
+      v_max: 0.15         # 사람에게 접근하는 동작이라 servo_pick(0.25)보다 보수적으로 낮게 둔다
+      offset_m: 0.20       # 사용자 확정값 - TCP->손 방향 위, 손 앞 20cm 지점에서 추종을 멈춘다
+      t_lost_s: 0.3
+      timeout_s: 60.0      # 사용자는 "주먹까지 계속 추종"을 원하므로 넉넉히 잡는다(0이면 비활성)
+      command_validate_tolerance: 1.0e-6
+      # hardware_ready는 vision_node의 hand_track 연속 발행/주먹 판정이 구현·검증되기
+      # 전까지 반드시 false로 유지한다. 기본값은 코드의 declare_parameter에 있으며
+      # 실수로 true를 적지 않기 위해 여기서는 다시 명시하지 않는다.
 
     handover_hold:
       # TODO(캘리브레이션 필요): 실제 그리퍼-TCP 장착 방향에 따라 결정해야 한다.

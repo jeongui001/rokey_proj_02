@@ -265,6 +265,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._received_first_status = False
         self._debug_events = deque(maxlen=_MAX_DEBUG_EVENTS)
         self._unseen_debug_count = 0
+        self._right_compact_scale = None
 
         self._build_ui()
         self._wire_signals()
@@ -462,6 +463,16 @@ class MainWindow(QtWidgets.QMainWindow):
         right_container.setLayout(right_panel)
         right_container.setMinimumWidth(320)
         right_container.setMaximumWidth(360)
+        self.right_container = right_container
+        self._right_group_layouts = [
+            mode_layout, pose_grid, estop_layout, free_command_layout, mic_layout, right_panel]
+        self._right_buttons = [
+            self.auto_button, self.manual_button,
+            self.home_button, self.front_button, self.watch_button, self.up_button, self.down_button,
+            self.stop_button, self.reset_button, self.resume_button,
+            self.send_button,
+        ]
+        self._right_groups = [mode_group, move_group, estop_group, cmd_group, mic_group]
 
         # 하단: 시간순 로그 - 최소 10줄 이상 보이도록 높이를 확보한다.
         self.debug_panel = QtWidgets.QGroupBox('오류 확인')
@@ -506,6 +517,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setCentralWidget(container)
         self.resize(960, 680)
         self.setMinimumSize(720, 480)
+        self._apply_right_compact_scale()
 
     def _wire_signals(self):
         self.task_status_received.connect(self._update_task_status)
@@ -861,8 +873,75 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self._apply_right_compact_scale()
         self._render_camera_pixmap()
         self._reposition_camera_overlay()
+
+    def _apply_right_compact_scale(self):
+        """창 높이가 낮을 때 우측 메뉴 전체를 같은 비율로 줄인다.
+
+        Qt 기본 레이아웃 압축에 맡기면 일부 버튼만 먼저 납작해져 보이므로,
+        버튼 높이/폰트/그룹 여백을 한 스케일로 맞춘다.
+        """
+        if not hasattr(self, 'right_container'):
+            return
+        scale = max(0.72, min(1.0, self.height() / 720.0))
+        bucket = round(scale, 2)
+        if self._right_compact_scale == bucket:
+            return
+        self._right_compact_scale = bucket
+
+        font_px = max(10, int(13 * scale))
+        title_px = max(9, int(11 * scale))
+        button_h = max(24, int(40 * scale))
+        input_h = max(28, int(38 * scale))
+        padding_v = max(3, int(8 * scale))
+        padding_h = max(7, int(12 * scale))
+        group_top = max(10, int(16 * scale))
+        group_pad_v = max(6, int(10 * scale))
+        group_pad_h = max(7, int(10 * scale))
+        spacing = max(4, int(8 * scale))
+
+        for button in self._right_buttons:
+            button.setMinimumHeight(button_h)
+            button.setMaximumHeight(button_h)
+        self.command_input.setMinimumHeight(input_h)
+        self.command_input.setMaximumHeight(input_h)
+        self.mic_level_bar.setFixedHeight(max(10, int(16 * scale)))
+        self.stt_command_label.setMaximumHeight(max(26, int(34 * scale)))
+
+        for layout in self._right_group_layouts:
+            layout.setSpacing(spacing)
+            if isinstance(layout, QtWidgets.QGridLayout):
+                layout.setContentsMargins(spacing, spacing, spacing, spacing)
+            else:
+                layout.setContentsMargins(spacing, spacing, spacing, spacing)
+        self.right_container.layout().setContentsMargins(0, 0, 0, 0)
+
+        self.right_container.setStyleSheet(f"""
+QGroupBox {{
+    margin-top: {group_top}px;
+    padding: {group_pad_v}px {group_pad_h}px {group_pad_v}px {group_pad_h}px;
+    font-size: {title_px}px;
+}}
+QGroupBox::title {{
+    top: 1px;
+    left: {group_pad_h}px;
+    padding: 0 5px;
+    font-size: {title_px}px;
+}}
+QPushButton {{
+    padding: {padding_v}px {padding_h}px;
+    font-size: {font_px}px;
+}}
+QLineEdit {{
+    padding: {padding_v}px {padding_h}px;
+    font-size: {font_px}px;
+}}
+QLabel {{
+    font-size: {max(10, int(12 * scale))}px;
+}}
+""")
 
     # ---- 로그 ----
 

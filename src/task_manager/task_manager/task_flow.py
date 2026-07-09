@@ -465,9 +465,10 @@ class TaskFlow:
     def _handle_move_safe_result(self, result):
         if result.success:
             # handover_safe 도착 - 작업대가 보이는 자세에서 YOLO로 손을 찾아 접근한다
-            # (robot_control의 handover_approach - movel 기반 단발성 이동으로 구현됨,
-            # /vision/hand_pose 1회 수신 후 이동. vision_node의 손 추적이 아직
-            # hand_pose를 채워 보내지 않으면 handover_approach.timeout_s로 실패한다).
+            # (robot_control의 handover_approach - HandServoLoop 기반 연속 speedl
+            # 서보로 구현됨, /vision/hand_track을 계속 따라가다 주먹이 확정되면 멈춘다.
+            # vision_node의 손 추적이 아직 hand_track을 채워 보내지 않으면
+            # handover_servo.hardware_ready=false 게이트에 막혀 실패한다).
             self._set_state(State.APPROACH_HAND, detail='작업자를 찾는 중')
             self._start_after_vision_mode(
                 SetVisionMode.Request.TRACK_HAND,

@@ -2,13 +2,13 @@ import time
 
 import rclpy
 import pytest
-from geometry_msgs.msg import PoseStamped
 from rclpy.action import CancelResponse, GoalResponse
 from rclpy.parameter import Parameter
 from std_srvs.srv import Trigger
 
 from handover_interfaces.action import RobotTask
-from handover_interfaces.msg import ToolTrack
+from handover_interfaces.msg import HandTrack, ToolTrack
+from robot_control.hand_servo_loop import HandServoLoop
 from robot_control.robot_control_node import (
     DoosanRobotControl, DoosanRobotState, FaultPrefix, RG2Status, RobotControlNode, SafetyState,
 )
@@ -751,7 +751,7 @@ def test_execute_handover_approach_rejected_when_safety_state_not_normal(node):
 
 
 def test_execute_handover_approach_dry_run_succeeds(node):
-    # hardware_enabled=False(기본) - hand_pose 없이도 흐름만 검증하고 바로 도착 처리.
+    # hardware_enabled=False(기본) - hand_track 없이도 흐름만 검증하고 바로 도착 처리.
     gh = FakeGoalHandle(_goal('handover_approach'))
 
     result = node._execute_handover_approach(gh)
@@ -776,158 +776,287 @@ def test_execute_handover_approach_dry_run_canceled(node, monkeypatch):
     assert result.success is False
 
 
-def _make_hand_pose(x, y, z, frame_id='base_link'):
-    msg = PoseStamped()
+# ---- HandTrack 유효성 검사 (_validate_hand_track_message) ----
+# HandServoLoop는 msg.pose.position을 base_link 기준 절대 손 위치로 직접 사용한다
+# (TCP 오차로 변환하지 않음) - 여기서는 frame_id/NaN만 확인한다.
+
+def _hand_track(frame_id='base_link', x=1.0, y=0.2, z=0.4, detected=True, fist=False):
+    msg = HandTrack()
     msg.header.frame_id = frame_id
     msg.pose.position.x = x
     msg.pose.position.y = y
     msg.pose.position.z = z
     msg.pose.orientation.w = 1.0
+    msg.detected = detected
+    msg.fist = fist
+    msg.confidence = 0.9
     return msg
 
 
-def _enable_handover_approach_hardware(node):
+def test_validate_hand_track_message_accepts_valid_message(node):
+    assert node._validate_hand_track_message(_hand_track(x=1.5, y=0.2, z=0.4)) is True
+
+
+def test_validate_hand_track_message_rejects_wrong_frame_id(node):
+    assert node._validate_hand_track_message(_hand_track(frame_id='camera_link')) is False
+
+
+@pytest.mark.parametrize('x,y,z', [
+    (float('nan'), 0.2, 0.4),
+    (1.5, float('inf'), 0.4),
+    (1.5, 0.2, float('-inf')),
+])
+def test_validate_hand_track_message_rejects_nan_inf_position(node, x, y, z):
+    assert node._validate_hand_track_message(_hand_track(x=x, y=y, z=z)) is False
+
+
+def test_on_hand_track_during_servo_ignores_invalid_message(node):
+    node._validate_hand_track_message = lambda msg: False
+    received = []
+    node.hand_servo_loop.on_hand_track = lambda msg: received.append(msg)
+
+    node._on_hand_track_during_servo(_hand_track())
+
+    assert received == []
+
+
+def test_on_hand_track_during_servo_forwards_raw_message_to_hand_servo_loop(node):
+    msg = _hand_track()
+    received = []
+    node.hand_servo_loop.on_hand_track = lambda m: received.append(m)
+
+    node._on_hand_track_during_servo(msg)
+
+    assert received == [msg]
+
+
+# ---- handover_approach tick (_handover_approach_tick) ----
+
+def test_handover_approach_tick_continue(node):
+    node.hand_servo_loop.tick = lambda: ('CONTINUE', None)
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'CONTINUE'
+    assert reason is None
+
+
+def test_handover_approach_tick_stop_on_fist(node):
+    node.hand_servo_loop.tick = lambda: ('STOP', 'fist_detected')
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'STOP'
+    assert reason == 'fist_detected'
+
+
+def test_handover_approach_tick_abort(node):
+    node.hand_servo_loop.tick = lambda: ('ABORT', 'hand_lost')
+
+    status, reason = node._handover_approach_tick()
+
+    assert status == 'ABORT'
+    assert reason == 'hand_lost'
+
+
+# ---- handover_servo 속도 명령 검증 (_validate_handover_servo_command) ----
+
+def test_validate_handover_servo_command_rejects_nan_inf(node):
+    assert node._validate_handover_servo_command(ServoCommand(vx=float('nan'))) is False
+    assert node._validate_handover_servo_command(ServoCommand(vz=float('inf'))) is False
+
+
+def test_validate_handover_servo_command_rejects_over_v_max(node):
+    v_max = node.get_parameter('handover_servo.v_max').value
+    assert node._validate_handover_servo_command(ServoCommand(vx=v_max * 10)) is False
+    assert node._validate_handover_servo_command(ServoCommand(vz=v_max * 10)) is False
+
+
+def test_validate_handover_servo_command_accepts_within_limits(node):
+    v_max = node.get_parameter('handover_servo.v_max').value
+    cmd = ServoCommand(vx=v_max * 0.5, vy=-v_max * 0.5, vz=v_max * 0.3, yaw_rate=0.0)
+
+    assert node._validate_handover_servo_command(cmd) is True
+
+
+def _enable_handover_servo_hardware(node):
     node.hardware_enabled = True
-    node.set_parameters([Parameter('handover_approach.hardware_ready', value=True)])
+    node.set_parameters([Parameter('handover_servo.hardware_ready', value=True)])
 
 
-def test_execute_handover_approach_moves_toward_hand_and_stops_short(node, monkeypatch):
+def test_handover_approach_execution_sets_and_clears_tcp_tracking_active(node, monkeypatch):
     import time as time_module
-    _enable_handover_approach_hardware(node)
-    move_calls = []
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [0.0, 0.0, 0.0, 10.0, 20.0, 30.0]  # mm, deg
-
-        def move_line(self, goal_handle, pos6, vel2, acc2, **kwargs):
-            move_calls.append(pos6)
-            return True
-
-    node._doosan = _FakeDoosan()
-    hand_pose = _make_hand_pose(1.0, 0.0, 0.0)  # 손이 base_link 기준 +x 1m
-
-    def fake_sleep(_s):
-        node._pending_hand_pose = hand_pose
-
-    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
-    assert len(move_calls) == 1
-    target = move_calls[0]
-    # stop_distance_m(기본 5cm)만큼 못 미친 지점 = x=0.95m=950mm
-    assert target[0] == pytest.approx(950.0)
-    assert target[1] == pytest.approx(0.0)
-    assert target[2] == pytest.approx(0.0)
-    assert list(target[3:6]) == [10.0, 20.0, 30.0]  # 방향각은 현재 TCP 방향 그대로 유지
-    assert node._pending_hand_pose is None  # 사용 후 슬롯 정리됨
-
-
-def test_execute_handover_approach_arrives_without_moving_when_already_close(node, monkeypatch):
-    import time as time_module
-    _enable_handover_approach_hardware(node)
-    move_calls = []
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [0.0] * 6
-
-        def move_line(self, *a, **k):
-            move_calls.append(True)
-            return True
-
-    node._doosan = _FakeDoosan()
-    hand_pose = _make_hand_pose(0.02, 0.0, 0.0)  # stop_distance_m(기본 5cm)보다 가까움
-
-    def fake_sleep(_s):
-        node._pending_hand_pose = hand_pose
-
-    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.succeeded is True
-    assert result.success is True
-    assert move_calls == []
-
-
-def test_execute_handover_approach_aborts_on_hand_pose_timeout(node, monkeypatch):
-    import time as time_module
-    _enable_handover_approach_hardware(node)
-    node.set_parameters([Parameter('handover_approach.timeout_s', value=0.0)])
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [0.0] * 6
-
-        def move_line(self, *a, **k):
-            return True
-
-    node._doosan = _FakeDoosan()
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+
+    observed_during_execution = {'active': None}
+
+    def fake_tick():
+        observed_during_execution['active'] = node._tcp_tracking_active
+        return ('STOP', None)
+
+    node._handover_approach_tick = fake_tick
+    node.hand_servo_loop.get_state = lambda: 'stopping'
+    node.hand_servo_loop.start = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    assert node._tcp_tracking_active is False
+    node._execute_handover_approach(gh)
+
+    assert observed_during_execution['active'] is True  # 실행 중에는 True였다
+    assert node._tcp_tracking_active is False  # 종료 후에는 반드시 해제된다
+
+
+def test_execute_handover_approach_stops_on_fist_and_returns_result(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+
+    ticks = iter(['CONTINUE', 'CONTINUE', 'STOP'])
+    node._handover_approach_tick = lambda: (next(ticks), None)
+    node.hand_servo_loop.step = lambda *a, **k: None
+    node.hand_servo_loop.get_state = lambda: 'following'
+    node.hand_servo_loop.start = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert len(gh.feedback_msgs) == 3
+
+
+def test_execute_handover_approach_calls_move_stop_after_fist_stop(node, monkeypatch):
+    # 주먹 확정(STOP)은 긴급정지가 아니라 의도된 정지지만, HandServoLoop의 STOP은
+    # servo_pick의 CLOSE와 달리 속도 수렴(should_close 같은 조건)을 요구하지 않으므로
+    # _run_rt_tracking이 break만 하고 끝내면 로봇이 마지막 속도로 계속 움직일 수 있다 -
+    # 그래서 ARRIVED 직후 명시적으로 MoveStop을 호출해야 한다.
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    node._handover_approach_tick = lambda: ('STOP', None)
+    node.hand_servo_loop.get_state = lambda: 'stopping'
+    node.hand_servo_loop.start = lambda *a, **k: None
+    node.hand_servo_loop.step = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
+    assert fake.stop_calls == [node.get_parameter('safety.fault_stop_mode').value]
+
+
+def test_execute_handover_approach_declares_fault_when_stop_motion_fails_after_fist(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+    fake = _FakeDoosanDriver()
+    fake.stop_return_value = False
+    node._doosan = fake
+    node._handover_approach_tick = lambda: ('STOP', None)
+    node.hand_servo_loop.get_state = lambda: 'stopping'
+    node.hand_servo_loop.start = lambda *a, **k: None
+    node.hand_servo_loop.step = lambda *a, **k: None
+    published = []
+    node.pub_fault.publish = published.append
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert gh.succeeded is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.FAULT
+    assert len(published) == 1
+    assert published[0].data.startswith(FaultPrefix.FAULT)
+
+
+def test_execute_handover_approach_abort_returns_reason(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+
+    node._handover_approach_tick = lambda: ('ABORT', 'hand_lost')
+    node.hand_servo_loop.get_state = lambda: 'approaching'
+    node.hand_servo_loop.start = lambda *a, **k: None
+
     gh = FakeGoalHandle(_goal('handover_approach'))
 
     result = node._execute_handover_approach(gh)
 
     assert gh.aborted is True
     assert result.success is False
-    assert 'timeout' in result.message.lower()
+    assert result.message == 'hand_lost'
 
 
-def test_execute_handover_approach_aborts_on_frame_id_mismatch(node, monkeypatch):
+def test_execute_handover_approach_cancel_mid_loop_calls_canceled(node, monkeypatch):
     import time as time_module
-    _enable_handover_approach_hardware(node)
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
 
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [0.0] * 6
+    node.hand_servo_loop.get_state = lambda: 'approaching'
+    node.hand_servo_loop.start = lambda *a, **k: None
 
-        def move_line(self, *a, **k):
-            return True
-
-    node._doosan = _FakeDoosan()
-    bad_pose = _make_hand_pose(1.0, 0.0, 0.0, frame_id='camera_link')
-
-    def fake_sleep(_s):
-        node._pending_hand_pose = bad_pose
-
-    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
     gh = FakeGoalHandle(_goal('handover_approach'))
-
-    result = node._execute_handover_approach(gh)
-
-    assert gh.aborted is True
-    assert result.success is False
-
-
-def test_execute_handover_approach_canceled_while_waiting_for_hand_pose(node, monkeypatch):
-    import time as time_module
-    _enable_handover_approach_hardware(node)
-
-    class _FakeDoosan:
-        def get_current_posx(self, ref=0):
-            return [0.0] * 6
-
-        def move_line(self, *a, **k):
-            return True
-
-    node._doosan = _FakeDoosan()
-    gh = FakeGoalHandle(_goal('handover_approach'))
-
-    def fake_sleep(_s):
-        gh.is_cancel_requested = True
-
-    monkeypatch.setattr(time_module, 'sleep', fake_sleep)
+    gh.is_cancel_requested = True
 
     result = node._execute_handover_approach(gh)
 
     assert gh.was_canceled is True
+    assert gh.aborted is False
     assert result.success is False
+
+
+def test_handover_approach_aborts_on_hand_lost(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+
+    node.hand_servo_loop = HandServoLoop(
+        kp_xy=1.2, kp_z=1.2, v_max=0.15, offset_m=0.2, t_lost_s=0.0, timeout_s=5.0)
+    # HandServoLoop.tick()은 on_hand_track이 한 번도 불리지 않으면 _last_msg_time이
+    # None으로 남아 'hand_lost'가 판정되지 않는다 - start() 직후 메시지를 하나
+    # 흘려보내 유실 타이머가 실제로 돌게 만든다.
+    real_start = node.hand_servo_loop.start
+
+    def _start_and_seed(*args, **kwargs):
+        real_start(*args, **kwargs)
+        node.hand_servo_loop.on_hand_track(_hand_track())
+
+    node.hand_servo_loop.start = _start_and_seed
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_handover_approach(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert result.message == 'hand_lost'
+
+
+def test_dispatch_routes_handover_approach(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+    _enable_handover_servo_hardware(node)
+
+    node._handover_approach_tick = lambda: ('STOP', None)
+    node.hand_servo_loop.get_state = lambda: 'stopping'
+    node.hand_servo_loop.start = lambda *a, **k: None
+    node.hand_servo_loop.step = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('handover_approach'))
+
+    result = node._execute_callback(gh)
+
+    assert gh.succeeded is True
+    assert result.success is True
 
 
 # ---- SpeedlStream 발행 직전 마지막 안전 검사 (_validate_servo_command) ----

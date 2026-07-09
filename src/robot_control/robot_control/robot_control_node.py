@@ -24,6 +24,7 @@ from robot_control.safety_monitor import (
     SafetyMonitor,
     SafetyState,
 )
+from robot_control.hand_servo_loop import HandServoLoop
 from robot_control.servo_loop import ServoLoop
 from robot_control.task_executor import TaskExecutor
 
@@ -224,29 +225,40 @@ class RobotControlNode(Node, TaskExecutor):
         # (_on_tf_broadcast_timer 참고, tcp_pose_refresh_period_s 파라미터는 제거됨).
         self.declare_parameter('servo_pick.tcp_pose_max_age_s', 0.2)
 
-        # handover_approach: handover_safe 도착 후 /vision/hand_pose(작업자 손 위치)를
-        # 향해 접근하다 stop_distance_m 이내가 되면 멈춘다(그리퍼 동작 없음 - 이후
-        # handover_hold가 당김을 기다린다). 실제 접근 로직(movel 기반 단발성 이동)은
-        # 아직 구현 전이라 _execute_handover_approach는 게이트 체크 후 TODO를
-        # 반환하는 스텁 상태다 - 아래 파라미터는 그 구현이 재사용할 것들이다.
+        # handover_servo: handover_safe 도착 후 /vision/hand_track(작업자 손 위치, 연속
+        # 스트림)을 따라 TCP->손 방향 위 offset_m 지점을 계속 추종하다 주먹이 확정되면
+        # 멈춘다(그리퍼 동작 없음 - 이후 handover_hold가 당김을 기다린다). servo_pick과
+        # 동일한 speedl 기반 RT 서보 루프(_run_rt_tracking)를 그대로 재사용한다.
         # hardware_ready는 servo_pick.hardware_ready와 같은 이유로 기본 false다:
-        # hand_pose(vision_node._track_hand)가 아직 미구현(NotImplementedError)이라
-        # frame_id/orientation 의미가 검증되지 않았다 - 확정 전까지 실제 속도
-        # 명령 발행을 금지한다.
-        self.declare_parameter('handover_approach.hardware_ready', False)
-        # 사용자가 지정한 접근 정지 거리(5cm) - 실측 협의값.
-        self.declare_parameter('handover_approach.stop_distance_m', 0.05)
-        # hand_pose 수신 대기 타임아웃 - movel 서비스 자체의 왕복 타임아웃(move.timeout_s)과는
-        # 별개로, "메시지가 아예 안 온다"를 감지하기 위한 것이다.
-        self.declare_parameter('handover_approach.timeout_s', 10.0)
-        # hand_pose가 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
-        # TF 변환이 구현되지 않았으므로 다른 frame_id는 거부한다.
-        self.declare_parameter('handover_approach.hand_pose_frame_id', 'base_link')
-        # movel 이동 속도 - 사람에게 접근하는 동작이라 실측 전까지 보수적으로 낮게 둔다
-        # (named pose 이동인 move.vel_deg_s=30deg/s보다 훨씬 느린 속도). hardware_ready가
-        # 기본 false로 게이트되어 있어 실측/검증 전에는 어차피 실제 명령이 나가지 않는다.
-        self.declare_parameter('handover_approach.vel_mm_s', 30.0)
-        self.declare_parameter('handover_approach.acc_mm_s2', 100.0)
+        # hand_track(vision_node._track_hand)이 아직 연속 발행/주먹 판정을 지원하지
+        # 않아 frame_id/orientation/fist 의미가 검증되지 않았다 - 확정 전까지 실제
+        # 속도 명령 발행을 금지한다.
+        self.declare_parameter('handover_servo.hardware_ready', False)
+        self.declare_parameter('handover_servo.control_period_s', 0.01)
+        self.declare_parameter('handover_servo.speedl_acc_trans_mm_s2', 100.0)
+        self.declare_parameter('handover_servo.speedl_acc_rot_deg_s2', 30.0)
+        # speedl watchdog - servo_pick과 동일한 이유(명령 스트림이 끊겨도 로봇이
+        # 스스로 멈추지 않아 데드맨 스위치가 필요함).
+        self.declare_parameter('handover_servo.watchdog_timeout_s', 0.2)
+        self.declare_parameter('handover_servo.watchdog_poll_interval_s', 0.05)
+        # HandTrack이 base_link 절대좌표라는 계약을 검증하는 유일한 허용 frame_id.
+        self.declare_parameter('handover_servo.hand_track_frame_id', 'base_link')
+        # TCP 위치 캐시 샘플의 나이(초) 상한 - servo_pick.tcp_pose_max_age_s와 동일한
+        # 이유(_get_current_tcp_posx 참고).
+        self.declare_parameter('handover_servo.tcp_pose_max_age_s', 0.2)
+        # 수평/수직 P 게인 - 사람에게 접근하는 동작이라 v_max는 servo_pick(0.25)보다
+        # 보수적으로 낮게 잡는다.
+        self.declare_parameter('handover_servo.kp_xy', 1.2)
+        self.declare_parameter('handover_servo.kp_z', 1.2)
+        self.declare_parameter('handover_servo.v_max', 0.15)
+        # 사용자 확정값(TCP->손 방향 위, 손 앞 20cm 지점에서 추종을 멈춘다).
+        self.declare_parameter('handover_servo.offset_m', 0.20)
+        # 손 유실 판정 시간 - servo_pick.t_lost(0.3s)와 동일한 성격.
+        self.declare_parameter('handover_servo.t_lost_s', 0.3)
+        # 타임아웃 - 사용자는 "주먹까지 계속 추종"을 원하므로 넉넉히 잡는다(0이면 비활성).
+        self.declare_parameter('handover_servo.timeout_s', 60.0)
+        # _validate_handover_servo_command(task_executor.py)의 부동소수점 비교 허용오차.
+        self.declare_parameter('handover_servo.command_validate_tolerance', 1e-6)
 
         self.hardware_enabled = bool(self.get_parameter('hardware_enabled').value)
         self.safety_monitor = SafetyMonitor(self)
@@ -288,6 +300,15 @@ class RobotControlNode(Node, TaskExecutor):
             p0_vel_reset=self.get_parameter('servo.kalman_p0_vel_reset').value,
         )
 
+        self.hand_servo_loop = HandServoLoop(
+            kp_xy=self.get_parameter('handover_servo.kp_xy').value,
+            kp_z=self.get_parameter('handover_servo.kp_z').value,
+            v_max=self.get_parameter('handover_servo.v_max').value,
+            offset_m=self.get_parameter('handover_servo.offset_m').value,
+            t_lost_s=self.get_parameter('handover_servo.t_lost_s').value,
+            timeout_s=self.get_parameter('handover_servo.timeout_s').value,
+        )
+
         # DoosanDriver 초기화 실패 시 즉시 FAULT를 선언해야 하므로, 발행자를 먼저 만든다.
         self.pub_gripper_state = self.create_publisher(GripperState, '/gripper/state', 10)
         self.pub_fault = self.create_publisher(String, '/robot/fault', 10)
@@ -323,9 +344,6 @@ class RobotControlNode(Node, TaskExecutor):
         # (과거에는 이 폴링과 별도 타이머가 각자 요청을 겹쳐 보내 스레드 고갈을
         # 유발했다).
         self._tcp_pose_request_in_flight = False
-        # handover_approach가 /vision/hand_pose 1개를 받을 때까지 임시로 채워두는
-        # 슬롯 (_on_hand_pose_received/_wait_for_hand_pose 참고).
-        self._pending_hand_pose = None
         # servo_pick 또는 handover_approach가 실제로 실행 중일 때만 TCP 위치를
         # 캐시에 반영한다 - 불필요한 상태 갱신을 피하기 위함이다.
         self._tcp_tracking_active = False
@@ -511,12 +529,12 @@ class RobotControlNode(Node, TaskExecutor):
                 {'hardware_enabled': self.hardware_enabled}, log=True)
             return GoalResponse.REJECT
         if (goal_request.task_type == 'handover_approach' and self.hardware_enabled
-                and not self.get_parameter('handover_approach.hardware_ready').value):
+                and not self.get_parameter('handover_servo.hardware_ready').value):
             self.get_logger().warn(
-                'Goal 거부 - handover_approach.hardware_ready=false (hand_pose 좌표 변환 미검증)')
+                'Goal 거부 - handover_servo.hardware_ready=false (hand_track 좌표 변환 미검증)')
             self._debug_event(
                 'WARN', 'GOAL_REJECT', 'handover_approach_hardware_not_ready',
-                'handover_approach.hardware_ready=false라 접근 goal을 거부했습니다.',
+                'handover_servo.hardware_ready=false라 접근 goal을 거부했습니다.',
                 {'hardware_enabled': self.hardware_enabled}, log=True)
             return GoalResponse.REJECT
         # goal 수락 경쟁(TOCTOU) 방지: 락 안에서 원자적으로 하나만 예약한다.

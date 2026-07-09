@@ -2,10 +2,9 @@ import math
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
 
 from handover_interfaces.action import RobotTask
-from handover_interfaces.msg import ToolTrack
+from handover_interfaces.msg import HandTrack, ToolTrack
 
 from robot_control.rg2_client import RG2Status
 from robot_control.safety_monitor import FaultPrefix, SafetyState
@@ -312,28 +311,29 @@ class TaskExecutor:
                 log=True)
         return command
 
-    def _get_current_tcp_posx(self):
+    def _get_current_tcp_posx(self, max_age_parameter='servo_pick.tcp_pose_max_age_s'):
         """캐시된 최신 TCP 위치를 [x,y,z,rx,ry,rz](mm/deg)로 반환한다.
 
         실제 GetCurrentPosx 서비스 호출은 이 함수가 아니라 robot_control_node의
         _on_tf_broadcast_timer가 TF 방송과 함께 수행하고 결과를 self._tcp_pose_cache에
-        저장한다(_tcp_tracking_active일 때만) - ToolTrack 콜백(60Hz일 수 있음)마다
-        동기 서비스 호출을 하면 여러 요청이 겹쳐 executor 스레드를 점유해 안전상태/
-        E-Stop polling이 늦어질 수 있기 때문이다. 이 함수는 캐시만 읽으므로 절대
-        블로킹하지 않는다. (2026-07-08: 이전에는 별도 _on_tcp_pose_refresh_timer가
+        저장한다(_tcp_tracking_active일 때만) - ToolTrack/HandTrack 콜백(60Hz일 수
+        있음)마다 동기 서비스 호출을 하면 여러 요청이 겹쳐 executor 스레드를 점유해
+        안전상태/E-Stop polling이 늦어질 수 있기 때문이다. 이 함수는 캐시만 읽으므로
+        절대 블로킹하지 않는다. (2026-07-08: 이전에는 별도 _on_tcp_pose_refresh_timer가
         독립적으로 GetCurrentPosx를 폴링했으나, TF 방송 폴링과 같은 서비스를 이중
         호출해 스레드 고갈을 유발해 하나로 합쳤다.)
 
         hardware_enabled=false에서는 캐시가 애초에 채워지지 않으므로 항상 None을
-        반환한다. 캐시가 없거나 servo_pick.tcp_pose_max_age_s보다 오래됐으면(=조회
-        실패가 계속돼 오래된 값을 무한정 재사용하게 되는 경우 포함) None을 반환해
-        호출측이 임의의 기본 좌표를 쓰지 않게 한다."""
+        반환한다. 캐시가 없거나 max_age_parameter(서보 루프별로 다른 파라미터를 쓸 수
+        있음 - servo_pick.tcp_pose_max_age_s / handover_servo.tcp_pose_max_age_s)보다
+        오래됐으면(=조회 실패가 계속돼 오래된 값을 무한정 재사용하게 되는 경우 포함)
+        None을 반환해 호출측이 임의의 기본 좌표를 쓰지 않게 한다."""
         if not self.hardware_enabled:
             return None
         cache = self._tcp_pose_cache
         if cache is None:
             return None
-        max_age_s = self.get_parameter('servo_pick.tcp_pose_max_age_s').value
+        max_age_s = self.get_parameter(max_age_parameter).value
         age_s = time.monotonic() - cache['received_at']
         if age_s > max_age_s:
             return None
@@ -418,9 +418,8 @@ class TaskExecutor:
         발행한다(단일 정지 명령으로 충분함도 같은 실측으로 확인됨).
 
         step: 인자 없이 호출해 이번 틱의 ServoCommand(또는 아직 계산할 수 없으면
-        None)를 반환하는 콜러블 - 현재는 servo_pick(칼만 ServoLoop, TCP pose 필요)만
-        이 루프를 쓴다. handover_approach는 movel 기반 단발성 이동으로 별도
-        구현될 예정이라 이 루프를 쓰지 않는다(2026-07-07)."""
+        None)를 반환하는 콜러블 - servo_pick(칼만 ServoLoop)과 handover_approach
+        (HandServoLoop) 둘 다 이 루프를 쓴다."""
         subscription = None
         outcome = 'ABORT'
         detail = f'{name} aborted'
@@ -579,31 +578,108 @@ class TaskExecutor:
         result.grip_detected = grip_detected
         return result
 
-    # ---- handover_approach (handover_safe 이후 작업자 손에 접근) ----
+    # ---- handover_approach (handover_safe 이후 작업자 손에 연속 접근) ----
 
-    def _on_hand_pose_received(self, msg):
-        # 최초 1개만 쓰는 단발성 이동이라 재계산하지 않는다 - 이후 도착하는 메시지는
-        # 무시된다(_wait_for_hand_pose가 첫 값을 확인하는 즉시 구독을 정리한다).
-        if self._pending_hand_pose is None:
-            self._pending_hand_pose = msg
+    def _validate_hand_track_message(self, message) -> bool:
+        """HandServoLoop는 msg.pose.position을 base_link 기준 절대 손 위치로 직접
+        사용하므로(TCP 오차로 변환하지 않음), 여기서는 frame_id/NaN만 확인한다
+        (_validate_tool_track_message와 동일 형태)."""
+        expected_frame = self.get_parameter('handover_servo.hand_track_frame_id').value
+        if message.header.frame_id != expected_frame:
+            self.get_logger().error(
+                f"frame_id='{message.header.frame_id}'가 '{expected_frame}'가 아닙니다.")
+            self._debug_event(
+                'WARN', 'HAND_TRACK_REJECT', 'frame_mismatch',
+                'HandTrack frame_id가 handover_servo 기준과 다릅니다.',
+                {'expected': expected_frame, 'actual': message.header.frame_id},
+                throttle_s=1.0,
+                log=True)
+            return False
+        position = message.pose.position
+        valid = all(math.isfinite(value) for value in (
+            position.x, position.y, position.z))
+        if not valid:
+            self._debug_event(
+                'WARN', 'HAND_TRACK_REJECT', 'invalid_position',
+                'HandTrack 좌표가 NaN/Inf입니다.',
+                {'x': position.x, 'y': position.y, 'z': position.z},
+                throttle_s=1.0,
+                log=True)
+        return valid
 
-    def _wait_for_hand_pose(self, goal_handle, timeout_s):
-        """/vision/hand_pose를 1개 받을 때까지 대기한다 (safety_monitor.wait_for_pull과
-        동일한 polling-with-timeout 형태). 결과는 'RECEIVED'/'CANCELED'/'UNSAFE'/
-        'TIMEOUT'/'SHUTDOWN' 중 하나 - 실제 메시지는 self._pending_hand_pose에서 읽는다."""
-        poll_interval_s = max(self.get_parameter('move.poll_interval_s').value, 0.001)
-        deadline = time.monotonic() + timeout_s
-        while rclpy.ok():
-            if self._pending_hand_pose is not None:
-                return 'RECEIVED'
-            if goal_handle.is_cancel_requested:
-                return 'CANCELED'
-            if self.safety_state != SafetyState.NORMAL:
-                return 'UNSAFE'
-            if time.monotonic() >= deadline:
-                return 'TIMEOUT'
-            time.sleep(poll_interval_s)
-        return 'SHUTDOWN'
+    def _validate_handover_servo_command(self, cmd) -> bool:
+        """속도 명령을 실제로 발행하기 직전 마지막 안전 검사(_validate_servo_command와
+        동일 형태). HandServoLoop는 x/y/z를 모두 같은 v_max로 클립하므로(3D P 제어,
+        servo_pick처럼 descend_speed로 z를 별도 다루지 않음) 세 축 모두 v_max 하나로
+        검사한다."""
+        values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
+        if not all(math.isfinite(v) for v in values):
+            self._debug_event(
+                'ERROR', 'SERVO_COMMAND_REJECT', 'nonfinite',
+                '서보 속도 명령에 NaN/Inf가 포함되어 있습니다.',
+                {'values': values, 'servo': self.hand_servo_loop.debug_snapshot()},
+                log=True)
+            return False
+        tol = self.get_parameter('handover_servo.command_validate_tolerance').value
+        v_max = abs(self.get_parameter('handover_servo.v_max').value)
+        if (abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol
+                or abs(cmd.vz) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol):
+            self._debug_event(
+                'ERROR', 'SERVO_COMMAND_REJECT', 'limit',
+                '서보 속도 명령이 v_max 제한을 넘었습니다.',
+                {'vx': cmd.vx, 'vy': cmd.vy, 'vz': cmd.vz, 'yaw_rate': cmd.yaw_rate,
+                 'v_max': v_max, 'tol': tol},
+                log=True)
+            return False
+        return True
+
+    def _on_hand_track_during_servo(self, msg):
+        if not self._validate_hand_track_message(msg):
+            # frame_id 불일치 또는 NaN/Inf - 이번 프레임은 유실된 것처럼 취급한다
+            # (HandServoLoop.tick의 t_lost_s가 결국 감지한다).
+            return
+        self.hand_servo_loop.on_hand_track(msg)
+
+    def _handover_approach_step(self):
+        """_servo_pick_step과 동일 형태 - 캐시된 TCP 위치를 HandServoLoop.step에 넘긴다."""
+        tcp_pose_mm = self._get_current_tcp_posx('handover_servo.tcp_pose_max_age_s')
+        if tcp_pose_mm is None:
+            self._debug_event(
+                'WARN', 'SERVO_SKIP', 'tcp_pose_unavailable',
+                'TCP 위치 캐시가 없거나 오래되어 이번 handover_approach tick을 건너뜁니다.',
+                {'hardware_enabled': self.hardware_enabled},
+                throttle_s=1.0,
+                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+            return None
+        tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
+        command = self.hand_servo_loop.step(tcp_pose_m, time.monotonic())
+        if bool(self.get_parameter('debug.log_servo_decisions').value):
+            self._debug_event(
+                'INFO', 'SERVO_STEP', 'command_computed',
+                'handover_approach 속도 명령 계산 결과입니다.',
+                {
+                    'tcp_pose_m': tcp_pose_m,
+                    'servo': self.hand_servo_loop.debug_snapshot(),
+                },
+                throttle_s=0.5,
+                log=True)
+        return command
+
+    def _handover_approach_tick(self):
+        state, reason = self.hand_servo_loop.tick()
+        if state == 'ABORT':
+            self._debug_event(
+                'WARN', 'SERVO_ABORT', reason,
+                'handover_approach 중단 조건이 발생했습니다.',
+                self.hand_servo_loop.debug_snapshot(),
+                log=True)
+        elif state == 'STOP':
+            self._debug_event(
+                'INFO', 'SERVO_STOP', reason,
+                'handover_approach가 주먹 확정으로 정지합니다.',
+                self.hand_servo_loop.debug_snapshot(),
+                log=bool(self.get_parameter('debug.log_servo_decisions').value))
+        return state, reason
 
     def _execute_handover_approach(self, goal_handle):
         if self.safety_state != SafetyState.NORMAL:
@@ -611,14 +687,14 @@ class TaskExecutor:
                 goal_handle, 'ABORT',
                 f'handover_approach rejected - safety_state={self.safety_state}')
         if (self.hardware_enabled
-                and not self.get_parameter('handover_approach.hardware_ready').value):
+                and not self.get_parameter('handover_servo.hardware_ready').value):
             return self._finish_tracking_result(
                 goal_handle, 'ABORT',
-                'handover_approach rejected - handover_approach.hardware_ready=false')
+                'handover_approach rejected - handover_servo.hardware_ready=false')
 
         if not self.hardware_enabled:
             # dry-run은 다른 _execute_*와 동일하게 센서/하드웨어 의존 없이 흐름만
-            # 검증한다 - hand_pose가 아직 vision_node에서 발행되지 않는 환경에서도
+            # 검증한다 - hand_track이 아직 vision_node에서 발행되지 않는 환경에서도
             # 실행 경로(취소/성공)를 테스트할 수 있다.
             if self._dry_run_move(goal_handle):
                 return self._finish_tracking_result(goal_handle, 'ARRIVED', '')
@@ -629,126 +705,34 @@ class TaskExecutor:
                 goal_handle, 'ABORT',
                 f'handover_approach aborted (dry_run) - safety_state={self.safety_state}')
 
-        self._pending_hand_pose = None
-        subscription = None
-        try:
-            subscription = self.create_subscription(
-                PoseStamped, '/vision/hand_pose', self._on_hand_pose_received, 10,
-                callback_group=self.sensor_callback_group)
-            wait_outcome = self._wait_for_hand_pose(
-                goal_handle, self.get_parameter('handover_approach.timeout_s').value)
-            if wait_outcome == 'CANCELED':
-                return self._finish_tracking_result(
-                    goal_handle, 'CANCELED', 'handover_approach canceled - hand_pose 대기 중')
-            if wait_outcome != 'RECEIVED':
-                # UNSAFE/TIMEOUT/SHUTDOWN 모두 "계속 진행할 수 없음"이므로 ABORT로
-                # 처리한다 - UNSAFE는 이미 safety_monitor가 별도로 FAULT를 선언했을
-                # 것이므로 여기서 다시 선언하지 않는다.
-                reason = (
-                    'handover_approach timeout - hand_pose 미수신'
-                    if wait_outcome == 'TIMEOUT' else
-                    f'handover_approach aborted - safety_state={self.safety_state}'
-                    if wait_outcome == 'UNSAFE' else
-                    'handover_approach aborted - rclpy 종료 중')
-                return self._finish_tracking_result(goal_handle, 'ABORT', reason)
-
-            hand_pose = self._pending_hand_pose
-            expected_frame = self.get_parameter('handover_approach.hand_pose_frame_id').value
-            position = hand_pose.pose.position
-            if (hand_pose.header.frame_id != expected_frame
-                    or not all(
-                        math.isfinite(v) for v in (position.x, position.y, position.z))):
-                self._debug_event(
-                    'WARN', 'HAND_POSE_REJECT', 'frame_or_position_invalid',
-                    'handover_approach가 hand_pose를 거부했습니다.',
-                    {
-                        'expected_frame': expected_frame,
-                        'actual_frame': hand_pose.header.frame_id,
-                        'x': position.x,
-                        'y': position.y,
-                        'z': position.z,
-                    },
-                    log=True)
-                return self._finish_tracking_result(
-                    goal_handle, 'ABORT',
-                    'handover_approach aborted - hand_pose frame_id/좌표 무효 '
-                    f'(frame_id={hand_pose.header.frame_id!r})')
-
-            if goal_handle.is_cancel_requested:
-                return self._finish_tracking_result(
-                    goal_handle, 'CANCELED', 'handover_approach canceled before TCP 조회')
-            if self.safety_state != SafetyState.NORMAL:
-                return self._finish_tracking_result(
-                    goal_handle, 'ABORT',
-                    f'handover_approach aborted - safety_state={self.safety_state}')
-
-            tcp_pos6 = self._doosan.get_current_posx(ref=0)
-            if tcp_pos6 is None:
-                return self._finish_tracking_result(
-                    goal_handle, 'ABORT', 'handover_approach aborted - TCP 위치 조회 실패')
-
-            # hand_pose(m)와 TCP(mm)를 m 단위로 맞춰 방향/거리를 계산한다.
-            tcp_m = [value / 1000.0 for value in tcp_pos6[:3]]
-            hand_m = [position.x, position.y, position.z]
-            delta = [hand_m[i] - tcp_m[i] for i in range(3)]
-            distance_m = math.sqrt(sum(d * d for d in delta))
-            self._debug_event(
-                'INFO', 'HANDOVER_APPROACH', 'hand_pose_received',
-                'handover_approach 목표 손 위치와 TCP 거리를 계산했습니다.',
-                {
-                    'hand_m': hand_m,
-                    'tcp_m': tcp_m,
-                    'distance_m': distance_m,
-                    'stop_distance_m': self.get_parameter('handover_approach.stop_distance_m').value,
-                },
-                log=bool(self.get_parameter('debug.log_servo_decisions').value))
-
-            stop_distance_m = self.get_parameter('handover_approach.stop_distance_m').value
-            if distance_m <= stop_distance_m:
-                # 이미 정지 거리 이내 - 나눗셈(0-division) 방지 겸, 불필요한 이동을
-                # 생략하고 그대로 도착 처리한다.
-                return self._finish_tracking_result(
-                    goal_handle, 'ARRIVED', 'handover_approach - 이미 stop_distance_m 이내')
-
-            # 목표점 = TCP + (손 방향 벡터) * (1 - stop_distance_m/거리) - 손 앞
-            # stop_distance_m 지점에서 멈춘다. 방향각(rx,ry,rz)은 hand_pose의
-            # orientation이 아직 의미 없는 identity라 현재 TCP 방향을 그대로 유지한다.
-            scale = 1.0 - (stop_distance_m / distance_m)
-            target_m = [tcp_m[i] + delta[i] * scale for i in range(3)]
-            target_pos6 = [value * 1000.0 for value in target_m] + list(tcp_pos6[3:6])
-
-            vel2 = [
-                self.get_parameter('handover_approach.vel_mm_s').value,
-                self.get_parameter('move.vel_deg_s').value]
-            acc2 = [
-                self.get_parameter('handover_approach.acc_mm_s2').value,
-                self.get_parameter('move.acc_deg_s2').value]
-            success = self._doosan.move_line(
-                goal_handle, target_pos6, vel2, acc2, ref=0,
-                radius_mm=self.get_parameter('move.blend_radius_mm').value,
-                sync_type=self.get_parameter('move.sync_type').value,
-                poll_interval_s=self.get_parameter('move.poll_interval_s').value,
-                timeout_s=self.get_parameter('move.timeout_s').value)
-            # move_named와 동일하게, 이동 함수가 성공을 반환한 직후에도 안전상태를
-            # 다시 확인한다 (응답 직후 Fault가 발생하는 경합 방지).
-            if success and self.safety_state != SafetyState.NORMAL:
-                success = False
-            if not success and goal_handle.is_cancel_requested:
-                return self._finish_tracking_result(
-                    goal_handle, 'CANCELED', 'handover_approach canceled during movel')
-            if success:
-                return self._finish_tracking_result(goal_handle, 'ARRIVED', '')
-            return self._finish_tracking_result(
-                goal_handle, 'ABORT', 'handover_approach movel 실패')
-        except Exception as exc:
-            self.get_logger().error(f'handover_approach 실행 중 예외: {exc}')
-            self._cleanup_stop_motion()
-            outcome = 'CANCELED' if goal_handle.is_cancel_requested else 'ABORT'
-            return self._finish_tracking_result(
-                goal_handle, outcome, f'handover_approach exception: {exc}')
-        finally:
-            self._cleanup_destroy_subscription(subscription)
-            self._pending_hand_pose = None
+        self.hand_servo_loop.start()
+        outcome, detail = self._run_rt_tracking(
+            goal_handle,
+            name='handover_approach',
+            message_type=HandTrack,
+            topic='/vision/hand_track',
+            callback=self._on_hand_track_during_servo,
+            servo=self.hand_servo_loop,
+            step=self._handover_approach_step,
+            tick=self._handover_approach_tick,
+            validate_command=self._validate_handover_servo_command,
+            ready_parameter='handover_servo.hardware_ready',
+            period_parameter='handover_servo.control_period_s',
+            accel_param_prefix='handover_servo')
+        if outcome == 'ARRIVED':
+            # 주먹 확정으로 도착한 경우(긴급정지가 아니라 의도된 정지) - _run_rt_tracking은
+            # tick()이 'STOP'을 반환하면 그 자리에서 break만 하고 실제 정지 명령은 보내지
+            # 않는다(SpeedlWatchdog은 이 시점엔 이미 watchdog.stop()으로 해제되어 타임아웃이
+            # 발동하지 않는다). servo_pick의 CLOSE와 달리 이 STOP은 속도가 이미 0에
+            # 수렴했다는 보장이 없으므로(should_close 같은 수렴 조건이 없음), 여기서
+            # 명시적으로 MoveStop을 걸어 로봇을 확실히 멈춘다. 실패하면 로봇이 계속 움직이고
+            # 있을 수 있으므로 FAULT로 승격한다 - safety_state를 바꾸는 것이지 이 정지 자체가
+            # 긴급정지라는 뜻은 아니다(뒤이어 task_manager가 handover_hold로 정상 진행한다).
+            if not self._cleanup_stop_motion():
+                detail = 'handover_approach 정지(MoveStop) 실패'
+                self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                return self._finish_tracking_result(goal_handle, 'FAULT', detail)
+        return self._finish_tracking_result(goal_handle, outcome, detail)
 
     # ---- handover_hold ----
 

@@ -24,8 +24,11 @@
 
     # 2026-07-08 실기 테스트(E-stop 대기 상태) 전제로 활성화. 좌표 변환 자체의
     # 코드상 결함은 없는 것으로 확인했으나 실기 검증 이력이 없으므로, 문제
-    # 발생 시 이 두 값을 다시 false로 되돌리는 것이 첫 대응이다.
+    # 발생 시 이 값을 다시 false로 되돌리는 것이 첫 대응이다.
     servo_pick:
       hardware_ready: true
-    handover_approach:
-      hardware_ready: true
+    # handover_approach.hardware_ready: true였던 이전 override는 제거했다(2026-07-09) -
+    # movel 기반 단발 이동에서 HandServoLoop 기반 연속 speedl 서보로 완전히
+    # 재구현되어 이전 실기 확인이 새 구현에는 적용되지 않는다. vision_node가
+    # /vision/hand_track(연속 발행 + 주먹 판정)을 실제로 내보내고 이 서보를
+    # 저속으로 검증하기 전까지 handover_servo.hardware_ready는 false(코드 기본값)로 유지한다.
