@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pytest
 import rclpy
@@ -230,3 +232,16 @@ def test_run_one_listen_cycle_closes_mic_even_if_no_text(node):
     node._run_one_listen_cycle()
 
     assert close_calls == [True]
+
+
+def test_on_utterance_ready_publishes_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    node._on_utterance_ready('스패너 갖다줘')
+
+    payload = json.loads(published[-1].data)
+    assert payload['phase'] == 'A'
+    assert payload['checkpoint_id'] == 'stt_utterance_published'
+    assert payload['status'] == 'PASS'
+    assert payload['data']['text'] == '스패너 갖다줘'

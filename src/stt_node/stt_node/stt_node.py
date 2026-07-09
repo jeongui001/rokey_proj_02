@@ -60,7 +60,6 @@ class SttNode(Node):
         self.declare_parameter('command.silence_rms_threshold', 150.0)
         # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
-        self.declare_parameter('debug.log_stt', False)
 
         package_share = get_package_share_directory('stt_node')
         load_dotenv(dotenv_path=os.path.join(package_share, 'resource', '.env'))
@@ -87,12 +86,12 @@ class SttNode(Node):
         self._stop_event = threading.Event()
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
 
-    def _debug_event(
-            self, level, category, reason, message, data=None,
+    def _checkpoint_event(
+            self, phase, checkpoint_id, status, message, data=None,
             *, throttle_s=None, log=False):
-        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트."""
+        """파이프라인 점검.md의 Phase 체크리스트에 대응하는 이벤트를 발행한다."""
         now = time.monotonic()
-        key = (level, category, reason)
+        key = (checkpoint_id, status)
         if throttle_s is not None:
             last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
             if now - last < throttle_s:
@@ -101,26 +100,22 @@ class SttNode(Node):
                 self._debug_event_last = {}
             self._debug_event_last[key] = now
         payload = {
-            'node': self.get_name(),
-            'level': level,
-            'category': category,
-            'reason': reason,
+            'phase': phase,
+            'checkpoint_id': checkpoint_id,
+            'status': status,
             'message': message,
             'data': data or {},
+            'node': self.get_name(),
             'stamp_monotonic': now,
         }
         if bool(self.get_parameter('debug.publish_events').value):
             msg = String()
             msg.data = json.dumps(payload, ensure_ascii=False)
             self.pub_debug_events.publish(msg)
-        if log or bool(self.get_parameter('debug.log_stt').value):
-            text = (
-                f'[STT][{category}] level={level} reason={reason} '
-                f'message={message} data={payload["data"]}')
-            if level in ('ERROR', 'FAULT'):
+        if log:
+            text = f'[CHECKPOINT][A/{checkpoint_id}] status={status} message={message}'
+            if status == 'FAIL':
                 self.get_logger().error(text)
-            elif level == 'WARN':
-                self.get_logger().warn(text)
             else:
                 self.get_logger().info(text)
 
@@ -147,12 +142,6 @@ class SttNode(Node):
             return fn(*args, **kwargs)
         except NotImplementedError as exc:
             self.get_logger().warn(f'{fn.__qualname__} not implemented yet: {exc}')
-            self._debug_event(
-                'WARN', 'STT_CALL', 'not_implemented',
-                'STT 의존 기능이 아직 준비되지 않았습니다.',
-                {'function': fn.__qualname__, 'error': str(exc)},
-                throttle_s=1.0,
-                log=True)
             self._publish_status('error', str(exc))
             return default
 
@@ -166,11 +155,6 @@ class SttNode(Node):
                 self._run_one_listen_cycle()
             except Exception as exc:
                 self.get_logger().error(f'stt 캡처 루프 예외: {exc}')
-                self._debug_event(
-                    'ERROR', 'STT_LOOP', 'exception',
-                    'STT 캡처 루프 예외가 발생했습니다.',
-                    {'error': str(exc)},
-                    log=True)
                 self._publish_status('error', f'음성 인식 오류: {exc}')
                 self._stop_event.wait(1.0)
 
@@ -186,10 +170,6 @@ class SttNode(Node):
             return  # stop_event로 중단됨
         self.get_logger().info('웨이크워드 감지 - 명령 녹음을 시작합니다.')
         self._publish_status('wakeword_detected', 'wakeWord가 인식되었습니다. 명령어를 말해주세요.')
-        self._debug_event(
-            'INFO', 'WAKEWORD', 'detected',
-            '웨이크워드가 감지되어 명령 녹음을 시작합니다.',
-            log=True)
         audio = self._safe_call(self._record_command_audio, default=None)
         if audio is None:
             return
@@ -210,11 +190,9 @@ class SttNode(Node):
         msg.data = text
         self.pub_command.publish(msg)
         self._publish_status('utterance_ready', text)
-        self._debug_event(
-            'INFO', 'STT_RESULT', 'utterance_ready',
-            'STT 결과 텍스트를 발행했습니다.',
-            {'text': text},
-            log=bool(self.get_parameter('debug.log_stt').value))
+        self._checkpoint_event(
+            'A', 'stt_utterance_published', 'PASS',
+            'STT 결과 텍스트를 발행했습니다.', {'text': text})
 
     # ---- 오디오 I/O (PyAudio, 웨이크워드 감지용 연속 스트림) ----
 
@@ -249,19 +227,13 @@ class SttNode(Node):
             int(duration_s * sample_rate), samplerate=sample_rate, channels=1, dtype='int16')
         sd.wait()
         if self._is_silent(audio):
-            self.get_logger().info('녹음 구간이 거의 무음 - STT 호출을 건너뜁니다.')
             rms = self._command_rms(audio)
+            threshold = float(self.get_parameter('command.silence_rms_threshold').value)
+            self.get_logger().info(
+                f'녹음 구간이 거의 무음(rms={rms}, threshold={threshold}) - STT 호출을 건너뜁니다.')
             self._publish_status(
                 'silent_skipped', '녹음 구간이 거의 무음이라 인식을 건너뜁니다.',
                 {'rms': rms})
-            self._debug_event(
-                'WARN', 'STT_AUDIO', 'silent',
-                '녹음 RMS가 silence threshold보다 낮아 STT 호출을 건너뜁니다.',
-                {
-                    'rms': rms,
-                    'threshold': float(self.get_parameter('command.silence_rms_threshold').value),
-                },
-                log=True)
             return None
         buffer = io.BytesIO()
         buffer.name = 'command.wav'  # OpenAI SDK가 파일명 확장자로 포맷을 추론한다
