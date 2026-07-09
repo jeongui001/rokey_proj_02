@@ -573,6 +573,9 @@ class TaskExecutor:
             return self._finish_tracking_result(goal_handle, 'FAULT', detail)
 
         width_mm, grip_detected = self.rg2_client.get_state()
+        # 그리퍼 폐합이 끝난 뒤에도 servo_pick 마지막 vx/vy 명령이 남아있을 수 있으므로
+        # (vz는 step()에서 z 도착 시 이미 0으로 고정됨) 여기서 확실히 정지시킨다.
+        self._cleanup_stop_motion()
         result = self._finish_tracking_result(goal_handle, 'ARRIVED', '')
         result.final_width_mm = width_mm
         result.grip_detected = grip_detected

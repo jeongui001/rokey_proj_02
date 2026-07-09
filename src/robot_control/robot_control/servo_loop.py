@@ -198,8 +198,15 @@ class ServoLoop:
             vx *= scale
             vy *= scale
 
-        # 하강은 별도 프로파일: 수평 오차가 충분히 작을 때만 진행, 아니면 대기(수평 정렬 우선)
-        if e_xy_norm < self.eps_descend:
+        # 하강은 별도 프로파일: 수평 오차가 충분히 작을 때만 진행, 아니면 대기(수평 정렬 우선).
+        # z_gap이 z_close 이내로 들어오면 xy 안정성/공분산(should_close 조건)과 무관하게
+        # 즉시 vz를 0으로 고정한다 - descend_speed는 비례 제어가 아니라 상수 속도라서
+        # should_close()의 복합 조건(폐합 가능 여부)이 늦게 만족돼도 목표 z를 지나쳐
+        # 계속 하강하면 안 되기 때문이다.
+        if self._last_z_gap < self.z_close:
+            self._state = ServoState.TRACKING
+            vz = 0.0
+        elif e_xy_norm < self.eps_descend:
             self._state = ServoState.DESCENDING
             vz = -self.descend_speed
         else:
