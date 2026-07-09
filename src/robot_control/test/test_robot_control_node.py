@@ -1,3 +1,4 @@
+import json
 import time
 
 import rclpy
@@ -2576,3 +2577,52 @@ def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node):
     assert any(
         cmd.vx == 0.0 and cmd.vy == 0.0 and cmd.vz == 0.0
         for cmd in fake.publish_calls)  # 워치독이 최소 1회 vel=0을 발행했다
+
+
+# ---- goal_sent 체크포인트 (파이프라인 점검.md 대응) ----
+
+_GOAL_SENT_CHECKPOINT_CASES = [
+    ('move_named', 'watch', 'B', 'move_watch_goal_sent'),
+    ('move_named', 'handover_safe', 'F', 'handover_safe_goal_sent'),
+    ('move_named', 'home', 'J', 'home_goal_sent'),
+    ('handover_approach', '', 'H', 'handover_approach_goal_sent'),
+    ('handover_hold', '', 'I', 'handover_hold_goal_sent'),
+]
+
+
+@pytest.mark.parametrize(
+    'task_type,named_target,expected_phase,expected_checkpoint', _GOAL_SENT_CHECKPOINT_CASES)
+def test_goal_callback_publishes_checkpoint_on_accept(
+        node, task_type, named_target, expected_phase, expected_checkpoint):
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    response = node._goal_callback(_goal(task_type, named_target=named_target))
+
+    assert response == GoalResponse.ACCEPT
+    payload = json.loads(published[-1].data)
+    assert payload['phase'] == expected_phase
+    assert payload['checkpoint_id'] == expected_checkpoint
+    assert payload['status'] == 'PASS'
+
+
+def test_goal_callback_publishes_fail_checkpoint_on_reject(node):
+    node.safety_monitor.state = SafetyState.FAULT
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    response = node._goal_callback(_goal('move_named', named_target='watch'))
+
+    assert response == GoalResponse.REJECT
+    payload = json.loads(published[-1].data)
+    assert payload['checkpoint_id'] == 'move_watch_goal_sent'
+    assert payload['status'] == 'FAIL'
+
+
+def test_goal_callback_unmapped_target_does_not_publish_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    node._goal_callback(_goal('move_named', named_target='front'))
+
+    assert published == []
