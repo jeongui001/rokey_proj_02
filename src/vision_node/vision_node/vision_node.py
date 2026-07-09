@@ -211,8 +211,19 @@ class VisionNode(Node):
             z_m, valid_ratio = patch_median_depth(
                 depth_m_img, px, py, half=half, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
             depth_valid = z_m is not None and valid_ratio >= self.valid_min_ratio
-            # depth 무효 구간은 마지막 유효 z로 픽셀->광선을 역산해 x,y만 RGB 추적으로 갱신 (2.7절)
-            z = z_m if z_m is not None else (self.tracker.last_valid_z or 0.0)
+            # depth 무효 구간은 마지막 유효 z로 픽셀->광선을 역산해 x,y만 RGB 추적으로 갱신 (2.7절).
+            # 추적 사이클의 첫 프레임부터 depth가 무효면(반사면 공구에서 흔함) last_valid_z도
+            # 아직 없다 - 이때 z를 0.0 등으로 지어내면 카메라 장착 위치 근방의 엉뚱한 3D 좌표가
+            # 나가버린다(2026-07-08 실기 사고: 망치가 보이는데도 로봇이 엉뚱한 위치로 이동해
+            # 바닥을 내려찍음 - 원인이 이 좌표 조작이었다). 만들어낼 z가 없으면 이 후보를 그냥
+            # 버린다(None) - ToolTracker.update()가 다른 유효 후보를 쓰거나, 없으면 검출 없음과
+            # 동일하게 처리한다.
+            if z_m is not None:
+                z = z_m
+            elif self.tracker.last_valid_z is not None:
+                z = self.tracker.last_valid_z
+            else:
+                return None
             cam_xyz = pixel_to_camera_xyz(px, py, z, fx, fy, ppx, ppy)
             base_xyz = camera_to_base(cam_xyz, tf_matrix)
             # DEBUG(파이프라인 점검용, 나중에 제거): z 오차 원인 추적용 중간값 전부 출력
@@ -250,7 +261,9 @@ class VisionNode(Node):
             chosen_det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class)
 
         if self.publish_debug_image:
-            self._publish_debug_image(color_msg, detection_msg.detections, chosen_det, axis_debug)
+            self._publish_debug_image(
+                color_msg, detection_msg.detections, chosen_det, axis_debug,
+                position=position, depth_valid=depth_valid)
 
         track = ToolTrack()
         track.header = color_msg.header  # 관측 시각(stamp)은 그대로 - 서보 루프의 시간 정합 기준
@@ -316,32 +329,50 @@ class VisionNode(Node):
         base_yaw_deg = float(np.degrees(np.arctan2(d_base[1], d_base[0])) % 180.0)
         return yaw_deg_to_quaternion(base_yaw_deg), debug_info
 
-    def _publish_debug_image(self, color_msg, detections, chosen_det, axis_debug):
+    def _publish_debug_image(
+            self, color_msg, detections, chosen_det, axis_debug, position=None, depth_valid=None):
         """검출 전체의 bbox + (있으면) 추적 대상의 축선을 그려 압축 이미지로 발행한다
         (전체 계획.md 4.6절 계약, operator_gui/rqt_image_view로 모니터링용). 클래스별
-        색상은 YOLO 모델 정보 없이도 이름 해시로 고정 배정한다."""
+        색상은 YOLO 모델 정보 없이도 이름 해시로 고정 배정한다.
+
+        position/depth_valid가 있으면(= ToolTrack이 실제로 발행된 프레임) 계산된
+        base_link 좌표를 화면에 같이 찍는다 - 2026-07-08 실기 사고(z=0 폴백 버그로 엉뚱한
+        좌표가 서보 목표가 됨) 이후 추가됨. bbox가 맞게 잡히는지뿐 아니라 좌표 계산
+        결과가 말이 되는 값인지(카메라 근처 등 이상값이 아닌지)를 rqt_image_view만 보고도
+        바로 판단할 수 있게 하기 위함이다."""
+        # 폰트 스케일 주의: 실제 스트림이 424x240(launch 설정)이라 0.5는 글자가 화면을
+        # 덮고 서로 겹친다(2026-07-08 실기 확인) - 0.35로 축소하고, base 좌표는 bbox
+        # 라벨들과 안 겹치게 화면 하단에 배치한다.
         frame = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8').copy()
         for d in detections:
             color = _class_color(d.class_name)
             is_target = chosen_det is not None and d is chosen_det
             thickness = 3 if is_target else 1
             cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
-            cv2.putText(frame, f'{d.class_name} {d.score * 100:.0f}%', (d.x1, max(d.y1 - 7, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            cv2.putText(frame, f'{d.class_name} {d.score * 100:.0f}%', (d.x1, max(d.y1 - 4, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
 
         if axis_debug is not None:
             ox, oy = axis_debug['origin']
             rect = axis_debug['rect']
             (rcx, rcy), (rw, rh), _ = rect
             box_pts = (cv2.boxPoints(rect) + np.array([ox, oy], dtype=np.float32)).astype(np.int32)
-            cv2.polylines(frame, [box_pts], True, (255, 255, 255), 2)
+            cv2.polylines(frame, [box_pts], True, (255, 255, 255), 1)
             theta = np.deg2rad(axis_debug['axis_deg'])
             half_len = max(rw, rh) / 2
             gcx, gcy = int(rcx) + ox, int(rcy) + oy
             dx, dy = int(half_len * np.cos(theta)), int(half_len * np.sin(theta))
-            cv2.line(frame, (gcx - dx, gcy - dy), (gcx + dx, gcy + dy), (255, 255, 255), 2)
+            cv2.line(frame, (gcx - dx, gcy - dy), (gcx + dx, gcy + dy), (255, 255, 255), 1)
+            # bbox 위 라벨(클래스명)과 겹치지 않게 회전사각형 하단에 표시
             cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
-                        (ox, oy - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                        (ox, min(oy + int(rh) + 24, frame.shape[0] - 16)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+        if position is not None:
+            x_mm, y_mm, z_mm = position[0] * 1000.0, position[1] * 1000.0, position[2] * 1000.0
+            text = f'base xyz=({x_mm:.0f},{y_mm:.0f},{z_mm:.0f})mm depth_valid={bool(depth_valid)}'
+            cv2.putText(frame, text, (6, frame.shape[0] - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
 
         ok, buf = cv2.imencode('.jpg', frame)
         if not ok:
