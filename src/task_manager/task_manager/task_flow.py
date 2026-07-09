@@ -227,9 +227,7 @@ class TaskFlow:
         sentinel(-1/빈 문자열)로 두어 항상 False(트리거 안 됨)를 반환하게 한다
         (config_ready=false와 별개의 방어선)."""
         def reject(reason, message, data=None):
-            self._debug_event(
-                'WARN', 'TRIGGER_REJECT', reason, message, data,
-                throttle_s=1.0, log=False)
+            self.get_logger().warn(f'{reason}: {message}', throttle_duration_sec=1.0)
             return False
         if self.current_tool is None:
             return reject('no_current_tool', 'current_tool이 없어 ToolTrack을 무시합니다.')
@@ -291,8 +289,9 @@ class TaskFlow:
                 'ToolTrack 좌표가 NaN/Inf입니다.',
                 {'x': position.x, 'y': position.y, 'z': position.z})
 
-        self._debug_event(
-            'INFO', 'TRIGGER_ACCEPT', 'criteria_met', 'servo_pick 트리거 기준을 통과했습니다.',
+        self._checkpoint_event(
+            'C', 'servo_pick_triggered', 'PASS',
+            'servo_pick 트리거 기준을 통과했습니다.',
             {
                 'tool_class': tool_track_msg.tool_class,
                 'confidence': confidence,
@@ -301,7 +300,7 @@ class TaskFlow:
                 'depth_valid': bool(tool_track_msg.depth_valid),
                 'approaching': bool(tool_track_msg.approaching),
             },
-            throttle_s=1.0, log=False)
+            throttle_s=1.0)
         return True
 
     def _get_grasp_spec(self, tool_class: str):
@@ -310,8 +309,8 @@ class TaskFlow:
         None을 반환한다 - 호출측은 이 경우 (0.0, 0.0) 같은 값으로 조용히 servo_pick을
         보내지 않아야 한다."""
         if tool_class not in SUPPORTED_TOOL_CLASSES:
-            self._debug_event(
-                'WARN', 'GRASP_SPEC_REJECT', 'unsupported_tool',
+            self._checkpoint_event(
+                'C', 'servo_pick_triggered', 'FAIL',
                 '지원하지 않는 tool_class라 grasp spec을 읽지 않습니다.',
                 {'tool_class': tool_class}, throttle_s=1.0)
             return None
@@ -323,22 +322,22 @@ class TaskFlow:
 
         if not all(math.isfinite(v) for v in (
                 width_mm, force_n, verify_min_width_mm, verify_max_width_mm)):
-            self._debug_event(
-                'WARN', 'GRASP_SPEC_REJECT', 'nonfinite_value',
+            self._checkpoint_event(
+                'C', 'servo_pick_triggered', 'FAIL',
                 'grasp spec에 NaN/Inf가 포함되어 있습니다.',
                 {'tool_class': tool_class}, throttle_s=1.0)
             return None  # NaN/Inf가 하나라도 있으면 신뢰할 수 없다
 
         if width_mm <= 0.0 or force_n <= 0.0:
-            self._debug_event(
-                'WARN', 'GRASP_SPEC_REJECT', 'open_close_unconfigured',
+            self._checkpoint_event(
+                'C', 'servo_pick_triggered', 'FAIL',
                 'width_mm 또는 force_n이 미설정/무효입니다.',
                 {'tool_class': tool_class, 'width_mm': width_mm, 'force_n': force_n},
                 throttle_s=1.0)
             return None  # 미설정 - 추측값으로 servo_pick을 보내지 않는다
         if verify_min_width_mm < 0.0 or verify_max_width_mm <= 0.0:
-            self._debug_event(
-                'WARN', 'GRASP_SPEC_REJECT', 'verify_range_unconfigured',
+            self._checkpoint_event(
+                'C', 'servo_pick_triggered', 'FAIL',
                 '파지 검증 폭 범위가 미설정/무효입니다.',
                 {
                     'tool_class': tool_class,
@@ -348,8 +347,8 @@ class TaskFlow:
                 throttle_s=1.0)
             return None
         if verify_min_width_mm > verify_max_width_mm:
-            self._debug_event(
-                'WARN', 'GRASP_SPEC_REJECT', 'verify_range_inverted',
+            self._checkpoint_event(
+                'C', 'servo_pick_triggered', 'FAIL',
                 'verify_min_width_mm가 verify_max_width_mm보다 큽니다.',
                 {
                     'tool_class': tool_class,
@@ -414,36 +413,43 @@ class TaskFlow:
 
     def _handle_servo_pick_result(self, result):
         if not result.success:
+            self._checkpoint_event(
+                'D', 'servo_pick_result', 'FAIL', result.message or 'servo_pick 실패',
+                {'message': result.message})
             recoverable = ('lost', 'tracking_lost', 'timeout', 'diverged', 'diverging')
             if result.message in recoverable:
-                self._debug_event(
-                    'WARN', 'SERVO_PICK_FAIL', result.message,
-                    'servo_pick 실패를 재검출 가능한 사유로 판단해 DETECT_TRACK으로 복귀합니다.',
-                    {'recoverable_reasons': recoverable}, log=True)
+                self.get_logger().warn(
+                    f'servo_pick 실패({result.message}) - DETECT_TRACK으로 복귀합니다.')
                 self._set_state(State.DETECT_TRACK, detail=result.message)
                 self._start_detect_track_timer()
             else:
-                self._debug_event(
-                    'ERROR', 'SERVO_PICK_FAIL', 'unrecoverable_reason',
-                    'servo_pick 실패 사유가 재검출 정책에 없어 FAULT로 전환합니다.',
-                    {'result_message': result.message}, log=True)
+                self.get_logger().error(
+                    f'servo_pick 실패 사유({result.message})가 재검출 정책에 없어 FAULT로 전환합니다.')
                 self._enter_fault(result.message)
             return
+        self._checkpoint_event(
+            'D', 'servo_pick_result', 'PASS', 'servo_pick 결과가 정상 반환되었습니다.',
+            {'final_width_mm': result.final_width_mm, 'grip_detected': bool(result.grip_detected)})
         self._set_state(State.VERIFY_GRASP)
         verified = self._verify_grasp(result)
         if verified:
+            self._checkpoint_event(
+                'E', 'grasp_verified', 'PASS', '파지 검증 기준을 통과했습니다.',
+                {
+                    'grip_detected': bool(result.grip_detected),
+                    'final_width_mm': result.final_width_mm,
+                })
             self._set_state(State.MOVE_SAFE, detail=f'{self.current_tool} 파지 완료')
             self._send_robot_goal('move_named', named_target='handover_safe')
             return
-        self._debug_event(
-            'WARN', 'VERIFY_GRASP_FAIL', 'criteria_not_met',
-            'servo_pick은 성공했지만 파지 검증 기준을 통과하지 못했습니다.',
+        self._checkpoint_event(
+            'E', 'grasp_verified', 'FAIL', '파지 검증 기준을 통과하지 못했습니다.',
             {
                 'grip_detected': bool(result.grip_detected),
                 'final_width_mm': result.final_width_mm,
-                'active_spec': self._active_grasp_spec.__dict__ if self._active_grasp_spec else None,
-            },
-            log=True)
+                'active_spec': (
+                    self._active_grasp_spec._asdict() if self._active_grasp_spec else None),
+            })
         self._verify_grasp_retries += 1
         max_retries = self.get_parameter('verify_grasp_max_retries').value
         if self._verify_grasp_retries > max_retries:

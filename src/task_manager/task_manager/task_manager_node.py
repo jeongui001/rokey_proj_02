@@ -25,6 +25,19 @@ from task_manager.task_models import (
 )
 
 
+# task_manager_node._set_state의 new_state -> (phase, checkpoint_id).
+# 여기 없는 전이(CANCELLING/DETECT_TRACK/VERIFY_GRASP/HOME/MANUAL_MOVE)는
+# 파이프라인 점검.md 체크리스트 항목이 아니므로 체크포인트를 발행하지 않는다.
+_STATE_CHECKPOINTS = {
+    State.MOVE_TO_WATCH: ('B', 'parse_no_intermediate_state'),
+    State.SERVO_PICK: ('D', 'servo_pick_state_entered'),
+    State.MOVE_SAFE: ('E', 'move_safe_entered'),
+    State.APPROACH_HAND: ('G', 'approach_hand_entered'),
+    State.WAIT_PULL: ('I', 'wait_pull_entered'),
+    State.IDLE: ('K', 'idle_entered'),
+}
+
+
 class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
     def __init__(self):
         super().__init__('task_manager')
@@ -148,10 +161,47 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 초기 연결된 GUI가 첫 상태를 기다리지 않게 한다.
         self._publish_status(detail='')
 
+    def _checkpoint_event(
+            self, phase, checkpoint_id, status, message, data=None,
+            *, throttle_s=None, log=False):
+        """파이프라인 점검.md의 Phase 체크리스트에 대응하는 이벤트를 발행한다."""
+        now = time.monotonic()
+        key = (checkpoint_id, status)
+        if throttle_s is not None:
+            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            if now - last < throttle_s:
+                return
+            if not hasattr(self, '_debug_event_last'):
+                self._debug_event_last = {}
+            self._debug_event_last[key] = now
+        payload = {
+            'phase': phase,
+            'checkpoint_id': checkpoint_id,
+            'status': status,
+            'message': message,
+            'data': data or {},
+            'node': self.get_name(),
+            'stamp_monotonic': now,
+        }
+        if bool(self.get_parameter('debug.publish_events').value):
+            msg = String()
+            msg.data = json.dumps(payload, ensure_ascii=False)
+            self.pub_debug_events.publish(msg)
+        if log or bool(self.get_parameter('debug.log_task_decisions').value):
+            text = f'[CHECKPOINT][{phase}/{checkpoint_id}] status={status} message={message}'
+            if status == 'FAIL':
+                self.get_logger().error(text)
+            else:
+                self.get_logger().info(text)
+
     def _debug_event(
             self, level, category, reason, message, data=None,
             *, throttle_s=None, log=False):
-        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트."""
+        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트.
+
+        Task 4가 action_coordinator.py/safety_recovery.py를 _checkpoint_event로
+        옮기기 전까지, 그 두 파일이 여전히 이 메서드를 호출한다 - 여기서 지우면 안 된다.
+        """
         now = time.monotonic()
         key = (level, category, reason)
         if throttle_s is not None:
@@ -213,11 +263,13 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         old_state = self.state
         self.state = new_state
         self._publish_status(detail)
-        if old_state != new_state:
-            self._debug_event(
-                'INFO', 'STATE', 'state_transition', 'task state changed',
-                {'from': old_state, 'to': new_state, 'detail': detail},
-                log=False)
+        if old_state is not None and old_state != new_state:
+            checkpoint = _STATE_CHECKPOINTS.get(new_state)
+            if checkpoint is not None:
+                phase, checkpoint_id = checkpoint
+                self._checkpoint_event(
+                    phase, checkpoint_id, 'PASS', f'{old_state} -> {new_state}',
+                    {'from': old_state, 'to': new_state, 'detail': detail})
 
     # ---- 업무 상태 타이머 정리 (DETECT_TRACK / WAIT_PULL) ----
 

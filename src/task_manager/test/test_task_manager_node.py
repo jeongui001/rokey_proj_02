@@ -2063,3 +2063,150 @@ def test_home_result_success_clears_stale_resume_snapshot(node):
     assert node._resume_state is None
     assert node._resume_tool is None
     assert node._resume_grasp_spec is None
+
+
+# ---- 체크포인트 이벤트 ----
+
+_STATE_CHECKPOINT_CASES = [
+    (State.MOVE_TO_WATCH, 'B', 'parse_no_intermediate_state'),
+    (State.SERVO_PICK, 'D', 'servo_pick_state_entered'),
+    (State.MOVE_SAFE, 'E', 'move_safe_entered'),
+    (State.APPROACH_HAND, 'G', 'approach_hand_entered'),
+    (State.WAIT_PULL, 'I', 'wait_pull_entered'),
+    (State.IDLE, 'K', 'idle_entered'),
+]
+
+
+@pytest.mark.parametrize('new_state,expected_phase,expected_checkpoint', _STATE_CHECKPOINT_CASES)
+def test_set_state_publishes_checkpoint_for_known_transitions(
+        node, new_state, expected_phase, expected_checkpoint):
+    published = []
+    node.pub_debug_events.publish = published.append
+    node.state = State.MANUAL_MOVE  # IDLE 외의 임의 시작 상태 - 최초 부팅(old_state=None) 가드와 별개로 확인
+
+    node._set_state(new_state, detail='테스트')
+
+    checkpoint_payloads = [
+        json.loads(p.data) for p in published if json.loads(p.data)['checkpoint_id'] == expected_checkpoint]
+    assert len(checkpoint_payloads) == 1
+    assert checkpoint_payloads[0]['phase'] == expected_phase
+    assert checkpoint_payloads[0]['status'] == 'PASS'
+
+
+def test_set_state_guards_against_none_old_state(node):
+    """old_state가 None인 채로 _set_state가 불리는 경우(현재 코드에서는
+    __init__이 self.state = State.IDLE을 직접 대입하므로 실제로는 일어나지
+    않지만, 방어적으로 넣어둔 가드다) K/idle_entered 같은 체크포인트를 잘못
+    PASS 처리하지 않아야 한다."""
+    published = []
+    node.pub_debug_events.publish = published.append
+    node.state = None
+
+    node._set_state(State.IDLE, detail='테스트')
+
+    assert published == []
+
+
+def test_set_state_unmapped_transition_does_not_publish_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+    node.state = State.IDLE
+
+    node._set_state(State.CANCELLING, detail='취소')
+
+    assert published == []
+
+
+def test_grasp_spec_reject_publishes_servo_pick_triggered_fail(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    result = node._get_grasp_spec('unsupported_tool_class')
+
+    assert result is None
+    payload = json.loads(published[-1].data)
+    assert payload['phase'] == 'C'
+    assert payload['checkpoint_id'] == 'servo_pick_triggered'
+    assert payload['status'] == 'FAIL'
+
+
+def test_trigger_accept_publishes_servo_pick_triggered_pass(node):
+    node.current_tool = 'spanner'
+    node.set_parameters([
+        Parameter('trigger.min_confidence', value=0.5),
+        Parameter('trigger.require_depth_valid', value=False),
+        Parameter('trigger.require_approaching', value=False),
+        Parameter('trigger.required_frame_id', value='base_link'),
+        Parameter('trigger.max_track_age_s', value=10.0),
+    ])
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    msg = ToolTrack()
+    msg.tool_class = 'spanner'
+    msg.confidence = 0.9
+    msg.depth_valid = False
+    msg.approaching = False
+    msg.header.frame_id = 'base_link'
+    msg.header.stamp = node.get_clock().now().to_msg()
+    msg.pose.position.x, msg.pose.position.y, msg.pose.position.z = 0.1, 0.2, 0.3
+
+    accepted = node._check_trigger(msg)
+
+    assert accepted is True
+    payload = json.loads(published[-1].data)
+    assert payload['phase'] == 'C'
+    assert payload['checkpoint_id'] == 'servo_pick_triggered'
+    assert payload['status'] == 'PASS'
+
+
+def test_servo_pick_result_success_publishes_pass_checkpoint_and_grasp_verified(node):
+    node.current_tool = 'spanner'
+    node._active_grasp_spec = GraspSpec(
+        width_mm=20.0, force_n=10.0, verify_min_width_mm=5.0, verify_max_width_mm=25.0)
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    result = _FakeResult(success=True)
+    result.grip_detected = True
+    result.final_width_mm = 15.0
+    node._handle_servo_pick_result(result)
+
+    payloads = [json.loads(p.data) for p in published]
+    servo_pick = [p for p in payloads if p['checkpoint_id'] == 'servo_pick_result']
+    grasp_verified = [p for p in payloads if p['checkpoint_id'] == 'grasp_verified']
+    assert servo_pick[0]['phase'] == 'D'
+    assert servo_pick[0]['status'] == 'PASS'
+    assert grasp_verified[0]['phase'] == 'E'
+    assert grasp_verified[0]['status'] == 'PASS'
+
+
+def test_servo_pick_result_failure_publishes_fail_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    result = _FakeResult(success=False, message='timeout')
+    node._handle_servo_pick_result(result)
+
+    payload = json.loads(published[-1].data)
+    assert payload['checkpoint_id'] == 'servo_pick_result'
+    assert payload['phase'] == 'D'
+    assert payload['status'] == 'FAIL'
+
+
+def test_verify_grasp_criteria_not_met_publishes_grasp_verified_fail(node):
+    node.current_tool = 'spanner'
+    node._active_grasp_spec = GraspSpec(
+        width_mm=20.0, force_n=10.0, verify_min_width_mm=5.0, verify_max_width_mm=10.0)
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    result = _FakeResult(success=True)
+    result.grip_detected = True
+    result.final_width_mm = 50.0  # verify 범위 밖
+    node._handle_servo_pick_result(result)
+
+    payloads = [json.loads(p.data) for p in published]
+    grasp_verified = [p for p in payloads if p['checkpoint_id'] == 'grasp_verified']
+    assert grasp_verified[0]['phase'] == 'E'
+    assert grasp_verified[0]['status'] == 'FAIL'
