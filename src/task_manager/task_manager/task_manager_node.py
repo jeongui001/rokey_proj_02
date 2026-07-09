@@ -168,12 +168,12 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         now = time.monotonic()
         key = (checkpoint_id, status)
         if throttle_s is not None:
-            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            last = getattr(self, '_checkpoint_event_last', {}).get(key, 0.0)
             if now - last < throttle_s:
                 return
-            if not hasattr(self, '_debug_event_last'):
-                self._debug_event_last = {}
-            self._debug_event_last[key] = now
+            if not hasattr(self, '_checkpoint_event_last'):
+                self._checkpoint_event_last = {}
+            self._checkpoint_event_last[key] = now
         payload = {
             'phase': phase,
             'checkpoint_id': checkpoint_id,

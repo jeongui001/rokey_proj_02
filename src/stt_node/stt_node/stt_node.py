@@ -93,12 +93,12 @@ class SttNode(Node):
         now = time.monotonic()
         key = (checkpoint_id, status)
         if throttle_s is not None:
-            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            last = getattr(self, '_checkpoint_event_last', {}).get(key, 0.0)
             if now - last < throttle_s:
                 return
-            if not hasattr(self, '_debug_event_last'):
-                self._debug_event_last = {}
-            self._debug_event_last[key] = now
+            if not hasattr(self, '_checkpoint_event_last'):
+                self._checkpoint_event_last = {}
+            self._checkpoint_event_last[key] = now
         payload = {
             'phase': phase,
             'checkpoint_id': checkpoint_id,
@@ -113,7 +113,7 @@ class SttNode(Node):
             msg.data = json.dumps(payload, ensure_ascii=False)
             self.pub_debug_events.publish(msg)
         if log:
-            text = f'[CHECKPOINT][A/{checkpoint_id}] status={status} message={message}'
+            text = f'[CHECKPOINT][{phase}/{checkpoint_id}] status={status} message={message}'
             if status == 'FAIL':
                 self.get_logger().error(text)
             else:

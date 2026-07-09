@@ -145,12 +145,12 @@ class VisionNode(Node):
         now = time.monotonic()
         key = (checkpoint_id, status)
         if throttle_s is not None:
-            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
+            last = getattr(self, '_checkpoint_event_last', {}).get(key, 0.0)
             if now - last < throttle_s:
                 return
-            if not hasattr(self, '_debug_event_last'):
-                self._debug_event_last = {}
-            self._debug_event_last[key] = now
+            if not hasattr(self, '_checkpoint_event_last'):
+                self._checkpoint_event_last = {}
+            self._checkpoint_event_last[key] = now
         payload = {
             'phase': phase,
             'checkpoint_id': checkpoint_id,
@@ -304,7 +304,9 @@ class VisionNode(Node):
                 # 왜 안 잡히는지(다른 클래스만 보임/아예 없음) 눈으로 바로 확인 가능하게.
                 self._publish_debug_image(color_msg, detection_msg.detections, None, None)
             self.get_logger().warn(
-                f"'{tool_class}' 유효 3D 추적 결과가 없습니다.", throttle_duration_sec=1.0)
+                f"'{tool_class}' 유효 3D 추적 결과가 없습니다. "
+                f"(frame_classes={[d.class_name for d in detection_msg.detections]})",
+                throttle_duration_sec=1.0)
             return None  # 이번 프레임엔 tool_class 검출이 없었음 - 퍼블리시 안 함
 
         position, velocity, depth_valid, chosen_det = result
@@ -379,7 +381,8 @@ class VisionNode(Node):
             band_m=self.yaw_band, min_px=YAW_MIN_MASK_PX)
         if axis_deg is None:
             self.get_logger().warn(
-                f"{det.class_name} depth ROI에서 공구 축을 계산하지 못했습니다.",
+                f"{det.class_name} depth ROI에서 공구 축을 계산하지 못했습니다. "
+                f"(bbox=({det.x1},{det.y1},{det.x2},{det.y2}), min_mask_px={YAW_MIN_MASK_PX})",
                 throttle_duration_sec=1.0)
             return None, None
         trust = min(1.0, max(0.0, (elongation - 1.0) / (ELONGATION_TRUST_MIN - 1.0)))
@@ -479,15 +482,18 @@ class VisionNode(Node):
         if not (0 <= py < depth_image.shape[0] and 0 <= px < depth_image.shape[1]):
             self._fist_confirm_count = 0
             self.get_logger().warn(
-                f'손목 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다.',
+                f'손목 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다. '
+                f'(width={depth_image.shape[1]}, height={depth_image.shape[0]})',
                 throttle_duration_sec=1.0)
             track.detected = False
             return track
-        depth_m = float(depth_image[py, px]) / 1000.0
+        raw_depth_mm = depth_image[py, px]
+        depth_m = float(raw_depth_mm) / 1000.0
         if depth_m <= 0.0:
             self._fist_confirm_count = 0
             self.get_logger().warn(
-                f'손목 픽셀({px},{py}) depth가 0 이하입니다.', throttle_duration_sec=1.0)
+                f'손목 픽셀({px},{py}) depth가 0 이하입니다. (raw_depth_mm={raw_depth_mm})',
+                throttle_duration_sec=1.0)
             track.detected = False
             return track
 
