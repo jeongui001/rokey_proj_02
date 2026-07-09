@@ -138,12 +138,12 @@ class VisionNode(Node):
             queue_size=10, slop=0.05)
         self._sync.registerCallback(self._on_synced_images)
 
-    def _debug_event(
-            self, level, category, reason, message, data=None,
+    def _checkpoint_event(
+            self, phase, checkpoint_id, status, message, data=None,
             *, throttle_s=None, log=False):
-        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트."""
+        """파이프라인 점검.md의 Phase 체크리스트에 대응하는 이벤트를 발행한다."""
         now = time.monotonic()
-        key = (level, category, reason)
+        key = (checkpoint_id, status)
         if throttle_s is not None:
             last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
             if now - last < throttle_s:
@@ -152,12 +152,12 @@ class VisionNode(Node):
                 self._debug_event_last = {}
             self._debug_event_last[key] = now
         payload = {
-            'node': self.get_name(),
-            'level': level,
-            'category': category,
-            'reason': reason,
+            'phase': phase,
+            'checkpoint_id': checkpoint_id,
+            'status': status,
             'message': message,
             'data': data or {},
+            'node': self.get_name(),
             'stamp_monotonic': now,
         }
         if bool(self.get_parameter('debug.publish_events').value):
@@ -165,13 +165,9 @@ class VisionNode(Node):
             msg.data = json.dumps(payload, ensure_ascii=False)
             self.pub_debug_events.publish(msg)
         if log or bool(self.get_parameter('debug.log_vision_decisions').value):
-            text = (
-                f'[VISION][{category}] level={level} reason={reason} '
-                f'message={message} data={payload["data"]}')
-            if level in ('ERROR', 'FAULT'):
+            text = f'[CHECKPOINT][{phase}/{checkpoint_id}] status={status} message={message}'
+            if status == 'FAIL':
                 self.get_logger().error(text)
-            elif level == 'WARN':
-                self.get_logger().warn(text)
             else:
                 self.get_logger().info(text)
 
@@ -181,6 +177,12 @@ class VisionNode(Node):
         except NotImplementedError as exc:
             self.get_logger().warn(f'{fn.__qualname__} not implemented yet: {exc}')
             return default
+
+    _SET_MODE_CHECKPOINTS = {
+        SetVisionMode.Request.TRACK_TOOL: ('C', 'vision_set_mode_track_tool'),
+        SetVisionMode.Request.TRACK_HAND: ('G', 'vision_set_mode_track_hand'),
+        SetVisionMode.Request.OFF: ('K', 'vision_set_mode_off'),
+    }
 
     def _on_set_mode(self, request, response):
         """task_manager가 부르는 서비스 핸들러. 모드를 TRACK_TOOL로 새로 켤 때마다
@@ -194,20 +196,17 @@ class VisionNode(Node):
             self._fist_confirm_count = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
+        checkpoint = self._SET_MODE_CHECKPOINTS.get(request.mode)
+        if checkpoint is not None:
+            phase, checkpoint_id = checkpoint
+            self._checkpoint_event(
+                phase, checkpoint_id, 'PASS' if response.success else 'FAIL',
+                response.message, {'mode': request.mode, 'tool_class': request.tool_class})
         return response
 
     def _on_synced_images(self, color_msg, depth_msg, info_msg, detection_msg):
         """4개 토픽이 시간적으로 맞춰졌을 때마다(30~60Hz 목표) 호출되는 메인 루프.
         모드에 따라 _track_tool 또는 _track_hand로 위임하고, 결과가 있으면 퍼블리시."""
-        self._debug_event(
-            'INFO', 'SYNC', 'callback',
-            '동기화 이미지 콜백이 동작 중입니다.',
-            {
-                'mode': self.mode,
-                'tool_class': self.tool_class,
-                'n_detections': len(detection_msg.detections),
-            },
-            throttle_s=1.0)
         try:
             # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
             # color_msg.header.frame_id(RealSense가 붙이는 camera_color_optical_frame)가
@@ -216,12 +215,9 @@ class VisionNode(Node):
                 'base_link', CAMERA_OPTICAL_CALIB_FRAME, color_msg.header.stamp,
                 timeout=Duration(seconds=0.1))
         except TransformException as ex:
-            self._debug_event(
-                'WARN', 'TF_LOOKUP', 'lookup_failed',
-                '이미지 시각의 camera->base TF 조회에 실패했습니다.',
-                {'error': str(ex), 'source_frame': CAMERA_OPTICAL_CALIB_FRAME, 'target_frame': 'base_link'},
-                throttle_s=1.0,
-                log=True)
+            self.get_logger().warn(
+                f'이미지 시각의 camera->base TF 조회에 실패했습니다: {ex}',
+                throttle_duration_sec=1.0)
             return
 
         if self.mode == SetVisionMode.Request.TRACK_TOOL:
@@ -264,11 +260,9 @@ class VisionNode(Node):
             이 클로저 하나로 depth 조회 + intrinsics + tf 변환을 전부 감춘다)."""
             px, py = int(cx), int(cy)
             if not (0 <= py < depth_m_img.shape[0] and 0 <= px < depth_m_img.shape[1]):
-                self._debug_event(
-                    'WARN', 'RECONSTRUCT', 'pixel_out_of_bounds',
-                    'bbox 중심 픽셀이 depth 이미지 범위를 벗어났습니다.',
-                    {'px': px, 'py': py, 'width': depth_m_img.shape[1], 'height': depth_m_img.shape[0]},
-                    throttle_s=1.0)
+                self.get_logger().warn(
+                    f'bbox 중심 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다.',
+                    throttle_duration_sec=1.0)
                 return None
             # 단일 픽셀은 금속/반사면 뎁스 구멍에 취약해서 patch median으로 보완하되,
             # bbox가 patch(9x9)보다 작으면(멀리 있거나 작은 물체) 패치가 bbox 밖 배경까지
@@ -289,54 +283,17 @@ class VisionNode(Node):
             elif self.tracker.last_valid_z is not None:
                 z = self.tracker.last_valid_z
             else:
-                self._debug_event(
-                    'WARN', 'RECONSTRUCT', 'no_valid_depth_seed',
-                    '첫 유효 depth가 없어 3D 좌표 생성을 건너뜁니다.',
-                    {
-                        'px': px,
-                        'py': py,
-                        'valid_ratio': float(valid_ratio),
-                        'raw_depth_mm': int(depth_image[py, px]),
-                        'min_valid_ratio': self.valid_min_ratio,
-                    },
-                    throttle_s=1.0,
-                    log=True)
+                self.get_logger().warn(
+                    f'첫 유효 depth가 없어 3D 좌표 생성을 건너뜁니다 '
+                    f'(px={px}, py={py}, valid_ratio={valid_ratio:.3f}).',
+                    throttle_duration_sec=1.0)
                 return None
             cam_xyz = pixel_to_camera_xyz(px, py, z, fx, fy, ppx, ppy)
             base_xyz = camera_to_base(cam_xyz, tf_matrix)
-            t = tf_at_stamp.transform.translation
-            self._debug_event(
-                'INFO', 'RECONSTRUCT', 'candidate',
-                'bbox 중심에서 base_link 3D 좌표를 복원했습니다.',
-                {
-                    'px': px,
-                    'py': py,
-                    'bbox_w': bbox_w,
-                    'bbox_h': bbox_h,
-                    'half': half,
-                    'valid_ratio': float(valid_ratio),
-                    'raw_depth_mm': int(depth_image[py, px]),
-                    'z_m': None if z_m is None else float(z_m),
-                    'used_last_valid_z': z_m is None,
-                    'cam_xyz': [float(v) for v in cam_xyz],
-                    'tf_translation': [t.x, t.y, t.z],
-                    'base_xyz': [float(v) for v in base_xyz],
-                    'depth_valid': depth_valid,
-                },
-                throttle_s=1.0)
             return (base_xyz[0], base_xyz[1], base_xyz[2], depth_valid)
 
         stamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
         result = self.tracker.update(detection_msg.detections, tool_class, reconstruct, stamp)
-        self._debug_event(
-            'INFO', 'TRACK_TOOL', 'tracker_result',
-            'ToolTracker update 결과입니다.',
-            {
-                'classes_in_frame': [d.class_name for d in detection_msg.detections],
-                'looking_for': tool_class,
-                'result_is_none': result is None,
-            },
-            throttle_s=1.0)
         if result is None:
             # 검출이 끊긴 프레임 - 축 이력도 지운다. 물체가 화면에서 사라졌다 다시
             # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다
@@ -346,17 +303,20 @@ class VisionNode(Node):
                 # tool_class 매칭 검출이 없어도 들어온 검출 전체는 그려서 보여준다 -
                 # 왜 안 잡히는지(다른 클래스만 보임/아예 없음) 눈으로 바로 확인 가능하게.
                 self._publish_debug_image(color_msg, detection_msg.detections, None, None)
-            self._debug_event(
-                'WARN', 'TRACK_TOOL', 'target_missing',
-                '요청한 tool_class의 유효 3D 추적 결과가 없습니다.',
-                {
-                    'looking_for': tool_class,
-                    'classes_in_frame': [d.class_name for d in detection_msg.detections],
-                },
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f"'{tool_class}' 유효 3D 추적 결과가 없습니다.", throttle_duration_sec=1.0)
             return None  # 이번 프레임엔 tool_class 검출이 없었음 - 퍼블리시 안 함
 
         position, velocity, depth_valid, chosen_det = result
+        self._checkpoint_event(
+            'C', 'tool_track_valid', 'PASS',
+            'ToolTrack 위치/뎁스/접근 판정이 유효합니다.',
+            {
+                'tool_class': tool_class,
+                'confidence': float(chosen_det.score),
+                'depth_valid': bool(depth_valid),
+            },
+            throttle_s=1.0)
         yaw_quat, axis_debug = self._grip_yaw_quaternion(
             chosen_det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class)
 
@@ -381,11 +341,9 @@ class VisionNode(Node):
             (track.pose.orientation.x, track.pose.orientation.y,
              track.pose.orientation.z, track.pose.orientation.w) = yaw_quat
         else:
-            self._debug_event(
-                'WARN', 'YAW', 'unavailable',
-                '공구 yaw 축 계산이 불가능해 identity orientation을 사용합니다.',
-                {'tool_class': tool_class, 'depth_valid': bool(depth_valid)},
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f"'{tool_class}' 공구 yaw 축 계산이 불가능해 identity orientation을 사용합니다.",
+                throttle_duration_sec=1.0)
             track.pose.orientation.w = 1.0  # 축 미확정 프레임 - identity (구독측은 depth_valid와 별개로 처리)
         track.depth_valid = bool(depth_valid)
         track.approaching = bool(is_approaching(
@@ -420,15 +378,9 @@ class VisionNode(Node):
             dmin=self.min_z_m, dmax=DEPTH_MAX_M,
             band_m=self.yaw_band, min_px=YAW_MIN_MASK_PX)
         if axis_deg is None:
-            self._debug_event(
-                'WARN', 'YAW', 'axis_unavailable',
-                'depth ROI에서 공구 축을 계산하지 못했습니다.',
-                {
-                    'class_name': det.class_name,
-                    'bbox': [det.x1, det.y1, det.x2, det.y2],
-                    'min_mask_px': YAW_MIN_MASK_PX,
-                },
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f"{det.class_name} depth ROI에서 공구 축을 계산하지 못했습니다.",
+                throttle_duration_sec=1.0)
             return None, None
         trust = min(1.0, max(0.0, (elongation - 1.0) / (ELONGATION_TRUST_MIN - 1.0)))
         alpha = self.axis_smoother.alpha * max(ELONGATION_ALPHA_FLOOR, trust)
@@ -517,10 +469,7 @@ class VisionNode(Node):
         landmarks, confidence = detect_hand_landmarks(self._hands_detector, image)
         if landmarks is None:
             self._fist_confirm_count = 0
-            self._debug_event(
-                'WARN', 'TRACK_HAND', 'hand_missing',
-                'MediaPipe가 손을 찾지 못했습니다.',
-                throttle_s=1.0)
+            self.get_logger().warn('MediaPipe가 손을 찾지 못했습니다.', throttle_duration_sec=1.0)
             track.detected = False
             return track
 
@@ -529,21 +478,16 @@ class VisionNode(Node):
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         if not (0 <= py < depth_image.shape[0] and 0 <= px < depth_image.shape[1]):
             self._fist_confirm_count = 0
-            self._debug_event(
-                'WARN', 'TRACK_HAND', 'pixel_out_of_bounds',
-                '손목 픽셀이 depth 이미지 범위를 벗어났습니다.',
-                {'px': px, 'py': py, 'width': depth_image.shape[1], 'height': depth_image.shape[0]},
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f'손목 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다.',
+                throttle_duration_sec=1.0)
             track.detected = False
             return track
         depth_m = float(depth_image[py, px]) / 1000.0
         if depth_m <= 0.0:
             self._fist_confirm_count = 0
-            self._debug_event(
-                'WARN', 'TRACK_HAND', 'invalid_depth',
-                '손목 픽셀 depth가 0 이하입니다.',
-                {'px': px, 'py': py, 'raw_depth_mm': int(depth_image[py, px])},
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f'손목 픽셀({px},{py}) depth가 0 이하입니다.', throttle_duration_sec=1.0)
             track.detected = False
             return track
 
@@ -561,8 +505,8 @@ class VisionNode(Node):
         track.detected = True
         track.fist = confirmed_fist
         track.confidence = confidence
-        self._debug_event(
-            'INFO', 'TRACK_HAND', 'hand_track',
+        self._checkpoint_event(
+            'H', 'hand_pose_published', 'PASS',
             'base_link 기준 hand_track을 발행합니다.',
             {
                 'px': px, 'py': py, 'depth_m': depth_m,

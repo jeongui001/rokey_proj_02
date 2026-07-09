@@ -1,3 +1,5 @@
+import json
+
 import rclpy
 import pytest
 from rclpy.parameter import Parameter
@@ -393,3 +395,119 @@ def test_on_set_mode_track_hand_resets_fist_confirm_count(node):
     node._on_set_mode(request, SetVisionMode.Response())
 
     assert node._fist_confirm_count == 0
+
+
+def test_set_mode_track_tool_publishes_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+    request = SetVisionMode.Request()
+    request.mode = SetVisionMode.Request.TRACK_TOOL
+    request.tool_class = 'spanner'
+
+    node._on_set_mode(request, SetVisionMode.Response())
+
+    assert len(published) == 1
+    payload = json.loads(published[0].data)
+    assert payload['phase'] == 'C'
+    assert payload['checkpoint_id'] == 'vision_set_mode_track_tool'
+    assert payload['status'] == 'PASS'
+
+
+def test_set_mode_track_hand_publishes_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+    request = SetVisionMode.Request()
+    request.mode = SetVisionMode.Request.TRACK_HAND
+
+    node._on_set_mode(request, SetVisionMode.Response())
+
+    payload = json.loads(published[0].data)
+    assert payload['phase'] == 'G'
+    assert payload['checkpoint_id'] == 'vision_set_mode_track_hand'
+    assert payload['status'] == 'PASS'
+
+
+def test_set_mode_off_publishes_checkpoint(node):
+    published = []
+    node.pub_debug_events.publish = published.append
+    request = SetVisionMode.Request()
+    request.mode = SetVisionMode.Request.OFF
+
+    node._on_set_mode(request, SetVisionMode.Response())
+
+    payload = json.loads(published[0].data)
+    assert payload['phase'] == 'K'
+    assert payload['checkpoint_id'] == 'vision_set_mode_off'
+    assert payload['status'] == 'PASS'
+
+
+def test_track_tool_success_publishes_tool_track_valid_checkpoint(node):
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+    published = []
+    node.pub_debug_events.publish = published.append
+    # 이 테스트는 체크포인트 발행 로직만 검증 대상 - 디버그 이미지 인코딩(cv2.putText가
+    # bgr8/uint8을 요구)까지 흉내내는 건 범위 밖이라 꺼서 우회한다
+    # (다른 기존 테스트 test_track_tool_debug_image_off_when_disabled와 동일 패턴).
+    node.publish_debug_image = False
+
+    color_msg = _make_image_msg()
+    depth_msg = _make_image_msg()
+    info_msg = _make_info_msg()
+    detection = Detection2D()
+    detection.class_name = 'spanner'
+    detection.score = 0.9
+    detection.x1, detection.y1, detection.x2, detection.y2 = 310, 230, 330, 250
+    detection_msg = _make_detection_msg([detection])
+
+    import numpy as np
+    fake_depth = np.full((480, 424), 500, dtype=np.uint16)
+    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: fake_depth
+
+    track = node._track_tool(
+        color_msg, depth_msg, info_msg, detection_msg, FakeTransform(), 'spanner')
+
+    assert track is not None
+    checkpoint_payloads = [json.loads(p.data) for p in published]
+    matches = [p for p in checkpoint_payloads if p['checkpoint_id'] == 'tool_track_valid']
+    assert len(matches) == 1
+    assert matches[0]['phase'] == 'C'
+    assert matches[0]['status'] == 'PASS'
+    assert matches[0]['data']['tool_class'] == 'spanner'
+    assert matches[0]['data']['depth_valid'] is True
+
+
+def test_track_tool_missing_target_does_not_publish_checkpoint(node):
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+    published = []
+    node.pub_debug_events.publish = published.append
+    node.tracker.update = lambda *a, **k: None
+    # depth 이미지 읽기(_track_tool 최상단)가 tracker.update보다 먼저 실행되므로
+    # 실제 cv_bridge가 빈 encoding으로 터지지 않게 최소 스텁이 필요하다. 디버그 이미지
+    # 인코딩은 이 테스트 범위 밖이라 꺼서 우회한다(위 테스트와 동일 이유).
+    node.publish_debug_image = False
+    import numpy as np
+    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: np.zeros(
+        (480, 424), dtype=np.uint16)
+
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(),
+        _make_detection_msg([]), FakeTransform(), 'spanner')
+
+    assert track is None
+    assert published == []
+
+
+def test_track_hand_success_publishes_hand_pose_checkpoint(node, monkeypatch):
+    _setup_hand_depth(node, depth_mm=500)
+    _patch_hand_landmarks(node, monkeypatch, _make_hand_landmarks(wrist_x=0.5, wrist_y=0.5, fist=False))
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    track = node._track_hand(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), FakeTransform())
+
+    assert track.detected is True
+    payload = json.loads(published[-1].data)
+    assert payload['phase'] == 'H'
+    assert payload['checkpoint_id'] == 'hand_pose_published'
+    assert payload['status'] == 'PASS'
