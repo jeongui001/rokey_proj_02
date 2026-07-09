@@ -1,7 +1,7 @@
 import threading
 
 import pytest
-from PyQt5 import QtCore, QtGui
+from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
 
 from operator_gui.main_window import CMD_RESUME, DEFAULT_CAMERA_STALE_TIMEOUT_S, MainWindow
@@ -15,6 +15,10 @@ class _FakeRosClient:
         self.on_fault = None
         self.on_connection_changed = None
         self.on_camera_image = None
+        self.on_mic_level = None
+        self.on_stt_status = None
+        self.on_stt_command = None
+        self.on_debug_event = None
         self.reconnect_interval_s = 5.0
         self._connected = connected
         self.ensure_connected_calls = 0
@@ -289,26 +293,93 @@ def test_stt_status_updates_label(window, qtbot):
     assert '명령어를 말해주세요' in window.stt_status_label.text()
 
 
-def test_debug_event_button_collects_warn_events(window, qtbot):
-    payload = {
-        'node': 'vision_node',
-        'level': 'WARN',
-        'category': 'TRACK_TOOL',
-        'reason': 'target_missing',
-        'message': '요청한 tool_class의 유효 3D 추적 결과가 없습니다.',
-        'data': {'looking_for': 'wrench'},
-    }
+def test_checklist_starts_with_all_checkpoints_pending(window):
+    from operator_gui.main_window import CHECKPOINTS
 
+    assert len(window._checkpoint_rows) == len(CHECKPOINTS)
+    assert all(row.status == 'PENDING' for row in window._checkpoint_rows.values())
+
+
+def test_checklist_auto_checkpoint_turns_pass_on_event(window, qtbot):
+    payload = {
+        'phase': 'C', 'checkpoint_id': 'vision_set_mode_track_tool', 'status': 'PASS',
+        'message': 'set_mode 응답 success', 'data': {'mode': 1}, 'node': 'vision_node',
+    }
     with qtbot.waitSignal(window.debug_event_received, timeout=1000):
         window.ros_client.on_debug_event(payload)
 
-    assert window.debug_log_view.count() == 1
-    assert window.debug_toggle_button.text() == '오류 확인 (1)'
+    row = window._checkpoint_rows['vision_set_mode_track_tool']
+    assert row.status == 'PASS'
+    assert row.payload == payload
 
-    qtbot.mouseClick(window.debug_toggle_button, Qt.LeftButton)
 
-    assert window.debug_panel.isVisible()
-    assert window.debug_toggle_button.text() == '오류 확인'
+def test_checklist_auto_checkpoint_turns_fail_on_event(window, qtbot):
+    payload = {
+        'phase': 'D', 'checkpoint_id': 'servo_pick_result', 'status': 'FAIL',
+        'message': 'timeout', 'data': {}, 'node': 'task_manager',
+    }
+    with qtbot.waitSignal(window.debug_event_received, timeout=1000):
+        window.ros_client.on_debug_event(payload)
+
+    assert window._checkpoint_rows['servo_pick_result'].status == 'FAIL'
+
+
+def test_checklist_ignores_unknown_checkpoint_id(window, qtbot):
+    payload = {
+        'phase': 'Z', 'checkpoint_id': 'not_a_real_checkpoint', 'status': 'PASS',
+        'message': '', 'data': {},
+    }
+    with qtbot.waitSignal(window.debug_event_received, timeout=1000):
+        window.ros_client.on_debug_event(payload)
+
+    assert all(row.status == 'PENDING' for row in window._checkpoint_rows.values())
+
+
+def test_manual_checkbox_toggles_checkpoint_to_pass_and_back(window):
+    row = window._checkpoint_rows['stt_recording_not_truncated']
+    assert row.auto is False
+
+    row.checkbox.setChecked(True)
+    assert row.status == 'PASS'
+
+    row.checkbox.setChecked(False)
+    assert row.status == 'PENDING'
+
+
+def test_reset_checklist_button_resets_all_rows(window, qtbot):
+    payload = {
+        'phase': 'C', 'checkpoint_id': 'vision_set_mode_track_tool', 'status': 'PASS',
+        'message': '', 'data': {}, 'node': 'vision_node',
+    }
+    with qtbot.waitSignal(window.debug_event_received, timeout=1000):
+        window.ros_client.on_debug_event(payload)
+    manual_row = window._checkpoint_rows['stt_recording_not_truncated']
+    manual_row.checkbox.setChecked(True)
+
+    qtbot.mouseClick(window.reset_checklist_button, Qt.LeftButton)
+
+    assert window._checkpoint_rows['vision_set_mode_track_tool'].status == 'PENDING'
+    assert manual_row.status == 'PENDING'
+    assert manual_row.checkbox.isChecked() is False
+
+
+def test_checkpoint_row_click_shows_detail_popup(window, qtbot, monkeypatch):
+    payload = {
+        'phase': 'C', 'checkpoint_id': 'vision_set_mode_track_tool', 'status': 'PASS',
+        'message': '응답 success', 'data': {'mode': 1}, 'node': 'vision_node',
+    }
+    with qtbot.waitSignal(window.debug_event_received, timeout=1000):
+        window.ros_client.on_debug_event(payload)
+
+    shown = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, 'information',
+        lambda *args, **kwargs: shown.append(args))
+
+    window._checkpoint_rows['vision_set_mode_track_tool'].clicked.emit()
+
+    assert len(shown) == 1
+    assert '응답 success' in shown[0][-1]
 
 
 # ---- 연결 상태 ----

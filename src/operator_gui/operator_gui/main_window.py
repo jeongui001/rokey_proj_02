@@ -1,7 +1,6 @@
 import math
 import os
 import time
-from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -11,7 +10,6 @@ DEFAULT_CAMERA_STALE_TIMEOUT_S = 2.0
 # 위 timeout과 무관하게, 화면 갱신 자체를 확인하는 주기(ms). timeout보다 충분히
 # 짧게 유지해 멈춤 표시가 늦게 뜨지 않게 한다.
 _CAMERA_STALE_CHECK_INTERVAL_MS = 300
-_MAX_DEBUG_EVENTS = 200
 
 _MONO_FONT_STACK = '"Cascadia Code", "DejaVu Sans Mono", "Consolas", monospace'
 
@@ -119,16 +117,6 @@ QPushButton#dangerButton:hover {{
     background-color: #ff4d5e;
     color: #05080d;
 }}
-QPushButton#warningButton {{
-    background-color: transparent;
-    color: #ffd166;
-    border: 1px solid #ffd166;
-    font-weight: 700;
-}}
-QPushButton#warningButton:checked {{
-    background-color: rgba(255, 209, 102, 0.18);
-    color: #ffd166;
-}}
 QLineEdit {{
     background-color: #0c141d;
     color: #cfe6f2;
@@ -224,6 +212,120 @@ SAFETY_OVERLAY_LABELS = {
     'FAULT': '오류',
 }
 
+# 파이프라인 점검.md의 Phase A~K 체크리스트와 1:1 대응하는 체크포인트 정의.
+# (phase, checkpoint_id, 화면에 보여줄 설명, 자동 판정 여부)
+CHECKPOINTS = [
+    ('A', 'stt_utterance_published', '발화 텍스트가 그대로 퍼블리시되는가', True),
+    ('A', 'stt_recording_not_truncated', '5초 고정 녹음이라 말이 잘리지 않는가', False),
+    ('B', 'parse_no_intermediate_state', 'command_parser가 즉시 판정하는가(중간 PARSING 없음)', True),
+    ('B', 'move_watch_goal_sent', 'move_named(watch) 골이 전송되는가', True),
+    ('B', 'move_watch_robot_moved', '로봇이 실제로 watch 자세로 이동하는가', False),
+    ('B', 'move_watch_result_received', '이동 완료 결과가 task_manager로 돌아오는가', True),
+    ('C', 'vision_set_mode_track_tool', '/vision/set_mode(TRACK_TOOL) 응답이 success인가', True),
+    ('C', 'tool_track_valid', 'ToolTrack(위치/뎁스 유효/접근 여부)이 그럴듯한가', True),
+    ('C', 'servo_pick_triggered', '트리거 게이트 통과 후 SERVO_PICK으로 전이되는가', True),
+    ('D', 'servo_pick_state_entered', '/task/status에서 SERVO_PICK 진입 확인', True),
+    ('D', 'servo_tracking_followed', '서보 루프가 공구를 따라가는가', False),
+    ('D', 'gripper_closed', '그리퍼가 실제로 닫히는가', True),
+    ('D', 'servo_pick_result', 'success/final_width_mm/grip_detected가 정상 반환되는가', True),
+    ('E', 'grasp_verified', 'grip_detected + 폭 범위로 재확인하는가', True),
+    ('E', 'move_safe_entered', 'MOVE_SAFE로 전이되는가', True),
+    ('F', 'handover_safe_goal_sent', 'move_named(handover_safe) 골 전송 확인', True),
+    ('F', 'handover_safe_robot_moved', '로봇이 handover_safe 자세로 이동하는가', False),
+    ('F', 'handover_safe_result_received', '이동 완료 결과 수신 확인', True),
+    ('G', 'approach_hand_entered', '/task/status에서 APPROACH_HAND 전이 확인', True),
+    ('G', 'vision_set_mode_track_hand', '/vision/set_mode(TRACK_HAND) 호출 및 success 응답', True),
+    ('H', 'hand_pose_published', '/vision/hand_pose가 퍼블리시되는가', True),
+    ('H', 'handover_approach_goal_sent', 'handover_approach 골 전송 확인', True),
+    ('H', 'handover_approach_robot_moved', '로봇이 손 쪽으로 이동하는가', False),
+    ('H', 'handover_approach_result_received', '이동 완료 결과 수신 확인', True),
+    ('I', 'wait_pull_entered', 'WAIT_PULL 전이 확인', True),
+    ('I', 'handover_hold_goal_sent', 'handover_hold 골 전송 확인', True),
+    ('I', 'compliance_mode_active', '컴플라이언스 모드가 가동되는가', True),
+    ('I', 'gripper_opened_on_pull', '공구를 당겼을 때 그리퍼가 개방되는가', True),
+    ('I', 'compliance_mode_ended', '개방 후 컴플라이언스가 종료되는가', True),
+    ('I', 'handover_hold_result_received', '결과 수신 확인', True),
+    ('J', 'home_goal_sent', 'move_named(home) 골 전송 확인', True),
+    ('J', 'gripper_auto_opened_before_home', '그리퍼가 열려있지 않으면 자동으로 open하는가', False),
+    ('J', 'home_result_received', 'home 이동 완료 결과 수신 확인', True),
+    ('K', 'vision_set_mode_off', '/vision/set_mode(OFF) 호출 및 success 응답', True),
+    ('K', 'idle_entered', '/task/status가 IDLE로 돌아오는가', True),
+    ('K', 'second_cycle_started', '이후 다시 발화했을 때 2회차 사이클이 정상 시작되는가', False),
+]
+PHASE_ORDER = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K']
+PHASE_TITLES = {
+    'A': 'Phase A — STT',
+    'B': 'Phase B — 파싱 → MOVE_TO_WATCH',
+    'C': 'Phase C — 공구 추적',
+    'D': 'Phase D — servo_pick 파지',
+    'E': 'Phase E — 파지 검증 → MOVE_SAFE',
+    'F': 'Phase F — handover_safe 이동',
+    'G': 'Phase G — TRACK_HAND 전환',
+    'H': 'Phase H — 손 위치 추적~접근',
+    'I': 'Phase I — handover_hold 당김 감지',
+    'J': 'Phase J — HOME 복귀',
+    'K': 'Phase K — vision OFF ~ IDLE',
+}
+
+_STATUS_ICON = {'PENDING': '⏳', 'PASS': '✅', 'FAIL': '❌'}
+_STATUS_COLOR = {'PENDING': '#7f95a3', 'PASS': '#39e991', 'FAIL': '#ff4d5e'}
+
+
+class _CheckpointRow(QtWidgets.QWidget):
+    """파이프라인 점검 체크리스트의 한 줄. 자동 판정 항목은 ROS 이벤트로만
+    상태가 바뀌고, 수동 항목은 체크박스를 눌러 오퍼레이터가 직접 표시한다."""
+
+    clicked = QtCore.pyqtSignal()
+
+    def __init__(self, checkpoint_id, label_text, auto, parent=None):
+        super().__init__(parent)
+        self.checkpoint_id = checkpoint_id
+        self.label_text = label_text
+        self.auto = auto
+        self.status = 'PENDING'
+        self.payload = None
+
+        layout = QtWidgets.QHBoxLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        self.status_label = QtWidgets.QLabel(_STATUS_ICON['PENDING'])
+        self.status_label.setFixedWidth(20)
+        self.text_label = QtWidgets.QLabel(label_text)
+        self.text_label.setWordWrap(True)
+        # 드래그로 문구를 선택해 Ctrl+C로 복사할 수 있게 한다(QLabel 기본 기능).
+        self.text_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.text_label, stretch=1)
+        self.checkbox = None
+        if not auto:
+            self.checkbox = QtWidgets.QCheckBox()
+            self.checkbox.toggled.connect(self._on_checkbox_toggled)
+            layout.addWidget(self.checkbox)
+        self._apply_style()
+
+    def _on_checkbox_toggled(self, checked):
+        self.set_status('PASS' if checked else 'PENDING')
+
+    def set_status(self, status, payload=None):
+        self.status = status
+        self.payload = payload
+        self._apply_style()
+
+    def _apply_style(self):
+        self.status_label.setText(_STATUS_ICON[self.status])
+        self.text_label.setStyleSheet(f'color: {_STATUS_COLOR[self.status]};')
+
+    def reset(self):
+        self.payload = None
+        if self.checkbox is not None:
+            self.checkbox.blockSignals(True)
+            self.checkbox.setChecked(False)
+            self.checkbox.blockSignals(False)
+        self.set_status('PENDING')
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
 
 class MainWindow(QtWidgets.QMainWindow):
     # state, detail, operation_mode, safety_state, resumable
@@ -263,8 +365,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._camera_stale = False
         # 초기 /task/status를 받기 전에는 이동/모드 버튼을 안전하게 비활성화해 둔다.
         self._received_first_status = False
-        self._debug_events = deque(maxlen=_MAX_DEBUG_EVENTS)
-        self._unseen_debug_count = 0
         self._right_compact_scale = None
 
         self._build_ui()
@@ -315,12 +415,6 @@ class MainWindow(QtWidgets.QMainWindow):
         top_bar.addWidget(self.state_label)
         top_bar.addWidget(self.safety_label)
         top_bar.addWidget(self.detail_label, stretch=1)
-        self.debug_toggle_button = QtWidgets.QPushButton('오류 확인')
-        self.debug_toggle_button.setObjectName('warningButton')
-        self.debug_toggle_button.setCheckable(True)
-        self.debug_toggle_button.setMinimumWidth(76)
-        self.debug_toggle_button.clicked.connect(self._toggle_debug_panel)
-        top_bar.addWidget(self.debug_toggle_button)
 
         self.fault_banner = QtWidgets.QLabel('')
         self.fault_banner.setStyleSheet(
@@ -474,29 +568,48 @@ class MainWindow(QtWidgets.QMainWindow):
         ]
         self._right_groups = [mode_group, move_group, estop_group, cmd_group, mic_group]
 
-        # 하단: 시간순 로그 - 최소 10줄 이상 보이도록 높이를 확보한다.
+        # 가장 중요한 정보이므로 카메라와 비슷한 비중으로 항상 크게 노출한다(토글 없음).
         self.debug_panel = QtWidgets.QGroupBox('오류 확인')
-        self.debug_log_view = QtWidgets.QListWidget()
-        self.debug_log_view.setMinimumHeight(80)
-        self.debug_log_view.itemClicked.connect(self._show_debug_event_detail)
-        self.clear_debug_button = QtWidgets.QPushButton('비우기')
-        self.clear_debug_button.clicked.connect(self._clear_debug_events)
+        self._checkpoint_rows = {}
+        scroll_content = QtWidgets.QWidget()
+        scroll_content_layout = QtWidgets.QVBoxLayout(scroll_content)
+        scroll_content_layout.setSpacing(6)
+        for phase in PHASE_ORDER:
+            phase_group = QtWidgets.QGroupBox(PHASE_TITLES[phase])
+            phase_layout = QtWidgets.QVBoxLayout()
+            for cp_phase, checkpoint_id, label, auto in CHECKPOINTS:
+                if cp_phase != phase:
+                    continue
+                row = _CheckpointRow(checkpoint_id, label, auto)
+                row.clicked.connect(
+                    lambda checkpoint_id=checkpoint_id: self._show_checkpoint_detail(checkpoint_id))
+                self._checkpoint_rows[checkpoint_id] = row
+                phase_layout.addWidget(row)
+            phase_group.setLayout(phase_layout)
+            scroll_content_layout.addWidget(phase_group)
+        scroll_content_layout.addStretch(1)
+        self.checklist_scroll = QtWidgets.QScrollArea()
+        self.checklist_scroll.setWidgetResizable(True)
+        self.checklist_scroll.setWidget(scroll_content)
+        self.checklist_scroll.setMinimumHeight(220)
+
+        self.reset_checklist_button = QtWidgets.QPushButton('초기화')
+        self.reset_checklist_button.clicked.connect(self._reset_checklist)
         debug_header = QtWidgets.QHBoxLayout()
         debug_header.addStretch(1)
-        debug_header.addWidget(self.clear_debug_button)
+        debug_header.addWidget(self.reset_checklist_button)
         debug_layout = QtWidgets.QVBoxLayout()
         debug_layout.addLayout(debug_header)
-        debug_layout.addWidget(self.debug_log_view)
+        debug_layout.addWidget(self.checklist_scroll)
         self.debug_panel.setLayout(debug_layout)
-        self.debug_panel.setMaximumHeight(190)
-        self.debug_panel.hide()
 
+        # 하단: 시간순 로그
         self.log_view = QtWidgets.QListWidget()
         self.log_view.setMinimumHeight(90)
 
         left_column = QtWidgets.QVBoxLayout()
         left_column.addWidget(self.camera_label, stretch=1)
-        left_column.addWidget(self.debug_panel)
+        left_column.addWidget(self.debug_panel, stretch=1)
         left_column.addWidget(self.log_view, stretch=0)
         left_widget = QtWidgets.QWidget()
         left_widget.setLayout(left_column)
@@ -761,75 +874,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_stt_command(self, text):
         self.stt_command_label.setText(f'마지막 명령어: {text}')
 
-    # ---- 디버그 이벤트 ----
+    # ---- 체크리스트 ----
 
-    def _toggle_debug_panel(self, checked):
-        self.debug_panel.setVisible(bool(checked))
-        if checked:
-            self._unseen_debug_count = 0
-            self._refresh_debug_button_text()
-
-    def _clear_debug_events(self):
-        self._debug_events.clear()
-        self.debug_log_view.clear()
-        self._unseen_debug_count = 0
-        self._refresh_debug_button_text()
-
-    def _refresh_debug_button_text(self):
-        if self._unseen_debug_count > 0:
-            self.debug_toggle_button.setText(f'오류 확인 ({self._unseen_debug_count})')
-        else:
-            self.debug_toggle_button.setText('오류 확인')
-
-    @staticmethod
-    def _format_debug_event(payload):
-        node = payload.get('node', '-')
-        level = payload.get('level', '-')
-        category = payload.get('category', '-')
-        reason = payload.get('reason', '-')
-        message = payload.get('message', '')
-        data = payload.get('data') or {}
-        compact_data = ''
-        if data:
-            pairs = []
-            for key in sorted(data.keys())[:4]:
-                value = data[key]
-                if isinstance(value, float):
-                    value = f'{value:.4g}'
-                pairs.append(f'{key}={value}')
-            compact_data = ' | ' + ', '.join(pairs)
-        return f'[{level}] {node}/{category} reason={reason} {message}{compact_data}'
+    def _reset_checklist(self):
+        for row in self._checkpoint_rows.values():
+            row.reset()
 
     def _update_debug_event(self, payload):
         if not isinstance(payload, dict):
             return
-        level = payload.get('level', '')
-        if level not in ('WARN', 'ERROR', 'FAULT'):
+        status = payload.get('status')
+        if status not in ('PASS', 'FAIL'):
             return
-        self._debug_events.append(payload)
-        item = QtWidgets.QListWidgetItem(self._format_debug_event(payload))
-        if level == 'WARN':
-            item.setForeground(QtGui.QColor('#ffd166'))
-        else:
-            item.setForeground(QtGui.QColor('#ff4d5e'))
-        item.setData(QtCore.Qt.UserRole, payload)
-        self.debug_log_view.addItem(item)
-        while self.debug_log_view.count() > _MAX_DEBUG_EVENTS:
-            self.debug_log_view.takeItem(0)
-        self.debug_log_view.scrollToBottom()
-        if not self.debug_panel.isVisible():
-            self._unseen_debug_count += 1
-            self._refresh_debug_button_text()
-        self._log(f'디버그 이벤트: {self._format_debug_event(payload)}')
+        row = self._checkpoint_rows.get(payload.get('checkpoint_id'))
+        if row is None:
+            return
+        row.set_status(status, payload)
+        self._log(f"체크포인트 갱신: {row.checkpoint_id} -> {status}")
 
-    def _show_debug_event_detail(self, item):
-        payload = item.data(QtCore.Qt.UserRole)
-        if not isinstance(payload, dict):
+    def _show_checkpoint_detail(self, checkpoint_id):
+        row = self._checkpoint_rows.get(checkpoint_id)
+        if row is None:
             return
+        if row.payload is None:
+            QtWidgets.QMessageBox.information(
+                self, '오류 확인', f'{row.label_text}\n\n(아직 수신된 이벤트가 없습니다.)')
+            return
+        payload = row.payload
         data = payload.get('data') or {}
-        detail = self._format_debug_event(payload)
+        detail = f"[{payload.get('status')}] {row.label_text} - {payload.get('message', '')}"
         if data:
-            detail = f'{detail}\n\n수치:\n' + '\n'.join(
+            detail += '\n\n수치:\n' + '\n'.join(
                 f'- {key}: {value}' for key, value in sorted(data.items()))
         QtWidgets.QMessageBox.information(self, '오류 확인', detail)
 
