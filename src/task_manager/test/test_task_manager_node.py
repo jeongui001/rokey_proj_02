@@ -2210,3 +2210,56 @@ def test_verify_grasp_criteria_not_met_publishes_grasp_verified_fail(node):
     grasp_verified = [p for p in payloads if p['checkpoint_id'] == 'grasp_verified']
     assert grasp_verified[0]['phase'] == 'E'
     assert grasp_verified[0]['status'] == 'FAIL'
+
+
+_GOAL_RESULT_CHECKPOINT_CASES = [
+    ('move_named', {'named_target': 'watch'}, State.MOVE_TO_WATCH, 'B', 'move_watch_result_received'),
+    ('move_named', {'named_target': 'handover_safe'}, State.MOVE_SAFE, 'F', 'handover_safe_result_received'),
+    ('handover_approach', {}, State.APPROACH_HAND, 'H', 'handover_approach_result_received'),
+    ('handover_hold', {}, State.WAIT_PULL, 'I', 'handover_hold_result_received'),
+    ('move_named', {'named_target': 'home'}, State.HOME, 'J', 'home_result_received'),
+]
+
+
+@pytest.mark.parametrize(
+    'task_type,kwargs,result_state,expected_phase,expected_checkpoint',
+    _GOAL_RESULT_CHECKPOINT_CASES)
+def test_goal_result_publishes_checkpoint_on_success(
+        node, task_type, kwargs, result_state, expected_phase, expected_checkpoint):
+    node.state = result_state
+    goal_handle = _send_and_accept(node, task_type, **kwargs)
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    goal_handle.result_future.fire(_FakeResult(success=True))
+
+    payloads = [json.loads(p.data) for p in published]
+    matches = [p for p in payloads if p['checkpoint_id'] == expected_checkpoint]
+    assert len(matches) == 1
+    assert matches[0]['phase'] == expected_phase
+    assert matches[0]['status'] == 'PASS'
+
+
+def test_goal_result_publishes_fail_checkpoint_on_failure(node):
+    node.state = State.MOVE_TO_WATCH
+    goal_handle = _send_and_accept(node, 'move_named', named_target='watch')
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    goal_handle.result_future.fire(_FakeResult(success=False, message='이동 실패'))
+
+    payload = json.loads(published[-1].data)
+    assert payload['checkpoint_id'] == 'move_watch_result_received'
+    assert payload['status'] == 'FAIL'
+
+
+def test_goal_result_unmapped_state_does_not_publish_checkpoint(node):
+    node.state = State.MANUAL_MOVE
+    goal_handle = _send_and_accept(node, 'move_named', named_target='front')
+    published = []
+    node.pub_debug_events.publish = published.append
+
+    goal_handle.result_future.fire(_FakeResult(success=True))
+
+    payloads = [json.loads(p.data) for p in published]
+    assert not any(p['checkpoint_id'].endswith('_result_received') for p in payloads)

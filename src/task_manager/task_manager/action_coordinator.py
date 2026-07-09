@@ -4,6 +4,19 @@ from handover_interfaces.srv import SetVisionMode
 from task_manager.task_models import Safety, State
 
 
+# _on_robot_result의 result_state(goal 송신 시점의 self.state) -> (phase, checkpoint_id).
+# SERVO_PICK/VERIFY_GRASP/MANUAL_MOVE 결과는 파이프라인 점검.md 체크리스트
+# 항목이 아니므로(각각 D/servo_pick_result가 별도로 처리하거나, 수동 이동/재시도라
+# 체크리스트 밖) 체크포인트를 발행하지 않는다.
+_RESULT_STATE_CHECKPOINTS = {
+    State.MOVE_TO_WATCH: ('B', 'move_watch_result_received'),
+    State.MOVE_SAFE: ('F', 'handover_safe_result_received'),
+    State.APPROACH_HAND: ('H', 'handover_approach_result_received'),
+    State.WAIT_PULL: ('I', 'handover_hold_result_received'),
+    State.HOME: ('J', 'home_result_received'),
+}
+
+
 class ActionCoordinator:
     """RobotTask Goal 송신·취소·지연 응답을 관리하는 mixin."""
 
@@ -29,11 +42,7 @@ class ActionCoordinator:
         self._recovery_in_progress = False
         self.safety_state = Safety.FAULT
         self._publish_status(detail='취소 확인 타임아웃 - 안전을 위해 FAULT로 전환합니다.')
-        self._debug_event(
-            'ERROR', 'ACTION_CANCEL', 'timeout',
-            'goal 취소 완료를 제한 시간 안에 확인하지 못했습니다.',
-            {'state': self.state},
-            log=True)
+        self.get_logger().error(f'goal 취소 완료를 제한 시간 안에 확인하지 못했습니다 (state={self.state}).')
 
     # ---- Action 취소 (STOP / 모드 전환 / Fault 공용) ----
 
@@ -86,23 +95,17 @@ class ActionCoordinator:
         self._set_vision_mode(SetVisionMode.Request.OFF)
         self._publish_status(
             detail=f'{context_label} 예외: {exc} - 안전을 위해 FAULT로 전환합니다.')
-        self._debug_event(
-            'ERROR', 'ACTION_EXCEPTION', context_label,
-            'RobotTask action 통신 경계에서 예외가 발생했습니다.',
-            {'error': str(exc), 'state': self.state},
-            log=True)
+        self.get_logger().error(
+            f'RobotTask action 통신 경계({context_label})에서 예외가 발생했습니다: {exc} (state={self.state}).')
 
     # ---- 안전/고장 처리 ----
 
     def _send_robot_goal(self, task_type, named_target='', tool_class='',
                          grasp_width_mm=0.0, grasp_force_n=0.0):
         if self._goal_in_progress:
-            self.get_logger().warn(f'{task_type} 요청 무시 - 이미 진행 중인 goal이 있습니다.')
-            self._debug_event(
-                'WARN', 'GOAL_SEND_SKIP', 'goal_in_progress',
-                '이미 진행 중인 goal이 있어 새 goal 송신을 생략했습니다.',
-                {'task_type': task_type, 'state': self.state},
-                throttle_s=1.0)
+            self.get_logger().warn(
+                f'{task_type} 요청 무시 - 이미 진행 중인 goal이 있습니다.',
+                throttle_duration_sec=1.0)
             return
         self._goal_in_progress = True
         self._goal_generation += 1
@@ -182,6 +185,14 @@ class ActionCoordinator:
             callback()
             self._maybe_start_recovery()
             return
+        checkpoint = _RESULT_STATE_CHECKPOINTS.get(result_state)
+        if checkpoint is not None:
+            phase, checkpoint_id = checkpoint
+            self._checkpoint_event(
+                phase, checkpoint_id,
+                'PASS' if response.result.success else 'FAIL',
+                response.result.message or f'{result_state} 결과 수신',
+                {'success': bool(response.result.success)})
         handlers = {
             State.MOVE_TO_WATCH: self._handle_move_to_watch_result,
             State.SERVO_PICK: self._handle_servo_pick_result,
