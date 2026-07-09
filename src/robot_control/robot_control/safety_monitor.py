@@ -127,16 +127,8 @@ class SafetyMonitor:
         message = String()
         message.data = reason
         self.node.pub_fault.publish(message)
-        if hasattr(self.node, '_debug_event'):
-            self.node._debug_event(
-                'ERROR', 'SAFETY_FAULT', new_state,
-                '안전 fault가 선언되었습니다.',
-                {
-                    'reason': reason,
-                    'safety_state': new_state,
-                    'latest_robot_state': self.latest_robot_state,
-                },
-                log=True)
+        self.node.get_logger().error(
+            f'안전 fault가 선언되었습니다: state={new_state}, reason={reason}')
 
     def wait_for_pull(self, goal_handle, is_pull_detected, is_fresh):
         """서로 다른 최신 힘 샘플에서 연속 당김이 확인될 때까지 기다린다."""

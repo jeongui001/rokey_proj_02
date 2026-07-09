@@ -492,6 +492,7 @@ class RobotControlNode(Node, TaskExecutor):
         reason = (
             f'{FaultPrefix.FAULT}예상하지 못한 외력이 감지되었습니다(이동 중 포함 직접 감지) '
             f'(joint={joint_index + 1}, 값={value:.1f} Nm, 기준={threshold:.1f} Nm).')
+        self.get_logger().error(reason)
         self.safety_monitor.declare_fault(reason)
 
     def destroy_node(self):
