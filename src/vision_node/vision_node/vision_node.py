@@ -22,6 +22,13 @@ from vision_node.grasp_geometry import (
     yaw_deg_to_quaternion,
 )
 
+# hand-eye 캘리브레이션(T_gripper2camera.npy)이 이미 카메라 광학 좌표계 기준이라,
+# RealSense가 내부적으로 발행하는 camera_link->camera_color_optical_frame 회전을 또
+# 거치면(=color_msg.header.frame_id로 조회하면) 회전이 두 번 걸려 축이 섞인다(x<->z 결합).
+# vision_node.launch.py의 static_transform_publisher가 이 이름으로 link_6->(광학좌표계)를
+# 직접 발행하므로, 캘리브레이션을 한 번만 적용하려면 이 프레임을 직접 조회해야 한다.
+CAMERA_OPTICAL_CALIB_FRAME = 'camera_optical_calib'
+
 # 뎁스/축 계산 상수 - tool_detection_node(프로토타입 계열)에서 실기 검증된 값 그대로.
 DEPTH_MAX_M = 2.0        # 이보다 먼 뎁스는 무효(배경/노이즈)
 PATCH_HALF = 4           # patch_median_depth 반경 -> (2*4+1)^2 = 9x9 패치
@@ -147,8 +154,10 @@ class VisionNode(Node):
             throttle_duration_sec=1.0)
         try:
             # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
+            # color_msg.header.frame_id(RealSense가 붙이는 camera_color_optical_frame)가
+            # 아니라 CAMERA_OPTICAL_CALIB_FRAME을 조회한다 - 캘리브레이션 회전 중복 적용 방지.
             tf_at_stamp = self.tf_buffer.lookup_transform(
-                'base_link', color_msg.header.frame_id, color_msg.header.stamp,
+                'base_link', CAMERA_OPTICAL_CALIB_FRAME, color_msg.header.stamp,
                 timeout=Duration(seconds=0.1))
         except TransformException as ex:
             self.get_logger().warn(f'TF lookup failed: {ex}')
@@ -188,21 +197,33 @@ class VisionNode(Node):
         depth_m_img = depth_image.astype(np.float64) / 1000.0  # RealSense depth는 보통 mm(16UC1)
         tf_matrix = self._tf_matrix(tf_at_stamp)
 
-        def reconstruct(cx, cy):
+        def reconstruct(cx, cy, bbox_w, bbox_h):
             """bbox 중심 픽셀(cx, cy) -> base_link 3D 좌표. ToolTracker.update()가
             후보 bbox마다 이 함수를 호출한다 (tracking.py는 ROS/depth 이미지를 몰라도 되게
             이 클로저 하나로 depth 조회 + intrinsics + tf 변환을 전부 감춘다)."""
             px, py = int(cx), int(cy)
             if not (0 <= py < depth_m_img.shape[0] and 0 <= px < depth_m_img.shape[1]):
                 return None
-            # 단일 픽셀은 금속/반사면 뎁스 구멍에 취약해서 9x9 패치 median으로 보완
+            # 단일 픽셀은 금속/반사면 뎁스 구멍에 취약해서 patch median으로 보완하되,
+            # bbox가 patch(9x9)보다 작으면(멀리 있거나 작은 물체) 패치가 bbox 밖 배경까지
+            # 덮어 median이 배경 depth로 쏠릴 수 있어 bbox 안쪽으로 반경을 제한한다.
+            half = max(1, min(PATCH_HALF, int(min(bbox_w, bbox_h) // 2)))
             z_m, valid_ratio = patch_median_depth(
-                depth_m_img, px, py, half=PATCH_HALF, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
+                depth_m_img, px, py, half=half, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
             depth_valid = z_m is not None and valid_ratio >= self.valid_min_ratio
             # depth 무효 구간은 마지막 유효 z로 픽셀->광선을 역산해 x,y만 RGB 추적으로 갱신 (2.7절)
             z = z_m if z_m is not None else (self.tracker.last_valid_z or 0.0)
             cam_xyz = pixel_to_camera_xyz(px, py, z, fx, fy, ppx, ppy)
             base_xyz = camera_to_base(cam_xyz, tf_matrix)
+            # DEBUG(파이프라인 점검용, 나중에 제거): z 오차 원인 추적용 중간값 전부 출력
+            t = tf_at_stamp.transform.translation
+            self.get_logger().info(
+                f'DEBUG reconstruct: px={px}, py={py}, bbox_w={bbox_w}, bbox_h={bbox_h}, '
+                f'half={half}, valid_ratio={valid_ratio}, '
+                f'raw_depth_mm={depth_image[py, px]}, z_m={z_m}, '
+                f'cam_xyz={cam_xyz}, tf_translation=({t.x}, {t.y}, {t.z}), '
+                f'base_xyz={base_xyz}',
+                throttle_duration_sec=1.0)
             return (base_xyz[0], base_xyz[1], base_xyz[2], depth_valid)
 
         stamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9

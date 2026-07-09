@@ -72,7 +72,7 @@
 
     # 아래는 통신/타이밍 관련 값으로, 하드웨어 캘리브레이션 값이 아니다 - 실 환경에
     # 맞게 조정 가능하다.
-    detect_track_timeout_s: 5.0
+    detect_track_timeout_s: 55.0
     verify_grasp_max_retries: 2
     wait_pull_timeout_s: 60.0
     wait_pull_reminder_interval_s: 10.0

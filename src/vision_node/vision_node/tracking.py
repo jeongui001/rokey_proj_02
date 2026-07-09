@@ -73,9 +73,11 @@ class ToolTracker:
     def update(self, detections, tool_class, reconstruct_fn, stamp):
         """한 프레임의 검출 목록(detections)을 받아 추적 상태를 한 스텝 갱신한다.
 
-        reconstruct_fn(cx, cy) -> (x, y, z, depth_valid) 또는 None: bbox 중심 픽셀을
-        3D로 복원하는 함수. vision_node.py가 depth 이미지·intrinsics·tf를 클로저로
-        캡처해서 넘겨준다(이 파일은 ROS 타입을 몰라도 되게 하기 위한 분리).
+        reconstruct_fn(cx, cy, bbox_w, bbox_h) -> (x, y, z, depth_valid) 또는 None:
+        bbox 중심 픽셀을 3D로 복원하는 함수. bbox_w/bbox_h는 depth 패치 크기가
+        bbox 밖(배경)으로 새지 않게 제한하는 데 쓴다. vision_node.py가 depth
+        이미지·intrinsics·tf를 클로저로 캡처해서 넘겨준다(이 파일은 ROS 타입을
+        몰라도 되게 하기 위한 분리).
 
         반환: (position, velocity, depth_valid, chosen_det) 또는 이번 프레임에
         tool_class와 일치하는 검출이 하나도 없으면 None. chosen_det은 선택된 원본
@@ -92,7 +94,7 @@ class ToolTracker:
         for d in candidates:
             cx = (d.x1 + d.x2) / 2.0
             cy = (d.y1 + d.y2) / 2.0
-            r = reconstruct_fn(cx, cy)
+            r = reconstruct_fn(cx, cy, d.x2 - d.x1, d.y2 - d.y1)
             if r is not None:
                 reconstructed.append((r, d.score, d))
         if not reconstructed:
