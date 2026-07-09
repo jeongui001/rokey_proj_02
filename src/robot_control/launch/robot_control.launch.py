@@ -15,7 +15,7 @@ def generate_launch_description():
         'robot_control_calibration_params.yaml')
 
     hardware_enabled_arg = DeclareLaunchArgument(
-        'hardware_enabled', default_value='false',
+        'hardware_enabled', default_value='true',
         description='true로 설정해야만 실제 M0609/RG2에 명령을 전송한다 (기본값: dry_run).')
     params_file_arg = DeclareLaunchArgument(
         'params_file', default_value=default_params,
