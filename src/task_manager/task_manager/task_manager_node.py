@@ -194,47 +194,6 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
             else:
                 self.get_logger().info(text)
 
-    def _debug_event(
-            self, level, category, reason, message, data=None,
-            *, throttle_s=None, log=False):
-        """DEBUG_LOG: GUI의 '오류 확인' 패널이 모을 수 있는 최근 판단/오류 이벤트.
-
-        Task 4가 action_coordinator.py/safety_recovery.py를 _checkpoint_event로
-        옮기기 전까지, 그 두 파일이 여전히 이 메서드를 호출한다 - 여기서 지우면 안 된다.
-        """
-        now = time.monotonic()
-        key = (level, category, reason)
-        if throttle_s is not None:
-            last = getattr(self, '_debug_event_last', {}).get(key, 0.0)
-            if now - last < throttle_s:
-                return
-            if not hasattr(self, '_debug_event_last'):
-                self._debug_event_last = {}
-            self._debug_event_last[key] = now
-        payload = {
-            'node': self.get_name(),
-            'level': level,
-            'category': category,
-            'reason': reason,
-            'message': message,
-            'data': data or {},
-            'stamp_monotonic': now,
-        }
-        if bool(self.get_parameter('debug.publish_events').value):
-            msg = String()
-            msg.data = json.dumps(payload, ensure_ascii=False)
-            self.pub_debug_events.publish(msg)
-        if log or bool(self.get_parameter('debug.log_task_decisions').value):
-            text = (
-                f'[TASK][{category}] level={level} reason={reason} '
-                f'message={message} data={payload["data"]}')
-            if level in ('ERROR', 'FAULT'):
-                self.get_logger().error(text)
-            elif level == 'WARN':
-                self.get_logger().warn(text)
-            else:
-                self.get_logger().info(text)
-
     def _publish_status(self, detail=''):
         self._last_status_detail = detail
         msg = String()
