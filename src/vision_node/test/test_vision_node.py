@@ -242,6 +242,12 @@ def test_track_tool_grip_yaw_from_keypoints_without_depth_axis(node):
     # keypoint 축 0도(이미지 x축) -> 그립 90도 -> (identity TF) 쿼터니언
     assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
     assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
+    assert track.kpt0_x == pytest.approx(100.0)
+    assert track.kpt0_y == pytest.approx(110.0)
+    assert track.kpt0_conf == pytest.approx(0.9)
+    assert track.kpt1_x == pytest.approx(240.0)
+    assert track.kpt1_y == pytest.approx(110.0)
+    assert track.kpt1_conf == pytest.approx(0.9)
 
 
 def test_track_tool_position_uses_keypoint_midpoint(node):
@@ -268,6 +274,40 @@ def test_track_tool_position_uses_keypoint_midpoint(node):
     assert track is not None
     # 중점 (360,240), ppx=320: x = (360-320)*0.5/600 (bbox 중심이면 0.0이 나와버림)
     assert track.pose.position.x == pytest.approx((360 - 320) * 0.5 / 600, abs=1e-3)
+
+
+def test_track_tool_single_kpt_holds_previous_axis(node):
+    """근접으로 한쪽 kpt만 남으면(반대쪽 conf~0) 잘린 ROI의 depth-PCA 대신 직전
+    keypoint 축을 유지해야 한다 - 라이브런에서 관측된 yaw 드리프트의 수정."""
+    import numpy as np
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+
+    fake_depth = np.full((480, 424), 500, dtype=np.uint16)  # 평평한 뎁스 - PCA 불가
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
+
+    def make_det(kpt1_conf):
+        d = Detection2D()
+        d.class_name = 'spanner'
+        d.score = 0.9
+        d.x1, d.y1, d.x2, d.y2 = 90, 90, 250, 130
+        d.kpt0_x, d.kpt0_y, d.kpt0_conf = 100.0, 110.0, 0.9
+        d.kpt1_x, d.kpt1_y, d.kpt1_conf = 240.0, 110.0, kpt1_conf
+        return d
+
+    # 1프레임: 두 kpt 유효 - 축 0도가 스무더에 기록됨
+    node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(),
+        _make_detection_msg([make_det(0.9)]), FakeTransform(), 'spanner')
+    # 2프레임: p1 잘림(conf~0) + 평평한 뎁스라 PCA도 불가 - 직전 축(0도) 유지 기대
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(),
+        _make_detection_msg([make_det(0.002)]), FakeTransform(), 'spanner')
+
+    assert track is not None
+    # 유지된 축 0도 -> 그립 90도 쿼터니언 (identity가 아니어야 한다 - 수정 전엔
+    # PCA 실패로 orientation identity 폴백이었음)
+    assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
+    assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
 
 
 def test_track_tool_kpt_axis_too_short_falls_back_to_depth_axis(node):

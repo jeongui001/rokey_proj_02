@@ -462,6 +462,12 @@ class VisionNode(Node):
         track.header.frame_id = 'base_link'
         track.tool_class = tool_class
         track.confidence = float(chosen_det.score)
+        track.kpt0_x = float(chosen_det.kpt0_x)
+        track.kpt0_y = float(chosen_det.kpt0_y)
+        track.kpt0_conf = float(chosen_det.kpt0_conf)
+        track.kpt1_x = float(chosen_det.kpt1_x)
+        track.kpt1_y = float(chosen_det.kpt1_y)
+        track.kpt1_conf = float(chosen_det.kpt1_conf)
         track.pose.position.x = position[0]
         track.pose.position.y = position[1]
         track.pose.position.z = position[2]
@@ -500,6 +506,18 @@ class VisionNode(Node):
             grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
             debug_info = {'kpts': kpt_debug, 'axis_deg': axis_deg, 'grip_deg': grip_deg}
             return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
+        # 한쪽 kpt만 유효(근접 시 반대쪽 끝이 화면 밖으로 잘림 - 라이브런 실측)이고
+        # 직전까지 keypoint로 축을 추정한 이력이 있으면, 잘린 bbox ROI의 depth-PCA
+        # (노이즈로 yaw 드리프트 유발)보다 직전 스무딩 각도를 유지하는 게 정확하다
+        # (도구는 접근 중 정지 상태라 축이 변하지 않음).
+        c0 = getattr(det, 'kpt0_conf', 0.0)
+        c1 = getattr(det, 'kpt1_conf', 0.0)
+        if (c0 >= KPT_CONF_MIN) != (c1 >= KPT_CONF_MIN):
+            held_deg = self.axis_smoother.current(tool_class)
+            if held_deg is not None:
+                grip_deg = (held_deg + 90.0) % 180.0
+                debug_info = {'axis_deg': held_deg, 'grip_deg': grip_deg, 'held': True}
+                return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
         h, w = depth_m_img.shape
         x1, y1 = max(det.x1, 0), max(det.y1, 0)
         x2, y2 = min(det.x2, w), min(det.y2, h)
@@ -596,6 +614,10 @@ class VisionNode(Node):
             cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
                         (min(p0[0], p1[0]), min(frame.shape[0] - 16, max(p0[1], p1[1]) + 24)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        elif axis_debug is not None and axis_debug.get('held'):
+            # 단일 kpt hold 경로: 그릴 기하가 없어 유지 중인 각도만 텍스트로 표시
+            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f} (hold)",
+                        (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
         elif axis_debug is not None:
             ox, oy = axis_debug['origin']
             rect = axis_debug['rect']

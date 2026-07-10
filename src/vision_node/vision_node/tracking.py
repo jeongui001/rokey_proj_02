@@ -5,17 +5,37 @@ import math
 KPT_CONF_MIN = 0.5
 
 
-def detection_center(det):
-    """검출의 추적/3D 복원 기준 픽셀. keypoint 2개(공구 장축 양 끝점)가 유효하면
-    그 중점(=파지점, 중심 파지 계약)을, 아니면 bbox 중심을 쓴다.
+def detection_anchor(det):
+    """검출의 추적 기준 픽셀과 그 출처(mode)를 돌려준다.
 
-    근접 시 bbox는 잘리거나 부풀어 중심이 요동치지만 keypoint 중점은 물체 구조에
-    붙어 있어 안정적 - pose 전환의 핵심 이득. kpt 필드가 아예 없는 객체(구 모델,
-    테스트 스텁)도 getattr 기본값 0.0으로 자연히 bbox 폴백된다."""
-    if (getattr(det, 'kpt0_conf', 0.0) >= KPT_CONF_MIN
-            and getattr(det, 'kpt1_conf', 0.0) >= KPT_CONF_MIN):
-        return (det.kpt0_x + det.kpt1_x) / 2.0, (det.kpt0_y + det.kpt1_y) / 2.0
-    return (det.x1 + det.x2) / 2.0, (det.y1 + det.y2) / 2.0
+    mode:
+      'mid'      두 kpt 모두 유효 - keypoint 중점(=파지점, 중심 파지 계약)
+      'p0'/'p1'  한쪽 kpt만 유효(근접 시 반대쪽 끝이 화면 밖으로 잘리면 모델이
+                 그 kpt conf를 0 근처로 떨어뜨린다 - 라벨 스펙 v0 학습 결과) -
+                 호출측(ToolTracker)이 학습해 둔 3D 오프셋으로 파지점을 추정한다
+      'bbox'     kpt 없음(구 box 모델)/양쪽 저신뢰 - bbox 중심
+
+    저신뢰 kpt의 xy는 실좌표가 오염돼 있어(라이브런에서 kpt0에 2px까지 붙는 퇴화
+    관측) 절대 그대로 쓰면 안 된다 - conf 문턱을 낮추는 게 아니라 버리는 게 맞다."""
+    c0 = getattr(det, 'kpt0_conf', 0.0)
+    c1 = getattr(det, 'kpt1_conf', 0.0)
+    if c0 >= KPT_CONF_MIN and c1 >= KPT_CONF_MIN:
+        return (det.kpt0_x + det.kpt1_x) / 2.0, (det.kpt0_y + det.kpt1_y) / 2.0, 'mid'
+    if c0 >= KPT_CONF_MIN:
+        return det.kpt0_x, det.kpt0_y, 'p0'
+    if c1 >= KPT_CONF_MIN:
+        return det.kpt1_x, det.kpt1_y, 'p1'
+    return (det.x1 + det.x2) / 2.0, (det.y1 + det.y2) / 2.0, 'bbox'
+
+
+def detection_center(det):
+    """(표시/로깅용 하위호환) 기준 픽셀 좌표만. 단일 kpt 모드는 오프셋 추정 없이는
+    파지점이 아니므로 여기서는 bbox 중심으로 취급한다 - 추적 본체는 detection_anchor
+    + ToolTracker의 오프셋 보정을 쓴다."""
+    cx, cy, mode = detection_anchor(det)
+    if mode in ('p0', 'p1'):
+        return (det.x1 + det.x2) / 2.0, (det.y1 + det.y2) / 2.0
+    return cx, cy
 
 
 def pixel_to_camera_xyz(px, py, depth, fx, fy, ppx, ppy):
@@ -72,6 +92,10 @@ class ToolTracker:
     실제 서보 제어에 쓰이는 정밀 칼만 필터는 robot_control/kalman.py에 별도로 있다.
     """
 
+    # kpt->파지점 오프셋 EMA 계수 (새 관측 가중치). 도구가 정지 상태라 오프셋이
+    # 거의 불변이므로 낮게 잡아 노이즈를 누른다.
+    OFFSET_EMA_ALPHA = 0.3
+
     def __init__(self, alpha=0.6, beta=0.3):
         self.alpha = alpha   # 위치 스무딩 계수
         self.beta = beta     # 속도 스무딩 계수
@@ -79,6 +103,10 @@ class ToolTracker:
         self.velocity = (0.0, 0.0)
         self.last_valid_z = None   # depth_valid=False일 때 유지할 마지막 z
         self.last_time = None
+        # "p0 -> 파지점" 3D 오프셋(base). 두 kpt가 다 보이는 프레임에서 학습해 두고,
+        # 접근 중 한쪽 끝이 화면 밖으로 잘리면(단일 kpt 모드) 남은 kpt + 이 오프셋으로
+        # 파지점을 유지한다 - 잘린 bbox 중심 폴백의 위쪽 편향(라이브런 실측)을 막는다.
+        self.kpt_offset = None
 
     def reset(self):
         """set_mode로 TRACK_TOOL에 새로 진입할 때 호출 - 이전 추적 상태를 지운다."""
@@ -86,6 +114,7 @@ class ToolTracker:
         self.velocity = (0.0, 0.0)
         self.last_valid_z = None
         self.last_time = None
+        self.kpt_offset = None
 
     def update(self, detections, tool_class, reconstruct_fn, stamp):
         """한 프레임의 검출 목록(detections)을 받아 추적 상태를 한 스텝 갱신한다.
@@ -106,27 +135,58 @@ class ToolTracker:
         if not candidates:
             return None
 
-        # 2. 각 후보의 기준점(keypoint 중점=파지점, 없으면 bbox 중심)을 3D로 복원
+        # 2. 각 후보의 기준점(keypoint 중점=파지점)을 3D로 복원. 한쪽 kpt만 유효한
+        #    후보는 학습된 오프셋으로 파지점을 추정하고, 오프셋 이력이 없으면(이 도구를
+        #    두 kpt로 본 적이 없음) 기존 bbox 중심 폴백을 유지한다.
         reconstructed = []
         for d in candidates:
-            cx, cy = detection_center(d)
+            cx, cy, mode = detection_anchor(d)
+            if mode in ('p0', 'p1') and self.kpt_offset is None:
+                cx, cy = (d.x1 + d.x2) / 2.0, (d.y1 + d.y2) / 2.0
+                mode = 'bbox'
             r = reconstruct_fn(cx, cy, d.x2 - d.x1, d.y2 - d.y1)
-            if r is not None:
-                reconstructed.append((r, d.score, d))
+            if r is None:
+                continue
+            x, y, z, dv = r
+            if mode == 'p0':
+                x += self.kpt_offset[0]
+                y += self.kpt_offset[1]
+                z += self.kpt_offset[2]
+            elif mode == 'p1':
+                # 파지점은 정확히 두 끝점의 중점이라 p1 기준 오프셋은 부호 반전과 같다
+                x -= self.kpt_offset[0]
+                y -= self.kpt_offset[1]
+                z -= self.kpt_offset[2]
+            reconstructed.append(((x, y, z, dv), d.score, d, mode))
         if not reconstructed:
             return None
 
         # 3. 후보 선택: 이전 추정이 없으면(첫 프레임) 최고 score, 있으면 최근접 매칭
         if self.position is None:
-            chosen, _, chosen_det = max(reconstructed, key=lambda item: item[1])
+            chosen, _, chosen_det, chosen_mode = max(reconstructed, key=lambda item: item[1])
         else:
             def dist(item):
                 r = item[0]
                 return math.dist((r[0], r[1], r[2]), self.position)
-            chosen, _, chosen_det = min(reconstructed, key=dist)
+            chosen, _, chosen_det, chosen_mode = min(reconstructed, key=dist)
+        x, y, z, depth_valid = chosen
+
+        # 3.5. 두 kpt가 다 보이는 동안 "p0 -> 파지점" 오프셋(base)을 학습해 둔다 -
+        # 접근 중 한쪽 끝이 잘리는 순간을 대비한 상태 준비 (위 2번에서 소비).
+        if chosen_mode == 'mid' and depth_valid:
+            r0 = reconstruct_fn(chosen_det.kpt0_x, chosen_det.kpt0_y,
+                                 chosen_det.x2 - chosen_det.x1,
+                                 chosen_det.y2 - chosen_det.y1)
+            if r0 is not None and r0[3]:
+                off = (x - r0[0], y - r0[1], z - r0[2])
+                if self.kpt_offset is None:
+                    self.kpt_offset = off
+                else:
+                    a = self.OFFSET_EMA_ALPHA
+                    self.kpt_offset = tuple(
+                        a * n + (1.0 - a) * o for n, o in zip(off, self.kpt_offset))
 
         # 4. depth 무효 구간: z는 마지막 유효값으로 고정(전체 계획.md 2.7절)
-        x, y, z, depth_valid = chosen
         if depth_valid:
             self.last_valid_z = z
         elif self.last_valid_z is not None:

@@ -99,6 +99,15 @@ class AxisSmoother:
         self._state[key] = vec
         return (np.degrees(np.arctan2(vec[1], vec[0])) / 2.0) % 180
 
+    def current(self, key):
+        """마지막 스무딩 상태의 각도(deg) 또는 이력이 없으면 None. 상태는 갱신하지
+        않는다 - 관측이 불가능한 프레임(근접 시 keypoint 한쪽이 화면 밖으로 잘려
+        벡터각을 못 구할 때)에 직전 축을 유지(hold)하는 용도."""
+        vec = self._state.get(key)
+        if vec is None:
+            return None
+        return float((np.degrees(np.arctan2(vec[1], vec[0])) / 2.0) % 180)
+
     def reset(self, key):
         """물체가 화면 밖으로 잘리는 등 이력이 오염될 상황에서 호출 - 다음 관측부터 새로 시작."""
         self._state.pop(key, None)

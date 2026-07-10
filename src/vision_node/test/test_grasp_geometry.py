@@ -97,6 +97,16 @@ def test_axis_smoother_wraparound():
     assert out > 170 or out < 10
 
 
+def test_axis_smoother_current_returns_state_without_update():
+    """current()는 마지막 스무딩 각도를 상태 변경 없이 돌려준다 - 관측 불가 프레임에서
+    직전 축을 유지(hold)하는 용도. 이력이 없으면 None."""
+    s = AxisSmoother(alpha=0.5)
+    assert s.current('k') is None
+    s.update('k', 40.0)
+    assert s.current('k') == pytest.approx(40.0)
+    assert s.current('k') == pytest.approx(40.0)  # 반복 조회에도 상태 불변
+
+
 def test_axis_smoother_reset():
     s = AxisSmoother(alpha=0.25)
     s.update('k', 10.0)
