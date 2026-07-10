@@ -14,3 +14,21 @@ docs/superpowers/
 
 # OpenAI API 키 등 비밀값 - 커밋 금지
 .env
+
+# 대용량 데이터/모델/실험 산출물 - ~/object_detection_data/ 로 이동됨.
+# 슬래시 없이 작성: 일부는 저장소 루트에 심볼릭 링크로 남아있는데, git의
+# 트레일링 슬래시(/datasets/) 패턴은 심볼릭 링크를 매칭하지 않으므로 주의.
+/datasets
+/datasets_session
+/datasets_pose_pilot*
+/roboflow_staging
+/roboflow_export_130
+/label_review_all
+/local_pose_labels
+/model_prelabels
+/runs
+/Fruits
+/bbox_check
+/dataset_manifest.csv
+/robust_run_v2.log
+/*.pt

@@ -1,5 +1,6 @@
 import time
 
+import numpy as np
 import pytest
 from robot_control.servo_loop import ServoCommand, ServoLoop, ServoState
 
@@ -64,6 +65,30 @@ def test_on_tool_track_then_step_moves_toward_target():
     loop.on_tool_track(FakeToolTrack(0.02, 0.78, 0.0, 0.05))
     cmd = loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
     assert cmd.vx > 0.0
+
+
+def test_step_lead_time_includes_elapsed_since_last_track():
+    loop = _make_loop()
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.02, 0.0, 0.05))
+    t0 = loop._last_msg_time
+    tcp = (0.0, 0.0, 0.05, 0, 0, 0)
+
+    loop.step(tcp, t0)
+    fresh_error = loop._last_e_xy_norm
+
+    loop.step(tcp, t0 + 0.2)
+    stale_error = loop._last_e_xy_norm
+
+    fresh_p = loop._filter.predict_position(loop.dt_latency)
+    stale_p = loop._filter.predict_position(loop.dt_latency + 0.2)
+    expected_fresh = float(np.hypot(fresh_p[0] - tcp[0], fresh_p[1] - tcp[1]))
+    expected_stale = float(np.hypot(stale_p[0] - tcp[0], stale_p[1] - tcp[1]))
+
+    assert fresh_error == pytest.approx(expected_fresh, abs=1e-9)
+    assert stale_error == pytest.approx(expected_stale, abs=1e-9)
+    assert stale_error > fresh_error
 
 
 def test_step_respects_v_max():

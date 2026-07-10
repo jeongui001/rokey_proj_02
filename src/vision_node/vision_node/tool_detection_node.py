@@ -11,6 +11,7 @@ DetectionArray로 /detection/tool_boxes에 발행한다. 뎁스 융합·추적·
 (hand_tracking/향후 대시보드와 카메라를 공유해야 함).
 """
 import os
+import time
 
 import cv2
 import rclpy
@@ -71,20 +72,40 @@ class ToolDetectionNode(Node):
 
     def _on_color(self, msg):
         frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        t0 = time.perf_counter()
         result = self.model.predict(source=frame, conf=self.conf, verbose=False)[0]
+        infer_ms = (time.perf_counter() - t0) * 1000.0
 
         det_msg = DetectionArray()
         # color 프레임과 동일 stamp (전체 계획.md 4.2절 계약) - vision_node의
         # ApproximateTimeSynchronizer가 이 시각으로 depth/camera_info와 맞춘다.
         det_msg.header = msg.header
         detections = []
-        for box in result.boxes:
+        # pose 모델(yolo*-pose)이면 keypoints가 박스와 같은 순서로 온다. box 모델이면 None -
+        # 그땐 kpt 필드가 기본값 0으로 남아 vision_node가 bbox 중심/depth-PCA로 폴백한다.
+        keypoints = result.keypoints
+        for i, box in enumerate(result.boxes):
             d = Detection2D()
             d.class_name = result.names[int(box.cls[0])]
             d.score = float(box.conf[0])
             d.x1, d.y1, d.x2, d.y2 = map(int, box.xyxy[0])
+            if keypoints is not None and i < len(keypoints.xy):
+                xy = keypoints.xy[i]  # (2, 2): [p0, p1] 픽셀 좌표
+                # kpt별 conf가 없는 모델(내보내기 경로에 따라 conf=None)은 box score로 대신한다
+                conf = keypoints.conf[i] if keypoints.conf is not None else None
+                if len(xy) >= 2:
+                    d.kpt0_x, d.kpt0_y = float(xy[0][0]), float(xy[0][1])
+                    d.kpt1_x, d.kpt1_y = float(xy[1][0]), float(xy[1][1])
+                    d.kpt0_conf = float(conf[0]) if conf is not None else d.score
+                    d.kpt1_conf = float(conf[1]) if conf is not None else d.score
             det_msg.detections.append(d)
             detections.append(d)
+        # 프로파일링: 추론 시간 + 이 노드 구간(capture->publish 직전) 지연을 실어 보낸다 -
+        # vision_node가 sync 대기/e2e와 합쳐 VisionTiming(/perception/timing)으로 통합 발행.
+        det_msg.infer_ms = float(infer_ms)
+        stamp_s = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        det_msg.detect_latency_ms = float((now_s - stamp_s) * 1000.0)
         self.pub_detections.publish(det_msg)
 
         if self.show_window:

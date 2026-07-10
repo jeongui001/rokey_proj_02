@@ -172,8 +172,12 @@ class ServoLoop:
             self._last_command = ServoCommand()
             return self._last_command
 
-        # p_ref = 필터 추정 위치를 Δt_lat만큼 앞으로 외삽한 "지금 목표로 삼아야 할 위치"
-        p_ref = self._filter.predict_position(self.dt_latency)
+        # p_ref = 필터 추정 위치를 (Δt_lat + 마지막 ToolTrack 이후 실제 경과시간)만큼
+        # 앞으로 외삽한 "지금 목표로 삼아야 할 위치". 비전 갱신이 뜸해질수록 더 멀리
+        # 내다봐야 목표점이 얼어붙지 않는다.
+        elapsed_since_track = max(now - self._last_msg_time, 0.0)
+        lead_time = self.dt_latency + elapsed_since_track
+        p_ref = self._filter.predict_position(lead_time)
         v_tool = self._filter.velocity  # 피드포워드 항(v̂_tool)
 
         tcp_x, tcp_y, tcp_z = tcp_pose[0], tcp_pose[1], tcp_pose[2]

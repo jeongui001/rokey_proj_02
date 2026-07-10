@@ -44,6 +44,19 @@ def _make_detection_msg(detections=None):
     return msg
 
 
+def _fake_bridge_fn(fake_depth):
+    """인코딩 인지 imgmsg_to_cv2 대체: 'bgr8' 요청(디버그 이미지)엔 8비트 컬러,
+    그 외(depth)엔 fake_depth. depth 배열을 컬러 요청에 그대로 돌려주면
+    OpenCV 5.x putText가 CV_8U 검사로 거부한다(4.x는 조용히 통과했음)."""
+    import numpy as np
+
+    def fake_imgmsg_to_cv2(msg, desired_encoding=None):
+        if desired_encoding == 'bgr8':
+            return np.zeros((*fake_depth.shape, 3), dtype=np.uint8)
+        return fake_depth
+    return fake_imgmsg_to_cv2
+
+
 def test_set_mode_updates_state(node):
     request = SetVisionMode.Request()
     request.mode = SetVisionMode.Request.TRACK_TOOL
@@ -163,7 +176,7 @@ def test_track_tool_filters_by_class_and_reconstructs_position(node):
 
     import numpy as np
     fake_depth = np.full((480, 424), 500, dtype=np.uint16)  # 0.5m
-    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: fake_depth
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
 
     track = node._track_tool(
         color_msg, depth_msg, info_msg, detection_msg, FakeTransform(), 'spanner')
@@ -186,7 +199,7 @@ def test_track_tool_fills_grip_yaw_orientation_from_depth_axis(node):
 
     fake_depth = np.full((480, 424), 310, dtype=np.uint16)  # 벨트 0.31m
     fake_depth[100:120, 100:240] = 300                      # 막대 0.30m, 140x20 (장축=x)
-    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: fake_depth
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
 
     detection = Detection2D()
     detection.class_name = 'spanner'
@@ -204,18 +217,21 @@ def test_track_tool_fills_grip_yaw_orientation_from_depth_axis(node):
     assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
 
 
-def test_track_tool_orientation_identity_when_axis_unavailable(node):
-    """뎁스가 전부 무효(0)라 축을 못 구하면 orientation은 identity로 남아야 한다."""
+def test_track_tool_grip_yaw_from_keypoints_without_depth_axis(node):
+    """pose 모델 검출(keypoint 장축 0도)이면 depth 마스크 없이도(평평한 뎁스)
+    keypoint 벡터로 grip 90도가 나와야 한다 - depth-PCA 경로를 타지 않는다."""
     import numpy as np
     node.tf_buffer.lookup_transform = lambda *a, **k: None
 
-    fake_depth = np.zeros((480, 424), dtype=np.uint16)  # 전부 뎁스 구멍
-    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: fake_depth
+    fake_depth = np.full((480, 424), 500, dtype=np.uint16)  # 평평한 0.5m - PCA 축 불가 상황
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
 
     detection = Detection2D()
     detection.class_name = 'spanner'
     detection.score = 0.9
-    detection.x1, detection.y1, detection.x2, detection.y2 = 100, 100, 200, 200
+    detection.x1, detection.y1, detection.x2, detection.y2 = 90, 90, 250, 130
+    detection.kpt0_x, detection.kpt0_y, detection.kpt0_conf = 100.0, 110.0, 0.9
+    detection.kpt1_x, detection.kpt1_y, detection.kpt1_conf = 240.0, 110.0, 0.9
     detection_msg = _make_detection_msg([detection])
 
     track = node._track_tool(
@@ -223,7 +239,130 @@ def test_track_tool_orientation_identity_when_axis_unavailable(node):
         FakeTransform(), 'spanner')
 
     assert track is not None
-    assert track.depth_valid is False
+    # keypoint 축 0도(이미지 x축) -> 그립 90도 -> (identity TF) 쿼터니언
+    assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
+    assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
+
+
+def test_track_tool_position_uses_keypoint_midpoint(node):
+    """3D 복원 기준점이 bbox 중심이 아니라 keypoint 중점(파지점)이어야 한다 -
+    근접 시 bbox가 붕괴해도 파지점 좌표가 흔들리지 않게 하는 pose 전환의 핵심."""
+    import numpy as np
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+
+    fake_depth = np.full((480, 424), 500, dtype=np.uint16)  # 0.5m
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
+
+    detection = Detection2D()
+    detection.class_name = 'spanner'
+    detection.score = 0.9
+    detection.x1, detection.y1, detection.x2, detection.y2 = 300, 220, 340, 260  # bbox 중심 (320,240)
+    detection.kpt0_x, detection.kpt0_y, detection.kpt0_conf = 350.0, 240.0, 0.9
+    detection.kpt1_x, detection.kpt1_y, detection.kpt1_conf = 370.0, 240.0, 0.9  # 중점 (360,240)
+    detection_msg = _make_detection_msg([detection])
+
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg,
+        FakeTransform(), 'spanner')
+
+    assert track is not None
+    # 중점 (360,240), ppx=320: x = (360-320)*0.5/600 (bbox 중심이면 0.0이 나와버림)
+    assert track.pose.position.x == pytest.approx((360 - 320) * 0.5 / 600, abs=1e-3)
+
+
+def test_track_tool_kpt_axis_too_short_falls_back_to_depth_axis(node):
+    """keypoint가 뭉쳐 있으면(축 길이 < bbox 장변 30%) 각도를 신뢰하지 않고
+    기존 depth-PCA 경로로 폴백해야 한다."""
+    import numpy as np
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+
+    fake_depth = np.full((480, 424), 310, dtype=np.uint16)  # 벨트 0.31m
+    fake_depth[100:120, 100:240] = 300                      # 막대 0.30m (장축=x)
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
+
+    detection = Detection2D()
+    detection.class_name = 'spanner'
+    detection.score = 0.9
+    detection.x1, detection.y1, detection.x2, detection.y2 = 90, 90, 250, 130
+    # 두 점이 3px 간격 - 장변 160px의 30%(48px) 미만이라 무시돼야 함
+    detection.kpt0_x, detection.kpt0_y, detection.kpt0_conf = 168.0, 110.0, 0.9
+    detection.kpt1_x, detection.kpt1_y, detection.kpt1_conf = 171.0, 110.0, 0.9
+    detection_msg = _make_detection_msg([detection])
+
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg,
+        FakeTransform(), 'spanner')
+
+    assert track is not None
+    # depth-PCA 폴백으로도 장축 0도 -> 그립 90도가 나와야 한다
+    assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
+    assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
+
+
+def test_synced_images_publishes_timing_in_track_tool_mode(node):
+    """TRACK_TOOL 콜백마다 /perception/timing으로 VisionTiming이 나가야 한다 -
+    구간 타이밍(infer/sync_wait/e2e)과 published 플래그(miss rate용) 포함."""
+    node.mode = SetVisionMode.Request.TRACK_TOOL
+    node.tool_class = 'spanner'
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._track_tool = lambda *a, **k: None  # 검출 miss 프레임
+
+    timing = []
+    node.pub_timing.publish = timing.append
+
+    detection_msg = _make_detection_msg()
+    detection_msg.infer_ms = 12.5
+    detection_msg.detect_latency_ms = 20.0
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg)
+
+    assert len(timing) == 1
+    t = timing[0]
+    assert t.infer_ms == pytest.approx(12.5)
+    assert t.published == 0          # track None -> miss 프레임
+    assert t.callback_ms >= 0.0
+    assert t.e2e_ms != 0.0           # capture stamp(0) 대비 현재 시각 - 0일 수 없다
+
+
+def test_synced_images_no_timing_when_disabled(node):
+    """vision.publish_timing=False면 타이밍 발행을 완전히 건너뛴다."""
+    node.mode = SetVisionMode.Request.TRACK_TOOL
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._track_tool = lambda *a, **k: None
+    node.set_parameters([Parameter('vision.publish_timing', value=False)])
+
+    timing = []
+    node.pub_timing.publish = timing.append
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert timing == []
+
+
+def test_track_tool_orientation_identity_when_axis_unavailable(node):
+    """축을 못 구하는 프레임은 orientation이 identity로 남아야 한다.
+
+    주의: '전체 depth 무효 + 첫 프레임'으로 만들면 안 된다 - 그 경우 z=0 폴백 가드
+    (2026-07-08 실기 사고 수정)가 track 자체를 안 만드는 게 옳은 동작이다. 여기선
+    depth는 유효하되 bbox가 너무 작아(마스크 < YAW_MIN_MASK_PX) 축만 불가한 상황."""
+    import numpy as np
+    node.tf_buffer.lookup_transform = lambda *a, **k: None
+
+    fake_depth = np.full((480, 424), 500, dtype=np.uint16)  # 유효 depth 0.5m
+    node._bridge.imgmsg_to_cv2 = _fake_bridge_fn(fake_depth)
+
+    detection = Detection2D()
+    detection.class_name = 'spanner'
+    detection.score = 0.9
+    detection.x1, detection.y1, detection.x2, detection.y2 = 300, 230, 306, 236  # 6x6=36px < 50
+    detection_msg = _make_detection_msg([detection])
+
+    track = node._track_tool(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg,
+        FakeTransform(), 'spanner')
+
+    assert track is not None
     assert track.pose.orientation.w == pytest.approx(1.0)
     assert track.pose.orientation.z == pytest.approx(0.0)
 

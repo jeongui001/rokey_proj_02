@@ -1,5 +1,22 @@
 import math
 
+# keypoint를 신뢰할 최소 confidence - 이 미만이면 없는 것으로 보고 bbox 중심 폴백.
+# YOLO pose의 kpt conf는 "그 점이 실제로 보이는가"에 가까워 0.5면 보수적으로 안전.
+KPT_CONF_MIN = 0.5
+
+
+def detection_center(det):
+    """검출의 추적/3D 복원 기준 픽셀. keypoint 2개(공구 장축 양 끝점)가 유효하면
+    그 중점(=파지점, 중심 파지 계약)을, 아니면 bbox 중심을 쓴다.
+
+    근접 시 bbox는 잘리거나 부풀어 중심이 요동치지만 keypoint 중점은 물체 구조에
+    붙어 있어 안정적 - pose 전환의 핵심 이득. kpt 필드가 아예 없는 객체(구 모델,
+    테스트 스텁)도 getattr 기본값 0.0으로 자연히 bbox 폴백된다."""
+    if (getattr(det, 'kpt0_conf', 0.0) >= KPT_CONF_MIN
+            and getattr(det, 'kpt1_conf', 0.0) >= KPT_CONF_MIN):
+        return (det.kpt0_x + det.kpt1_x) / 2.0, (det.kpt0_y + det.kpt1_y) / 2.0
+    return (det.x1 + det.x2) / 2.0, (det.y1 + det.y2) / 2.0
+
 
 def pixel_to_camera_xyz(px, py, depth, fx, fy, ppx, ppy):
     """픽셀 좌표 + depth(camera 기준 z)를 camera 좌표계 3D 점으로 변환 (핀홀 카메라 역투영)."""
@@ -89,11 +106,10 @@ class ToolTracker:
         if not candidates:
             return None
 
-        # 2. 각 후보의 bbox 중심을 3D로 복원
+        # 2. 각 후보의 기준점(keypoint 중점=파지점, 없으면 bbox 중심)을 3D로 복원
         reconstructed = []
         for d in candidates:
-            cx = (d.x1 + d.x2) / 2.0
-            cy = (d.y1 + d.y2) / 2.0
+            cx, cy = detection_center(d)
             r = reconstruct_fn(cx, cy, d.x2 - d.x1, d.y2 - d.y1)
             if r is not None:
                 reconstructed.append((r, d.score, d))

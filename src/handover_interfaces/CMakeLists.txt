@@ -12,6 +12,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GripperState.msg"
   "msg/Detection2D.msg"
   "msg/DetectionArray.msg"
+  "msg/VisionTiming.msg"
   "srv/SetVisionMode.srv"
   "action/RobotTask.action"
   DEPENDENCIES std_msgs geometry_msgs
