@@ -1,5 +1,7 @@
 import json
+import os
 import time
+from collections import deque
 
 import cv2
 import message_filters
@@ -13,11 +15,12 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
 from std_msgs.msg import String
 
-from handover_interfaces.msg import ToolTrack, HandTrack, DetectionArray
+from handover_interfaces.msg import ToolTrack, HandTrack, DetectionArray, VisionTiming
 from handover_interfaces.srv import SetVisionMode
 
 from vision_node.tracking import (
     ToolTracker, pixel_to_camera_xyz, transform_to_matrix, camera_to_base, is_approaching,
+    KPT_CONF_MIN, detection_center,
 )
 from vision_node.hand_tracking import create_hands_detector, detect_hand_landmarks, is_fist
 from vision_node.grasp_geometry import (
@@ -86,6 +89,11 @@ class VisionNode(Node):
         # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
         self.declare_parameter('debug.log_vision_decisions', False)
+        # 프로파일링: "FPS 저하 vs latency 누적" 판별용 구간 타이밍(/perception/timing).
+        # timing_csv_path를 주면 프레임당 1줄 CSV도 남긴다(오프라인 분석: tools/analyze_timing.py) -
+        # 시퀀스 안정성(miss rate/지터) 지표의 원천 데이터라 실기 검증 런에서는 켜고 돌 것.
+        self.declare_parameter('vision.publish_timing', True)
+        self.declare_parameter('vision.timing_csv_path', '')
         self.min_z_m = self.get_parameter('vision.min_z_m').value
         self.yaw_band = self.get_parameter('vision.yaw_depth_band_m').value
         self.valid_min_ratio = self.get_parameter('vision.depth_valid_min_ratio').value
@@ -109,6 +117,10 @@ class VisionNode(Node):
         self.pub_debug_image = self.create_publisher(
             CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
+        self.pub_timing = self.create_publisher(VisionTiming, '/perception/timing', 10)  # 서브스크라이버: 팀 모니터링/tools 분석
+        self._t = {}                            # 이번 프레임의 구간 타이밍/추적 기록 (콜백마다 리셋)
+        self._timing_window = deque(maxlen=100)  # (callback_ms, e2e_ms, infer_ms) rolling 통계용
+        self._timing_csv = None                 # timing_csv_path 설정 시 지연 오픈
         self.srv_set_mode = self.create_service(SetVisionMode, '/vision/set_mode', self._on_set_mode)  # 클라이언트: task_manager
 
         # eye-in-hand라 3D 복원엔 "지금"이 아니라 "이미지가 찍힌 시각"의 flange pose가 필요하다
@@ -171,6 +183,95 @@ class VisionNode(Node):
             else:
                 self.get_logger().info(text)
 
+    # timing CSV 열 순서 (tools/analyze_timing.py와 계약)
+    _TIMING_CSV_COLS = (
+        'stamp_s', 'infer_ms', 'detect_latency_ms', 'sync_wait_ms', 'tf_ms', 'depth_ms',
+        'track_ms', 'yaw_ms', 'debug_ms', 'callback_ms', 'e2e_ms', 'published',
+        'n_detections', 'cx', 'cy', 'base_x', 'base_y', 'base_z', 'cam_z',
+        'depth_valid', 'grip_deg')
+
+    def _publish_timing(self, color_msg, detection_msg, t_entry, entry_wall_s, published):
+        """프레임 하나의 구간 타이밍을 /perception/timing으로 발행하고(팀 실시간 확인용),
+        timing_csv_path가 설정돼 있으면 CSV 한 줄을 append한다(오프라인 분석용).
+
+        핵심 진단: callback_ms(콜백 내 연산 합)와 e2e_ms(capture->지금)의 괴리.
+        연산 합이 작은데 e2e가 크면 큐 적체(오래된 프레임을 처리 중) - "추론이 느린 게"
+        아니라 "밀린 게" 문제라는 뜻이다."""
+        if not bool(self.get_parameter('vision.publish_timing').value):
+            return
+        callback_ms = (time.perf_counter() - t_entry) * 1000.0
+        stamp_s = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
+        e2e_ms = (self.get_clock().now().nanoseconds * 1e-9 - stamp_s) * 1000.0
+        # capture->콜백진입 경과에서 검출 노드 구간을 빼면 "토픽 홉 + 4토픽 정렬 대기".
+        # 음수가 나오면 노드 간 시계 불일치 신호라 일부러 clamp하지 않는다.
+        sync_wait_ms = (entry_wall_s - stamp_s) * 1000.0 - detection_msg.detect_latency_ms
+
+        msg = VisionTiming()
+        msg.header = color_msg.header
+        msg.infer_ms = float(detection_msg.infer_ms)
+        msg.detect_latency_ms = float(detection_msg.detect_latency_ms)
+        msg.sync_wait_ms = float(sync_wait_ms)
+        msg.tf_ms = float(self._t.get('tf_ms', 0.0))
+        msg.depth_ms = float(self._t.get('depth_ms', 0.0))
+        msg.track_ms = float(self._t.get('track_ms', 0.0))
+        msg.yaw_ms = float(self._t.get('yaw_ms', 0.0))
+        msg.debug_ms = float(self._t.get('debug_ms', 0.0))
+        msg.callback_ms = float(callback_ms)
+        msg.e2e_ms = float(e2e_ms)
+        msg.published = 1 if published else 0
+        msg.n_detections = min(len(detection_msg.detections), 255)
+        self.pub_timing.publish(msg)
+
+        # rolling(최근 100프레임) 요약을 2초마다 이벤트로 - GUI/콘솔에서 추세 확인용
+        self._timing_window.append((callback_ms, e2e_ms, float(detection_msg.infer_ms)))
+        if len(self._timing_window) >= 10:
+            cbs = sorted(t[0] for t in self._timing_window)
+            e2es = sorted(t[1] for t in self._timing_window)
+            infs = sorted(t[2] for t in self._timing_window)
+            p95 = lambda xs: xs[int(len(xs) * 0.95) - 1]  # noqa: E731
+            self.get_logger().info(
+                f'[TIMING] callback_ms mean={sum(cbs) / len(cbs):.2f} p95={p95(cbs):.2f} '
+                f'e2e_ms mean={sum(e2es) / len(e2es):.2f} p95={p95(e2es):.2f} '
+                f'infer_ms mean={sum(infs) / len(infs):.2f} n_frames={len(self._timing_window)}',
+                throttle_duration_sec=2.0)
+
+        csv_path = str(self.get_parameter('vision.timing_csv_path').value or '')
+        if csv_path:
+            row = {
+                'stamp_s': f'{stamp_s:.6f}',
+                'infer_ms': f'{detection_msg.infer_ms:.3f}',
+                'detect_latency_ms': f'{detection_msg.detect_latency_ms:.3f}',
+                'sync_wait_ms': f'{sync_wait_ms:.3f}',
+                'tf_ms': f"{self._t.get('tf_ms', 0.0):.3f}",
+                'depth_ms': f"{self._t.get('depth_ms', 0.0):.3f}",
+                'track_ms': f"{self._t.get('track_ms', 0.0):.3f}",
+                'yaw_ms': f"{self._t.get('yaw_ms', 0.0):.3f}",
+                'debug_ms': f"{self._t.get('debug_ms', 0.0):.3f}",
+                'callback_ms': f'{callback_ms:.3f}',
+                'e2e_ms': f'{e2e_ms:.3f}',
+                'published': int(published),
+                'n_detections': len(detection_msg.detections),
+                'cx': f"{self._t.get('cx', float('nan')):.1f}",
+                'cy': f"{self._t.get('cy', float('nan')):.1f}",
+                'base_x': f"{self._t.get('base_x', float('nan')):.4f}",
+                'base_y': f"{self._t.get('base_y', float('nan')):.4f}",
+                'base_z': f"{self._t.get('base_z', float('nan')):.4f}",
+                'cam_z': f"{(self._t.get('cam_z') if self._t.get('cam_z') is not None else float('nan')):.4f}",
+                'depth_valid': int(self._t.get('depth_valid', False)),
+                'grip_deg': f"{self._t.get('grip_deg', float('nan')):.2f}",
+            }
+            try:
+                if self._timing_csv is None:
+                    new_file = not os.path.exists(csv_path)
+                    self._timing_csv = open(csv_path, 'a', buffering=1)  # line-buffered
+                    if new_file:
+                        self._timing_csv.write(','.join(self._TIMING_CSV_COLS) + '\n')
+                self._timing_csv.write(','.join(str(row[c]) for c in self._TIMING_CSV_COLS) + '\n')
+            except OSError as exc:
+                self.get_logger().warn(
+                    f'timing CSV 기록에 실패했습니다. (path={csv_path}, error={exc})',
+                    throttle_duration_sec=5.0)
+
     def _safe_call(self, fn, *args, default=None, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -207,13 +308,18 @@ class VisionNode(Node):
     def _on_synced_images(self, color_msg, depth_msg, info_msg, detection_msg):
         """4개 토픽이 시간적으로 맞춰졌을 때마다(30~60Hz 목표) 호출되는 메인 루프.
         모드에 따라 _track_tool 또는 _track_hand로 위임하고, 결과가 있으면 퍼블리시."""
+        t_entry = time.perf_counter()
+        entry_wall_s = self.get_clock().now().nanoseconds * 1e-9
+        self._t = {}  # 이번 프레임 타이밍 기록 시작 (_track_tool의 구간들이 여기 쌓인다)
         try:
             # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
             # color_msg.header.frame_id(RealSense가 붙이는 camera_color_optical_frame)가
             # 아니라 CAMERA_OPTICAL_CALIB_FRAME을 조회한다 - 캘리브레이션 회전 중복 적용 방지.
+            t0 = time.perf_counter()
             tf_at_stamp = self.tf_buffer.lookup_transform(
                 'base_link', CAMERA_OPTICAL_CALIB_FRAME, color_msg.header.stamp,
                 timeout=Duration(seconds=0.1))
+            self._t['tf_ms'] = (time.perf_counter() - t0) * 1000.0
         except TransformException as ex:
             self.get_logger().warn(
                 f'이미지 시각의 camera->base TF 조회에 실패했습니다: {ex}',
@@ -226,6 +332,8 @@ class VisionNode(Node):
                 tf_at_stamp, self.tool_class, default=None)
             if track is not None:
                 self.pub_tool_track.publish(track)
+            self._publish_timing(color_msg, detection_msg, t_entry, entry_wall_s,
+                                 published=track is not None)
         elif self.mode == SetVisionMode.Request.TRACK_HAND:
             hand_track = self._safe_call(
                 self._track_hand, color_msg, depth_msg, info_msg, tf_at_stamp, default=None)
@@ -250,8 +358,10 @@ class VisionNode(Node):
         # bool 필드(approaching 등)에 대입할 때 타입 에러가 난다.
         fx, fy, ppx, ppy = (float(info_msg.k[0]), float(info_msg.k[4]),
                             float(info_msg.k[2]), float(info_msg.k[5]))
+        t0 = time.perf_counter()
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         depth_m_img = depth_image.astype(np.float64) / 1000.0  # RealSense depth는 보통 mm(16UC1)
+        self._t['depth_ms'] = (time.perf_counter() - t0) * 1000.0
         tf_matrix = self._tf_matrix(tf_at_stamp)
 
         def reconstruct(cx, cy, bbox_w, bbox_h):
@@ -293,7 +403,9 @@ class VisionNode(Node):
             return (base_xyz[0], base_xyz[1], base_xyz[2], depth_valid)
 
         stamp = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
+        t0 = time.perf_counter()
         result = self.tracker.update(detection_msg.detections, tool_class, reconstruct, stamp)
+        self._t['track_ms'] = (time.perf_counter() - t0) * 1000.0
         if result is None:
             # 검출이 끊긴 프레임 - 축 이력도 지운다. 물체가 화면에서 사라졌다 다시
             # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다
@@ -302,7 +414,9 @@ class VisionNode(Node):
             if self.publish_debug_image:
                 # tool_class 매칭 검출이 없어도 들어온 검출 전체는 그려서 보여준다 -
                 # 왜 안 잡히는지(다른 클래스만 보임/아예 없음) 눈으로 바로 확인 가능하게.
+                t0 = time.perf_counter()
                 self._publish_debug_image(color_msg, detection_msg.detections, None, None)
+                self._t['debug_ms'] = (time.perf_counter() - t0) * 1000.0
             self.get_logger().warn(
                 f"'{tool_class}' 유효 3D 추적 결과가 없습니다. "
                 f"(frame_classes={[d.class_name for d in detection_msg.detections]})",
@@ -319,13 +433,25 @@ class VisionNode(Node):
                 'depth_valid': bool(depth_valid),
             },
             throttle_s=1.0)
+        t0 = time.perf_counter()
         yaw_quat, axis_debug = self._grip_yaw_quaternion(
             chosen_det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class)
+        self._t['yaw_ms'] = (time.perf_counter() - t0) * 1000.0
+        # 시퀀스 안정성(지터/miss) 오프라인 분석용 - timing CSV에 같이 실린다
+        cx, cy = detection_center(chosen_det)
+        self._t.update(cx=cx, cy=cy, base_x=position[0], base_y=position[1],
+                       base_z=position[2], depth_valid=bool(depth_valid),
+                       # 거리 버킷 분석용 카메라축 거리(마지막 유효 depth) - base_z(로봇 기준 높이)와 다르다
+                       cam_z=self.tracker.last_valid_z)
+        if axis_debug is not None:
+            self._t['grip_deg'] = axis_debug['grip_deg']
 
         if self.publish_debug_image:
+            t0 = time.perf_counter()
             self._publish_debug_image(
                 color_msg, detection_msg.detections, chosen_det, axis_debug,
                 position=position, depth_valid=depth_valid)
+            self._t['debug_ms'] = (time.perf_counter() - t0) * 1000.0
 
         track = ToolTrack()
         track.header = color_msg.header  # 관측 시각(stamp)은 그대로 - 서보 루프의 시간 정합 기준
@@ -363,6 +489,17 @@ class VisionNode(Node):
         반환: (쿼터니언 또는 None, 디버그 시각화용 정보 dict 또는 None). 디버그 정보는
         카메라 이미지 평면 좌표계 그대로(base 회전 반영 전)라 _publish_debug_image에서
         원본 프레임 위에 곧바로 그릴 수 있다."""
+        # pose 모델 경로: 검출에 keypoint(공구 장축 양 끝점)가 있으면 그 벡터각이 곧
+        # 장축이다 - depth 마스크/PCA 없이 직접, 근접·가림에도 bbox보다 강건.
+        # keypoint가 없거나 저신뢰면 기존 depth-PCA로 폴백 (box 모델 하위호환).
+        kpt_axis = self._axis_from_keypoints(det)
+        if kpt_axis is not None:
+            axis_deg, kpt_debug, trust = kpt_axis
+            alpha = self.axis_smoother.alpha * max(ELONGATION_ALPHA_FLOOR, trust)
+            axis_deg = self.axis_smoother.update(tool_class, axis_deg, alpha=alpha)
+            grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
+            debug_info = {'kpts': kpt_debug, 'axis_deg': axis_deg, 'grip_deg': grip_deg}
+            return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
         h, w = depth_m_img.shape
         x1, y1 = max(det.x1, 0), max(det.y1, 0)
         x2, y2 = min(det.x2, w), min(det.y2, h)
@@ -390,13 +527,40 @@ class VisionNode(Node):
         axis_deg = self.axis_smoother.update(tool_class, axis_deg, alpha=alpha)
         grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
         debug_info = {'rect': rect, 'axis_deg': axis_deg, 'grip_deg': grip_deg, 'origin': (x1, y1)}
+        return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
 
-        # 그립축 방향벡터(카메라 이미지 평면)를 base 좌표계로 회전 (top-down 전제)
+    def _axis_from_keypoints(self, det):
+        """검출의 2-keypoint(장축 양 끝점)에서 (axis_deg, 디버그 좌표, trust)를 구한다.
+
+        keypoint가 없거나(kpt_conf 기본값 0 - 구 box 모델), 저신뢰거나, 두 점이 너무
+        붙어 있으면(각도 신뢰 불가) None - 호출측이 depth-PCA로 폴백한다.
+        trust는 두 kpt conf의 평균으로, elongation 기반 trust와 같은 방식으로
+        AxisSmoother의 alpha를 누른다(저신뢰 관측이 각도를 흔들지 못하게)."""
+        c0, c1 = det.kpt0_conf, det.kpt1_conf
+        if c0 < KPT_CONF_MIN or c1 < KPT_CONF_MIN:
+            return None
+        dx, dy = det.kpt1_x - det.kpt0_x, det.kpt1_y - det.kpt0_y
+        # 축 길이 하한: bbox 장변의 30%. 그 미만이면 두 점이 뭉쳐 있어 각도가 노이즈
+        # (라벨 스펙상 끝점 간 거리는 장변 근처여야 정상 - validate_pose_labels.py의 50% 경고와 일관)
+        min_axis_px = 0.3 * max(det.x2 - det.x1, det.y2 - det.y1)
+        if np.hypot(dx, dy) < max(min_axis_px, 2.0):
+            self.get_logger().warn(
+                f'{det.class_name} keypoint 축이 너무 짧아 depth-PCA로 폴백합니다. '
+                f'(axis_px={np.hypot(dx, dy):.1f})',
+                throttle_duration_sec=1.0)
+            return None
+        axis_deg = float(np.degrees(np.arctan2(dy, dx)) % 180.0)
+        kpt_debug = ((det.kpt0_x, det.kpt0_y), (det.kpt1_x, det.kpt1_y))
+        trust = min(1.0, (c0 + c1) / 2.0)
+        return axis_deg, kpt_debug, trust
+
+    def _grip_deg_to_base_quaternion(self, grip_deg, tf_matrix):
+        """그립축 방향벡터(카메라 이미지 평면)를 base 좌표계로 회전해 yaw 쿼터니언으로 (top-down 전제)."""
         d_cam = np.array([np.cos(np.deg2rad(grip_deg)), np.sin(np.deg2rad(grip_deg)), 0.0])
         rot = np.array(tf_matrix)[:3, :3]
         d_base = rot @ d_cam
         base_yaw_deg = float(np.degrees(np.arctan2(d_base[1], d_base[0])) % 180.0)
-        return yaw_deg_to_quaternion(base_yaw_deg), debug_info
+        return yaw_deg_to_quaternion(base_yaw_deg)
 
     def _publish_debug_image(
             self, color_msg, detections, chosen_det, axis_debug, position=None, depth_valid=None):
@@ -421,7 +585,18 @@ class VisionNode(Node):
             cv2.putText(frame, f'{d.class_name} {d.score * 100:.0f}%', (d.x1, max(d.y1 - 4, 10)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
 
-        if axis_debug is not None:
+        if axis_debug is not None and 'kpts' in axis_debug:
+            # keypoint 경로: 끝점 2개(p0 빨강/p1 파랑)와 그 축선을 그대로 그린다
+            (p0x, p0y), (p1x, p1y) = axis_debug['kpts']
+            p0 = (int(p0x), int(p0y))
+            p1 = (int(p1x), int(p1y))
+            cv2.line(frame, p0, p1, (255, 255, 255), 1)
+            cv2.circle(frame, p0, 3, (0, 0, 255), -1)
+            cv2.circle(frame, p1, 3, (255, 0, 0), -1)
+            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
+                        (min(p0[0], p1[0]), min(frame.shape[0] - 16, max(p0[1], p1[1]) + 24)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        elif axis_debug is not None:
             ox, oy = axis_debug['origin']
             rect = axis_debug['rect']
             (rcx, rcy), (rw, rh), _ = rect
@@ -523,6 +698,13 @@ class VisionNode(Node):
             },
             throttle_s=1.0)
         return track
+
+
+    def destroy_node(self):
+        if self._timing_csv is not None:
+            self._timing_csv.close()
+            self._timing_csv = None
+        super().destroy_node()
 
 
 def main(args=None):

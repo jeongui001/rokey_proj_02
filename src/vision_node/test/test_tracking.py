@@ -2,7 +2,7 @@ import math
 import pytest
 from vision_node.tracking import (
     pixel_to_camera_xyz, quaternion_to_rotation_matrix, transform_to_matrix,
-    camera_to_base, is_approaching, ToolTracker,
+    camera_to_base, is_approaching, ToolTracker, detection_center,
 )
 
 
@@ -11,6 +11,28 @@ class FakeDetection:
         self.class_name = class_name
         self.score = score
         self.x1, self.y1, self.x2, self.y2 = x1, y1, x2, y2
+
+
+def test_detection_center_uses_keypoint_midpoint_when_confident():
+    """pose 모델 검출: keypoint 2개가 유효하면 중점(=파지점)이 추적 기준이 된다."""
+    d = FakeDetection('spanner', 0.9, 100, 100, 200, 140)
+    d.kpt0_x, d.kpt0_y, d.kpt0_conf = 110.0, 130.0, 0.9
+    d.kpt1_x, d.kpt1_y, d.kpt1_conf = 190.0, 110.0, 0.8
+    assert detection_center(d) == pytest.approx((150.0, 120.0))
+
+
+def test_detection_center_falls_back_to_bbox_when_kpt_low_conf():
+    """keypoint 저신뢰(가림 등)면 bbox 중심으로 폴백한다."""
+    d = FakeDetection('spanner', 0.9, 100, 100, 200, 140)
+    d.kpt0_x, d.kpt0_y, d.kpt0_conf = 110.0, 130.0, 0.2
+    d.kpt1_x, d.kpt1_y, d.kpt1_conf = 190.0, 110.0, 0.9
+    assert detection_center(d) == pytest.approx((150.0, 120.0))
+
+
+def test_detection_center_falls_back_when_no_kpt_fields():
+    """kpt 필드가 아예 없는 구 box 모델 검출(테스트 스텁 포함)도 bbox 중심으로 동작한다."""
+    d = FakeDetection('spanner', 0.9, 100, 100, 200, 140)
+    assert detection_center(d) == pytest.approx((150.0, 120.0))
 
 
 def test_pixel_to_camera_xyz_center_pixel_is_zero_xy():
