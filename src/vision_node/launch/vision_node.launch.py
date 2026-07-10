@@ -19,6 +19,17 @@ def generate_launch_description():
             # tool_detection_node는 /camera/color/image_raw(단일)를 구독하므로 비워서 맞춘다
             # (2026-07-08 실기 검증 중 발견: 이걸 안 하면 두 노드 다 이미지를 하나도 못 받는다).
             'camera_namespace': '',
+            # depth post-processing 필터(2026-07-10, "z가 계속 내려간다" 조사 중 추가) -
+            # patch_median_depth(공간)/ToolTracker의 EMA(시간)는 우리 코드 안에서 노이즈를
+            # 누르지만, 드라이버가 애초에 내놓는 depth 원본을 다듬는 게 아니라 하류에서만
+            # 대응하는 것. RealSense 공식 필터는 더 상류(센서 출력 직후)에서 적용돼 이후
+            # 모든 단계에 도움이 된다.
+            'spatial_filter.enable': 'true',   # 프레임 내 edge-preserving 스무딩(홀/스펙클 감소)
+            'temporal_filter.enable': 'true',  # 프레임간 노이즈 저감(우리가 겪는 노이즈 층위와 정확히 일치)
+            # decimation_filter는 추가 안 함 - 이미 424x240으로 낮춘 해상도를 더 줄이면
+            # keypoint 정밀도 손실 우려. hole_filling_filter도 보류 - patch_median_depth+
+            # depth_valid 플래그로 무효 구간을 이미 명시적으로 다루고 있어 중복이고,
+            # 잘못 채워진 값이 유효로 오인될 위험이 있음.
         }.items()
     )
     # data_recording.py(캘리브레이션 촬영)가 set_tool("Tool Weight_2FG") + set_tcp("2FG_TCP")를

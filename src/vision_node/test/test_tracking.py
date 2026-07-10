@@ -103,6 +103,47 @@ def test_tracker_second_frame_estimates_velocity():
     assert velocity[0] == pytest.approx(0.1, abs=1e-6)
 
 
+def test_tracker_smooths_z_via_ema():
+    """z(depth)는 EMA로 스무딩돼야 한다 - RealSense 스테레오 depth의 프레임간
+    temporal jitter가 patch median(공간적 이상치 제거)만으로는 안 걸러지는 게
+    체감 노이즈의 핵심 원인이었다(수정 전엔 z가 raw로 그대로 흘러나갔음)."""
+    tracker = ToolTracker(alpha=0.5, beta=1.0)  # alpha_z 기본값=alpha
+    tracker.update([FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+                    lambda cx, cy, bw, bh: (0.0, 0.0, 0.40, True), stamp=0.0)
+    position, _, _, _ = tracker.update(
+        [FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+        lambda cx, cy, bw, bh: (0.0, 0.0, 0.50, True), stamp=0.1)
+    # raw z(0.50)를 그대로 쓰면 안 되고, alpha=0.5로 0.40과 0.50 사이(0.45)여야 한다
+    assert position[2] == pytest.approx(0.45, abs=1e-6)
+
+
+def test_tracker_does_not_smooth_xy():
+    """x,y는 EMA를 적용하지 않고 raw 관측값을 그대로 써야 한다(2026-07-10, 사용자 지시:
+    "ema가 z에는 적용되어야 하는데 xy에는 적용되면 안 돼") - 검출 좌표 자체는 이미
+    안정적이라 스무딩하면 접근 중 지연만 유발한다. alpha를 낮게 줘도(스무딩이 켜져
+    있었다면 값이 이전 값 쪽으로 끌렸을 것) x,y는 새 관측값으로 즉시 스냅해야 한다."""
+    tracker = ToolTracker(alpha=0.1, beta=1.0, alpha_z=1.0)
+    tracker.update([FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+                    lambda cx, cy, bw, bh: (0.0, 0.0, 0.40, True), stamp=0.0)
+    position, _, _, _ = tracker.update(
+        [FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+        lambda cx, cy, bw, bh: (1.0, 2.0, 0.50, True), stamp=0.1)
+    assert position[0] == pytest.approx(1.0, abs=1e-6)
+    assert position[1] == pytest.approx(2.0, abs=1e-6)
+
+
+def test_tracker_alpha_z_override_can_smooth_depth_harder_than_xy():
+    """depth 노이즈가 xy보다 크면 alpha_z를 따로 낮춰 더 세게 눌러야 한다."""
+    tracker = ToolTracker(alpha=1.0, beta=1.0, alpha_z=0.1)
+    tracker.update([FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+                    lambda cx, cy, bw, bh: (0.0, 0.0, 0.40, True), stamp=0.0)
+    position, _, _, _ = tracker.update(
+        [FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
+        lambda cx, cy, bw, bh: (0.0, 0.0, 0.50, True), stamp=0.1)
+    # alpha(xy)=1.0이라 x,y는 즉시 새 값으로 스냅하지만 z는 alpha_z=0.1로 거의 안 움직여야 함
+    assert position[2] == pytest.approx(0.41, abs=1e-6)
+
+
 def test_tracker_holds_last_valid_z_when_depth_invalid():
     tracker = ToolTracker()
     tracker.update([FakeDetection('spanner', 0.9, 0, 0, 0, 0)], 'spanner',
