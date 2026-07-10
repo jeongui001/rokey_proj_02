@@ -36,13 +36,8 @@
     # verify_min/max_width_mm은 아직 미확정이라 -1.0으로 남겨뒀다.
     tools:
       bottle:
-        width_mm: 80.0
-        force_n: 30.0
-        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
-        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
-      spanner:
-        width_mm: 80.0
-        force_n: 30.0
+        width_mm: 20.0
+        force_n: 20.0
         verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
         verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       screw_driver:
@@ -51,22 +46,17 @@
         # 된다(실기에서 80mm으로 이 문제 확인됨). 손잡이보다 확실히 좁은 값(거의
         # 완전히 닫힘)으로 두어 force 한계에 걸려 멈추게 한다.
         width_mm: 5.0
-        force_n: 25.0
+        force_n: 20.0
         verify_min_width_mm: 0.0     # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
         verify_max_width_mm: 15.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       wrench:
-        width_mm: 80.0
-        force_n: 30.0
-        verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
-        verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
-      pliers:
-        width_mm: 80.0
-        force_n: 30.0
+        width_mm: 20.0
+        force_n: 20.0
         verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
         verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
       hammer:
-        width_mm: 80.0
-        force_n: 30.0
+        width_mm: 20.0
+        force_n: 20.0
         verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
         verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
 
