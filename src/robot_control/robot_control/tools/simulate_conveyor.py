@@ -88,9 +88,10 @@ if __name__ == '__main__':
 
     for name in ('constant', 'long_reversal', 'short_oscillation'):
         loop = ServoLoop(kp_xy=1.2, kp_yaw=1.0, v_max=0.25, descend_speed=0.10,
-                          eps_descend=0.015, eps_grasp=0.005, n_stable=5,
+                          eps_descend=0.015, eps_grasp=0.005, n_stable=10,
                           dt_latency=0.05, timeout_s=5.0, t_lost_s=0.3,
-                          innov_low=0.010, innov_high=0.040, w_alpha=0.3)
+                          innov_low=0.010, innov_high=0.040, w_alpha=0.3,
+                          diverge_n=15)
         log = run_servo_sim(loop, make_scenario(name, duration_s=4.0, dt=0.02), dt=0.02)
         avg_w = sum(row['w'] for row in log) / len(log)
         avg_e = sum(row['e_xy'] for row in log) / len(log)

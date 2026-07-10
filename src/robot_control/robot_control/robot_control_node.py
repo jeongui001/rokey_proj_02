@@ -87,7 +87,7 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.descend_speed', 0.10)
         self.declare_parameter('servo.eps_descend', 0.015)
         self.declare_parameter('servo.eps_grasp', 0.005)
-        self.declare_parameter('servo.n_stable', 5)
+        self.declare_parameter('servo.n_stable', 10)
         self.declare_parameter('servo.dt_latency', 0.05)
         self.declare_parameter('servo.timeout', 5.0)
         self.declare_parameter('servo.t_lost', 0.3)
@@ -98,7 +98,7 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.innov_high', 0.040)
         self.declare_parameter('servo.w_alpha', 0.3)
         self.declare_parameter('servo.z_close', 0.02)
-        self.declare_parameter('servo.diverge_n', 5)
+        self.declare_parameter('servo.diverge_n', 15)
         self.declare_parameter('servo.cov_threshold', 0.05)
         # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
         # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
