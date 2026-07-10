@@ -54,17 +54,18 @@
       v_max: 0.25               # 수평 속도 상한(m/s), 
       descend_speed: 0.10       # 하강 속도(m/s)
       eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
-      eps_grasp: 0.005          # 폐합 판정 수평 오차 임계(m)
-      n_stable: 10              # 폐합 판정에 필요한 연속 안정 주기 수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~5.7개치)
+      eps_grasp: 0.01          # 폐합 판정 수평 오차 임계(m)
+      n_stable: 1              # 폐합 판정에 필요한 연속 안정 주기 수, 일단 끈 상태(1)
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
       timeout: 5.0              # 서보 전체 타임아웃(s)
       t_lost: 0.3               # 추적 유실 판정 시간(s)
       innov_low: 0.010   # 이 잔차(m) 이하 -> w=1(피드포워드 완전 신뢰)
       innov_high: 0.040  # 이 잔차(m) 이상 -> w=0 + 속도 공분산 리셋
       w_alpha: 0.3        # w의 저역통과 스무딩 계수
-      z_close: 0.02       # 폐합 판정 z_gap(m) 임계, 너무 위에서 잡으면 낮추고 너무 아래서 잡으면 키우기
+      z_close: 0.04       # 폐합 판정 z_gap(m) 임계, 너무 위에서 잡으면 낮추고 너무 아래서 잡으면 키우기
+      n_stable_z: 5       # z_close 판정에 필요한 연속 안정 주기 수 - depth 단발 노이즈로 조기 정지되는 걸 막음(n_stable과 같은 방식)
       diverge_n: 15       # 발산 판정에 볼 연속 오차 개수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~8.6개치)
-      cov_threshold: 0.05 # 폐합 판정용 속도 공분산 임계
+      cov_threshold: 100.0 # 폐합 판정용 속도 공분산 임계, 일단 끈 상태(1)
       kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
       kalman_q_vel: 1.0e-2      # 프로세스 노이즈(속도)
       kalman_r_xy: 1.0e-4       # 측정 노이즈(x,y)

@@ -121,7 +121,7 @@ def test_depth_invalid_track_does_not_move_z_estimate():
 
 
 def test_should_close_requires_stable_error_and_z_gap_and_low_covariance():
-    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, cov_threshold=2.5)
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2, cov_threshold=2.5)
     loop.start('spanner', 30.0, 20.0)
     loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
     loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
@@ -132,13 +132,44 @@ def test_should_close_requires_stable_error_and_z_gap_and_low_covariance():
 
 
 def test_should_close_blocked_by_high_velocity_covariance():
-    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, cov_threshold=0.5)
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2, cov_threshold=0.5)
     loop.start('spanner', 30.0, 20.0)
     loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
     loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
     for _ in range(3):
         loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
     assert loop.should_close() is False
+
+
+def test_single_noisy_z_gap_dip_does_not_latch_descent_stop():
+    # z_close 이내로 딱 한 틱만 떨어졌다가 다시 벗어나는 경우(depth 노이즈 상황) -
+    # n_stable_z가 2 이상이면 그 한 틱만으로 하강이 멈추면 안 된다.
+    loop = _make_loop(z_close=0.05, n_stable_z=3)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.5))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.5))
+    tcp_noisy_close = (0.0, 0.0, 0.48, 0, 0, 0)  # z_gap=0.02 < z_close(0.05), 노이즈성 단발 근접
+    tcp_far = (0.0, 0.0, 0.20, 0, 0, 0)          # z_gap=0.30 >= z_close, 원래 거리로 복귀
+    cmd = loop.step(tcp_noisy_close, time.monotonic())
+    assert cmd.vz != 0.0
+    assert loop._z_stable_count == 1
+    cmd = loop.step(tcp_far, time.monotonic())
+    assert loop._z_stable_count == 0
+    assert cmd.vz != 0.0
+
+
+def test_vz_locks_to_zero_only_after_n_stable_z_consecutive_ticks():
+    loop = _make_loop(z_close=0.05, n_stable_z=3)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.5))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.5))
+    tcp_close = (0.0, 0.0, 0.48, 0, 0, 0)  # z_gap=0.02 < z_close(0.05)로 계속 유지
+    cmd = loop.step(tcp_close, time.monotonic())
+    assert cmd.vz != 0.0  # 1번째 - 아직 안 멈춤
+    cmd = loop.step(tcp_close, time.monotonic())
+    assert cmd.vz != 0.0  # 2번째 - 아직 안 멈춤
+    cmd = loop.step(tcp_close, time.monotonic())
+    assert cmd.vz == 0.0  # 3번째(n_stable_z) - 이제 멈춤
 
 
 def test_should_abort_timeout():

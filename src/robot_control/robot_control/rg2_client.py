@@ -54,10 +54,44 @@ class RG2Client:
                 baudrate=115200, timeout=self._connect_timeout_s())
         try:
             if not self._client.connect():
+                self._log_comm_failure('connect', detail='connect()가 False를 반환')
+                self._reset_connection()
                 return None
-        except Exception:
+        except Exception as exc:
+            self._log_comm_failure('connect', exc=exc)
+            self._reset_connection()
             return None
         return self._client
+
+    def _log_comm_failure(self, context, exc=None, response=None, detail=None):
+        # COMMUNICATION_ERROR가 반복될 때 "왜"인지 전부 삼켜져서(2026-07-09: 재연결
+        # 로직을 넣었는데도 여전히 재현) 원인을 못 보고 있었다 - 실제 pymodbus
+        # 예외/응답 내용을 그대로 남긴다. RG2Client는 유닛 테스트에서 node=None으로도
+        # 쓰이므로 get_logger()는 node가 있을 때만 부른다.
+        if detail is None:
+            if exc is not None:
+                detail = f'{type(exc).__name__}: {exc}'
+            elif response is not None:
+                detail = repr(response)
+            else:
+                detail = 'unknown'
+        if self._node is not None:
+            self._node.get_logger().error(
+                f'RG2 통신 실패[{context}]: {detail} (ip={self.ip}, port={self.port})')
+
+    def _reset_connection(self):
+        # pymodbus의 ModbusTcpClient.connect()는 소켓이 상대(RG2)쪽에서 이미 끊긴
+        # "죽은" 상태여도 이미 연결됐다고 착각하고 그냥 통과시킨다 - 그러면 이후
+        # read/write가 계속 실패하는데 재시도도 같은 죽은 소켓으로만 이뤄져 절대
+        # 회복이 안 된다(2026-07-09 실기: RG2 open이 재시도까지 다 실패하고 FAULT).
+        # 통신 실패를 감지한 곳마다 이걸 불러서 다음 시도(재시도 포함)가 새 TCP
+        # 연결로 다시 붙게 한다.
+        if self._client is not None:
+            try:
+                self._client.close()
+            except Exception:
+                pass
+            self._client = None
 
     def _command_timeout_s(self) -> float:
         if self._node is not None:
@@ -117,10 +151,14 @@ class RG2Client:
                 return None
             response = client.read_holding_registers(address=268, count=1, unit=65)
             if self._response_failed(response):
+                self._log_comm_failure('read_busy_bit', response=response)
+                self._reset_connection()
                 return None
             registers = getattr(response, 'registers', None)
             return None if not registers else bool(registers[0] & 0x01)
-        except Exception:
+        except Exception as exc:
+            self._log_comm_failure('read_busy_bit', exc=exc)
+            self._reset_connection()
             return None
 
     def _read_final_state(self):
@@ -131,6 +169,11 @@ class RG2Client:
             width_response = client.read_holding_registers(address=267, count=1, unit=65)
             status_response = client.read_holding_registers(address=268, count=1, unit=65)
             if self._response_failed(width_response) or self._response_failed(status_response):
+                self._log_comm_failure(
+                    'read_final_state',
+                    response=width_response if self._response_failed(width_response)
+                    else status_response)
+                self._reset_connection()
                 return None
             width_registers = getattr(width_response, 'registers', None)
             status_registers = getattr(status_response, 'registers', None)
@@ -140,7 +183,9 @@ class RG2Client:
             if not math.isfinite(width_mm):
                 return None
             return width_mm, bool(status_registers[0] & 0x02)
-        except Exception:
+        except Exception as exc:
+            self._log_comm_failure('read_final_state', exc=exc)
+            self._reset_connection()
             return None
 
     def _wait_until_not_busy(self, goal_handle=None):
@@ -168,9 +213,13 @@ class RG2Client:
         try:
             response = client.write_registers(
                 address=0, values=[0, 0, self._CMD_STOP], unit=65)
-        except Exception:
+        except Exception as exc:
+            self._log_comm_failure('send_stop', exc=exc)
+            self._reset_connection()
             return False
         if self._response_failed(response):
+            self._log_comm_failure('send_stop', response=response)
+            self._reset_connection()
             return False
         deadline = time.monotonic() + self._command_timeout_s()
         while True:
@@ -201,9 +250,13 @@ class RG2Client:
             return RG2Status.COMMUNICATION_ERROR
         try:
             response = client.write_registers(address=0, values=values, unit=65)
-        except Exception:
+        except Exception as exc:
+            self._log_comm_failure('write_command', exc=exc)
+            self._reset_connection()
             return RG2Status.COMMUNICATION_ERROR
         if self._response_failed(response):
+            self._log_comm_failure('write_command', response=response)
+            self._reset_connection()
             return RG2Status.COMMUNICATION_ERROR
 
         status = self._wait_until_not_busy(goal_handle=goal_handle)

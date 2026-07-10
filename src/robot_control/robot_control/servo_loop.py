@@ -56,7 +56,8 @@ class ServoLoop:
                  timeout_s, t_lost_s,
                  innov_low=0.010, innov_high=0.040, w_alpha=0.3,
                  z_close=0.02, diverge_n=5, cov_threshold=0.05,
-                 q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0):
+                 q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
+                 n_stable_z=5):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
@@ -64,6 +65,7 @@ class ServoLoop:
         self.eps_descend = eps_descend   # 이 오차 이내여야 하강 시작
         self.eps_grasp = eps_grasp       # 폐합 판정 오차 임계
         self.n_stable = n_stable         # 폐합 판정에 필요한 연속 안정 주기 수
+        self.n_stable_z = n_stable_z     # z_close 판정에 필요한 연속 안정 주기 수(단발 depth 노이즈 방지)
         # dt_latency에 2.3절의 "루프 반주기" 보정도 함께 흡수한다(1차 구현 단순화).
         self.dt_latency = dt_latency     # 지연 보상(lookahead) 시간
         self.timeout_s = timeout_s       # 서보 전체 타임아웃
@@ -91,6 +93,7 @@ class ServoLoop:
         self._last_msg_time = None       # 마지막 ToolTrack을 "받은" 시각(monotonic) - t_lost 판정용
         self._start_time = None          # servo_pick 시작 시각(monotonic) - timeout 판정용
         self._stable_count = 0           # eps_grasp 이내로 연속 몇 주기째인지
+        self._z_stable_count = 0         # z_close 이내로 연속 몇 주기째인지
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
         self._last_e_xy_norm = None      # DEBUG_LOG: 최근 xy 오차(m)
@@ -113,6 +116,7 @@ class ServoLoop:
         self._last_msg_time = None
         self._start_time = time.monotonic()
         self._stable_count = 0
+        self._z_stable_count = 0
         self._error_history = []
         self._last_z_gap = None
         self._last_e_xy_norm = None
@@ -202,12 +206,21 @@ class ServoLoop:
             vx *= scale
             vy *= scale
 
-        # 하강은 별도 프로파일: 수평 오차가 충분히 작을 때만 진행, 아니면 대기(수평 정렬 우선).
-        # z_gap이 z_close 이내로 들어오면 xy 안정성/공분산(should_close 조건)과 무관하게
-        # 즉시 vz를 0으로 고정한다 - descend_speed는 비례 제어가 아니라 상수 속도라서
-        # should_close()의 복합 조건(폐합 가능 여부)이 늦게 만족돼도 목표 z를 지나쳐
-        # 계속 하강하면 안 되기 때문이다.
+        # z_close 이내 판정도 xy의 stable_count와 같은 방식으로 디바운스한다 - depth
+        # 관측 한 프레임이 노이즈로 튀어 z_gap이 순간적으로 z_close 밑으로 떨어져도
+        # 그 한 번만으로 하강을 멈추지 않도록, n_stable_z주기 연속으로 z_close
+        # 이내여야 "도착"으로 인정한다.
         if self._last_z_gap < self.z_close:
+            self._z_stable_count += 1
+        else:
+            self._z_stable_count = 0
+
+        # 하강은 별도 프로파일: 수평 오차가 충분히 작을 때만 진행, 아니면 대기(수평 정렬 우선).
+        # z가 안정적으로 z_close 이내에 들어오면 xy 안정성/공분산(should_close 조건)과
+        # 무관하게 즉시 vz를 0으로 고정한다 - descend_speed는 비례 제어가 아니라 상수
+        # 속도라서 should_close()의 복합 조건(폐합 가능 여부)이 늦게 만족돼도 목표 z를
+        # 지나쳐 계속 하강하면 안 되기 때문이다.
+        if self._z_stable_count >= self.n_stable_z:
             self._state = ServoState.TRACKING
             vz = 0.0
         elif e_xy_norm < self.eps_descend:
@@ -235,7 +248,7 @@ class ServoLoop:
         오차가 n_stable주기 연속 충분히 작고, z까지 충분히 가깝고, 필터가 수렴했을 것."""
         if self._stable_count < self.n_stable:
             return False
-        if self._last_z_gap is None or self._last_z_gap >= self.z_close:
+        if self._last_z_gap is None or self._z_stable_count < self.n_stable_z:
             return False
         if self._filter.velocity_covariance_trace >= self.cov_threshold:
             return False
@@ -274,6 +287,7 @@ class ServoLoop:
             'e_xy_norm_m': self._last_e_xy_norm,
             'stable_count': self._stable_count,
             'last_z_gap_m': self._last_z_gap,
+            'z_stable_count': self._z_stable_count,
             'velocity_covariance_trace': float(self._filter.velocity_covariance_trace),
             'error_history_m': [float(v) for v in self._error_history],
             'depth_valid': self._last_depth_valid,
