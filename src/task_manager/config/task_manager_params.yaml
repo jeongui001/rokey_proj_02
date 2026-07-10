@@ -40,7 +40,7 @@
         force_n: 20.0
         verify_min_width_mm: 20.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
         verify_max_width_mm: 90.0    # TEMP(스모크테스트용 임시값, mm) - 캘리브레이션 필요
-      screw_driver:
+      screwdriver:
         # width_mm은 "닫힐 때 목표 폭"이다(RG2Client.close 참고) - 물체(드라이버
         # 손잡이)보다 넓으면 물체에 닿기도 전에 목표 폭에서 멈춰 grip_detected=False가
         # 된다(실기에서 80mm으로 이 문제 확인됨). 손잡이보다 확실히 좁은 값(거의

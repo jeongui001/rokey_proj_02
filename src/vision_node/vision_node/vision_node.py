@@ -22,7 +22,7 @@ from vision_node.tracking import (
     ToolTracker, pixel_to_camera_xyz, transform_to_matrix, camera_to_base, is_approaching,
     KPT_CONF_MIN, detection_center,
 )
-from vision_node.hand_tracking import create_hands_detector, detect_hand_landmarks, is_fist
+from vision_node.hand_tracking import create_hands_detector, detect_hand, is_fist
 from vision_node.grasp_geometry import (
     AxisSmoother, is_bbox_at_edge, patch_median_depth, tool_axis_from_depth,
     yaw_deg_to_quaternion,
@@ -117,6 +117,7 @@ class VisionNode(Node):
         self.yaw_band = self.get_parameter('vision.yaw_depth_band_m').value
         self.valid_min_ratio = self.get_parameter('vision.depth_valid_min_ratio').value
         self.publish_debug_image = self.get_parameter('vision.publish_debug_image').value
+        self.fist_confirm_frames = self.get_parameter('vision.fist_confirm_frames').value
         self.approach_ref_xy = (
             self.get_parameter('vision.approach_ref_x').value,
             self.get_parameter('vision.approach_ref_y').value,
@@ -129,7 +130,7 @@ class VisionNode(Node):
         self.axis_smoother = AxisSmoother(
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
         self._hands_detector = None  # 지연 생성 (TRACK_HAND 최초 진입 시 create_hands_detector() 호출)
-        self._fist_confirm_count = 0  # 연속으로 주먹으로 판별된 프레임 수(_on_set_mode에서 리셋)
+        self._fist_counter = 0  # TRACK_HAND에서 is_fist 연속 참 카운트(디바운스)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
         self.pub_hand_track = self.create_publisher(HandTrack, '/vision/hand_track', 10)  # 서브스크라이버: robot_control(handover_approach 중 직접 구독)
@@ -313,7 +314,7 @@ class VisionNode(Node):
             self.tracker.reset()
             self.axis_smoother.reset(request.tool_class)  # 이전 사이클의 축 이력도 함께 초기화
         elif request.mode == SetVisionMode.Request.TRACK_HAND:
-            self._fist_confirm_count = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
+            self._fist_counter = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
         checkpoint = self._SET_MODE_CHECKPOINTS.get(request.mode)
@@ -689,30 +690,38 @@ class VisionNode(Node):
             self._hands_detector = create_hands_detector()
 
         image = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-        landmarks, confidence = detect_hand_landmarks(self._hands_detector, image)
-        if landmarks is None:
-            self._fist_confirm_count = 0
+        detection = detect_hand(self._hands_detector, image)
+        if detection is None:
+            self._fist_counter = 0
             self.get_logger().warn('MediaPipe가 손을 찾지 못했습니다.', throttle_duration_sec=1.0)
             track.detected = False
+            track.fist = False
+            track.confidence = 0.0
             return track
 
-        h, w = image.shape[:2]
-        px, py = int(landmarks[0].x * w), int(landmarks[0].y * h)  # 0번 = 손목(WRIST)
+        (px, py), landmarks, confidence = detection
+        track.confidence = float(confidence)
+
+        raw_fist = is_fist(landmarks)
+        self._fist_counter = self._fist_counter + 1 if raw_fist else 0
+        confirmed_fist = self._fist_counter >= self.fist_confirm_frames
+        track.fist = confirmed_fist
+
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-        if not (0 <= py < depth_image.shape[0] and 0 <= px < depth_image.shape[1]):
-            self._fist_confirm_count = 0
+        depth_m_img = depth_image.astype(np.float64) / 1000.0
+        if not (0 <= py < depth_m_img.shape[0] and 0 <= px < depth_m_img.shape[1]):
             self.get_logger().warn(
-                f'손목 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다. '
-                f'(width={depth_image.shape[1]}, height={depth_image.shape[0]})',
+                f'손바닥 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다. '
+                f'(width={depth_m_img.shape[1]}, height={depth_m_img.shape[0]})',
                 throttle_duration_sec=1.0)
             track.detected = False
             return track
-        raw_depth_mm = depth_image[py, px]
-        depth_m = float(raw_depth_mm) / 1000.0
-        if depth_m <= 0.0:
-            self._fist_confirm_count = 0
+        depth_m, valid_ratio = patch_median_depth(
+            depth_m_img, px, py, half=PATCH_HALF, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
+        if depth_m is None or valid_ratio < self.valid_min_ratio:
             self.get_logger().warn(
-                f'손목 픽셀({px},{py}) depth가 0 이하입니다. (raw_depth_mm={raw_depth_mm})',
+                f'손바닥 픽셀({px},{py}) depth가 무효입니다. '
+                f'(depth_m={depth_m}, valid_ratio={valid_ratio:.2f})',
                 throttle_duration_sec=1.0)
             track.detected = False
             return track
@@ -722,15 +731,8 @@ class VisionNode(Node):
         cam_xyz = pixel_to_camera_xyz(px, py, depth_m, fx, fy, ppx, ppy)
         base_xyz = camera_to_base(cam_xyz, self._tf_matrix(tf_at_stamp))
 
-        raw_fist = is_fist(landmarks)
-        self._fist_confirm_count = self._fist_confirm_count + 1 if raw_fist else 0
-        fist_confirm_frames = self.get_parameter('vision.fist_confirm_frames').value
-        confirmed_fist = self._fist_confirm_count >= fist_confirm_frames
-
         track.pose.position.x, track.pose.position.y, track.pose.position.z = base_xyz
         track.detected = True
-        track.fist = confirmed_fist
-        track.confidence = confidence
         self._checkpoint_event(
             'H', 'hand_pose_published', 'PASS',
             'base_link 기준 hand_track을 발행합니다.',
@@ -738,7 +740,7 @@ class VisionNode(Node):
                 'px': px, 'py': py, 'depth_m': depth_m,
                 'base_xyz': [float(v) for v in base_xyz],
                 'raw_fist': raw_fist,
-                'fist_confirm_count': self._fist_confirm_count,
+                'fist_confirm_count': self._fist_counter,
                 'confirmed_fist': confirmed_fist,
             },
             throttle_s=1.0)
