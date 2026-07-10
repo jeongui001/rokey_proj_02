@@ -51,9 +51,28 @@ _DEBUG_CLASS_COLORS = [
     (0, 255, 0), (255, 100, 0), (0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0),
 ]
 
+# 디버그 이미지 표시 확대 배율(2026-07-10) - 실제 스트림이 424x240이라 원본 그대로는
+# 화질이 낮고 글자가 조밀해 가까이서 보면 읽기 어렵다. 검출/추적 연산 자체는 원본
+# 해상도 그대로 두고, 발행 직전 시각화 단계에서만 확대한다.
+_DEBUG_IMAGE_UPSCALE = 2
+_DEBUG_FONT_SCALE = 0.35 * _DEBUG_IMAGE_UPSCALE
+_DEBUG_FONT_THICKNESS = 1
+
 
 def _class_color(class_name):
     return _DEBUG_CLASS_COLORS[hash(class_name) % len(_DEBUG_CLASS_COLORS)]
+
+
+def _put_text_clamped(frame, text, x, y, color,
+                       font_scale=_DEBUG_FONT_SCALE, thickness=_DEBUG_FONT_THICKNESS):
+    """cv2.putText 래퍼 - 텍스트 원점을 프레임 경계 안으로 clamp한다. 근접 촬영 시
+    bbox/keypoint가 화면 가장자리에 붙어 라벨이 프레임 밖으로 잘려나가는 문제
+    (2026-07-10 실기 확인) 대응 - 기존엔 y좌표 일부만 개별적으로 클램프했다."""
+    h, w = frame.shape[:2]
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+    x = max(0, min(x, w - tw))
+    y = max(th, min(y, h - 1))
+    cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness)
 
 
 class VisionNode(Node):
@@ -591,54 +610,58 @@ class VisionNode(Node):
         좌표가 서보 목표가 됨) 이후 추가됨. bbox가 맞게 잡히는지뿐 아니라 좌표 계산
         결과가 말이 되는 값인지(카메라 근처 등 이상값이 아닌지)를 rqt_image_view만 보고도
         바로 판단할 수 있게 하기 위함이다."""
-        # 폰트 스케일 주의: 실제 스트림이 424x240(launch 설정)이라 0.5는 글자가 화면을
-        # 덮고 서로 겹친다(2026-07-08 실기 확인) - 0.35로 축소하고, base 좌표는 bbox
-        # 라벨들과 안 겹치게 화면 하단에 배치한다.
+        # 실제 스트림이 424x240(launch 설정)이라 원본 그대로 그리면 화질이 낮고, 특히
+        # 근접 촬영 시(bbox가 화면을 꽉 채움) 글자가 서로 겹치거나 화면 밖으로 잘려
+        # 읽기 어렵다(2026-07-08/2026-07-10 실기 확인) - 검출 좌표는 원본 기준으로 계산된
+        # 값이라 여기서 _DEBUG_IMAGE_UPSCALE배로 스케일해 그리고, 텍스트는 전부
+        # _put_text_clamped로 화면 경계 안에 들어오게 한다.
+        u = _DEBUG_IMAGE_UPSCALE
         frame = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8').copy()
+        frame = cv2.resize(frame, None, fx=u, fy=u, interpolation=cv2.INTER_LINEAR)
         for d in detections:
             color = _class_color(d.class_name)
             is_target = chosen_det is not None and d is chosen_det
             thickness = 3 if is_target else 1
-            cv2.rectangle(frame, (d.x1, d.y1), (d.x2, d.y2), color, thickness)
-            cv2.putText(frame, f'{d.class_name} {d.score * 100:.0f}%', (d.x1, max(d.y1 - 4, 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1)
+            cv2.rectangle(frame, (d.x1 * u, d.y1 * u), (d.x2 * u, d.y2 * u), color, thickness)
+            _put_text_clamped(frame, f'{d.class_name} {d.score * 100:.0f}%',
+                               d.x1 * u, max(d.y1 * u - 4, 10), color)
 
         if axis_debug is not None and 'kpts' in axis_debug:
             # keypoint 경로: 끝점 2개(p0 빨강/p1 파랑)와 그 축선을 그대로 그린다
             (p0x, p0y), (p1x, p1y) = axis_debug['kpts']
-            p0 = (int(p0x), int(p0y))
-            p1 = (int(p1x), int(p1y))
+            p0 = (int(p0x * u), int(p0y * u))
+            p1 = (int(p1x * u), int(p1y * u))
             cv2.line(frame, p0, p1, (255, 255, 255), 1)
             cv2.circle(frame, p0, 3, (0, 0, 255), -1)
             cv2.circle(frame, p1, 3, (255, 0, 0), -1)
-            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
-                        (min(p0[0], p1[0]), min(frame.shape[0] - 16, max(p0[1], p1[1]) + 24)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            _put_text_clamped(
+                frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
+                min(p0[0], p1[0]), max(p0[1], p1[1]) + 24, (255, 255, 255))
         elif axis_debug is not None and axis_debug.get('held'):
             # 단일 kpt hold 경로: 그릴 기하가 없어 유지 중인 각도만 텍스트로 표시
-            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f} (hold)",
-                        (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            _put_text_clamped(
+                frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f} (hold)",
+                6, 16, (255, 255, 255))
         elif axis_debug is not None:
             ox, oy = axis_debug['origin']
             rect = axis_debug['rect']
             (rcx, rcy), (rw, rh), _ = rect
-            box_pts = (cv2.boxPoints(rect) + np.array([ox, oy], dtype=np.float32)).astype(np.int32)
+            box_pts = (u * (cv2.boxPoints(rect) + np.array([ox, oy], dtype=np.float32))).astype(np.int32)
             cv2.polylines(frame, [box_pts], True, (255, 255, 255), 1)
             theta = np.deg2rad(axis_debug['axis_deg'])
             half_len = max(rw, rh) / 2
-            gcx, gcy = int(rcx) + ox, int(rcy) + oy
-            dx, dy = int(half_len * np.cos(theta)), int(half_len * np.sin(theta))
+            gcx, gcy = (int(rcx) + ox) * u, (int(rcy) + oy) * u
+            dx, dy = int(half_len * u * np.cos(theta)), int(half_len * u * np.sin(theta))
             cv2.line(frame, (gcx - dx, gcy - dy), (gcx + dx, gcy + dy), (255, 255, 255), 1)
             # bbox 위 라벨(클래스명)과 겹치지 않게 회전사각형 하단에 표시
-            cv2.putText(frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
-                        (ox, min(oy + int(rh) + 24, frame.shape[0] - 16)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+            _put_text_clamped(
+                frame, f"axis {axis_debug['axis_deg']:.0f} grip {axis_debug['grip_deg']:.0f}",
+                ox * u, (oy + int(rh)) * u + 24, (255, 255, 255))
 
         if position is not None:
             x_mm, y_mm, z_mm = position[0] * 1000.0, position[1] * 1000.0, position[2] * 1000.0
             text = f'base xyz=({x_mm:.0f},{y_mm:.0f},{z_mm:.0f})mm depth_valid={bool(depth_valid)}'
-            cv2.putText(frame, text, (6, frame.shape[0] - 6),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+            _put_text_clamped(frame, text, 6, frame.shape[0] - 6, (0, 255, 0))
 
         ok, buf = cv2.imencode('.jpg', frame)
         if not ok:

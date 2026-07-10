@@ -96,9 +96,17 @@ class ToolTracker:
     # 거의 불변이므로 낮게 잡아 노이즈를 누른다.
     OFFSET_EMA_ALPHA = 0.3
 
-    def __init__(self, alpha=0.6, beta=0.3):
-        self.alpha = alpha   # 위치 스무딩 계수
+    def __init__(self, alpha=0.6, beta=0.3, alpha_z=None):
+        # x,y는 검출 좌표 자체가 이미 안정적이라 EMA를 적용하지 않는다(raw 그대로
+        # 사용, 2026-07-10) - 스무딩하면 접근 중 지연만 생긴다. alpha는 이제 xy에는
+        # 안 쓰이고 alpha_z 기본값 산출(미지정 시 하위 호환)에만 남는다.
+        self.alpha = alpha
         self.beta = beta     # 속도 스무딩 계수
+        # z(depth) 전용 스무딩 계수. RealSense 스테레오 depth는 정지 물체에서도
+        # 프레임간 temporal jitter가 본질적으로 있어(패치 median은 "한 프레임 내" 공간
+        # 이상치만 걸러줄 뿐 이 프레임간 흔들림엔 무력하다) z만 EMA로 누른다.
+        # 지정 없으면 alpha와 동일(과거 동작과 호환).
+        self.alpha_z = alpha if alpha_z is None else alpha_z
         self.position = None       # 마지막 추정 위치 (x, y, z) base_link
         self.velocity = (0.0, 0.0)
         self.last_valid_z = None   # depth_valid=False일 때 유지할 마지막 z
@@ -196,7 +204,7 @@ class ToolTracker:
         return position, velocity, depth_valid, chosen_det
 
     def _filter_update(self, x, y, z, depth_valid, stamp):
-        """알파-베타 필터 한 스텝: 위치는 alpha로, 속도는 beta로 각각 스무딩."""
+        """알파-베타 필터 한 스텝: x,y는 raw 그대로, z는 alpha_z로, 속도는 beta로 스무딩."""
         if self.position is None or self.last_time is None:
             # 첫 프레임은 스무딩할 이전 값이 없으니 그대로 채택, 속도는 0
             self.position = (x, y, z)
@@ -208,12 +216,13 @@ class ToolTracker:
         raw_vx = (x - self.position[0]) / dt
         raw_vy = (y - self.position[1]) / dt
 
-        smoothed_x = self.position[0] + self.alpha * (x - self.position[0])
-        smoothed_y = self.position[1] + self.alpha * (y - self.position[1])
+        smoothed_x = x
+        smoothed_y = y
+        smoothed_z = self.position[2] + self.alpha_z * (z - self.position[2])
         vx = self.velocity[0] + self.beta * (raw_vx - self.velocity[0])
         vy = self.velocity[1] + self.beta * (raw_vy - self.velocity[1])
 
-        self.position = (smoothed_x, smoothed_y, z)
+        self.position = (smoothed_x, smoothed_y, smoothed_z)
         self.velocity = (vx, vy)
         self.last_time = stamp
         return self.position, self.velocity, depth_valid
