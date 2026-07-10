@@ -3,4 +3,10 @@
 # robot_control_node가 정상적으로 기동된다 (지연 임포트 - RG2Client._ensure_connected,
 # RobotControlNode._pose_stamped_to_posx 참고).
 scipy      # move_pose 자세(quaternion) -> Doosan movel 입력(ZYZ Euler) 변환에 사용
-pymodbus   # OnRobot RG2 그리퍼를 Modbus TCP(Tool Changer)로 제어하는 데 사용
+# OnRobot RG2 그리퍼를 Modbus TCP(Tool Changer)로 제어하는 데 사용. 버전을 일부러
+# 고정하지 않는다 - 2.x(unit=)/3.0~3.11(slave=)/3.12+(device_id=)가 서로 import
+# 경로와 키워드 인자 이름을 하위호환 없이 바꿔왔는데, rg2_client.py가 설치된
+# 버전을 런타임에 감지해서 맞춰 쓰므로(_import_modbus_tcp_client/
+# _resolve_modbus_id_kwarg 참고) 팀원마다 pip이 다른 시점에 설치해 버전이
+# 달라도(Humble/Jazzy 무관) 그대로 동작한다.
+pymodbus

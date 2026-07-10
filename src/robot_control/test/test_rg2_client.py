@@ -44,13 +44,13 @@ class _FakeModbusClient:
     def connect(self):
         return self.connect_ok
 
-    def write_registers(self, address, values, unit):
-        self.write_calls.append((address, values, unit))
+    def write_registers(self, address, values, slave):
+        self.write_calls.append((address, values, slave))
         if self.write_raises:
             raise RuntimeError('modbus 통신 오류 (simulated write)')
         return _FakeResponse(is_error=self.write_is_error)
 
-    def read_holding_registers(self, address, count, unit):
+    def read_holding_registers(self, address, count, slave):
         if address == 268:
             self._read_268_count += 1
             if (self.read_raises_after is not None
@@ -71,8 +71,28 @@ class _FakeModbusClient:
         return _FakeResponse(registers=[0])
 
 
+class _FakeModbusClientDeviceId(_FakeModbusClient):
+    """pymodbus 3.12+ 스타일(slave= 대신 device_id=)을 흉내낸다."""
+
+    def write_registers(self, address, values, device_id):
+        return super().write_registers(address, values, device_id)
+
+    def read_holding_registers(self, address, count, device_id):
+        return super().read_holding_registers(address, count, device_id)
+
+
+class _FakeModbusClientUnit(_FakeModbusClient):
+    """pymodbus 2.x 스타일(slave= 대신 unit=)을 흉내낸다."""
+
+    def write_registers(self, address, values, unit):
+        return super().write_registers(address, values, unit)
+
+    def read_holding_registers(self, address, count, unit):
+        return super().read_holding_registers(address, count, unit)
+
+
 def _install_fake(monkeypatch, fake):
-    monkeypatch.setattr('pymodbus.client.sync.ModbusTcpClient', lambda *a, **kw: fake)
+    monkeypatch.setattr('pymodbus.client.ModbusTcpClient', lambda *a, **kw: fake)
     return fake
 
 
@@ -87,6 +107,55 @@ class _FakeGoalHandle:
         if self.cancel_after is None:
             return False
         return self._calls >= self.cancel_after
+
+
+# ---- pymodbus 버전별 unit/slave/device_id 키워드 인자 호환성 ----
+# (2026-07-10: 팀원마다 설치된 pymodbus 버전이 달라 unit=/slave=/device_id=
+# 중 하나만 하드코딩하면 다른 버전에서는 깨진다 - 실제 설치된 클라이언트의
+# 시그니처를 보고 골라 쓰는 _resolve_modbus_id_kwarg를 검증한다.)
+
+def test_resolve_modbus_id_kwarg_prefers_device_id_then_slave_then_unit():
+    from robot_control.rg2_client import _resolve_modbus_id_kwarg
+
+    assert _resolve_modbus_id_kwarg(_FakeModbusClientDeviceId()) == 'device_id'
+    assert _resolve_modbus_id_kwarg(_FakeModbusClient()) == 'slave'
+    assert _resolve_modbus_id_kwarg(_FakeModbusClientUnit()) == 'unit'
+
+
+def test_resolve_modbus_id_kwarg_falls_back_to_device_id_for_unknown_signature():
+    from robot_control.rg2_client import _resolve_modbus_id_kwarg
+
+    class _UnknownFutureClient:
+        def read_holding_registers(self, address, count, some_new_kwarg_name):
+            pass
+
+    assert _resolve_modbus_id_kwarg(_UnknownFutureClient()) == 'device_id'
+
+
+def test_close_and_get_state_work_with_pymodbus_3_12_plus_device_id_api(monkeypatch):
+    """pymodbus 3.12+에서 slave=가 device_id=로 완전히 교체된 상황을 흉내내
+    RG2Client가 여전히 정상 동작하는지 확인한다."""
+    _install_fake(monkeypatch, _FakeModbusClientDeviceId())
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True)
+    result = client.close(width_mm=30.0, force_n=20.0)
+
+    assert result is True
+    assert client.last_status == RG2Status.SUCCESS
+    width_mm, grip_detected = client.get_state()
+    assert width_mm == 30.0
+    assert grip_detected is True
+
+
+def test_close_and_get_state_work_with_legacy_pymodbus_unit_api(monkeypatch):
+    """pymodbus 2.x 스타일(unit=)에서도 정상 동작하는지 확인한다."""
+    _install_fake(monkeypatch, _FakeModbusClientUnit())
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True)
+    result = client.close(width_mm=30.0, force_n=20.0)
+
+    assert result is True
+    assert client.last_status == RG2Status.SUCCESS
 
 
 # ---- dry-run ----
@@ -358,8 +427,8 @@ def test_close_reports_fault_when_stop_fails_after_cancel(monkeypatch):
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
     class _StopFailingClient(_FakeModbusClient):
-        def write_registers(self, address, values, unit):
-            self.write_calls.append((address, values, unit))
+        def write_registers(self, address, values, slave):
+            self.write_calls.append((address, values, slave))
             if values[2] == RG2Client._CMD_STOP:
                 raise RuntimeError('stop 쓰기 실패 (simulated)')
             return _FakeResponse(is_error=False)
@@ -520,7 +589,7 @@ def test_close_without_retry_configured_fails_immediately(monkeypatch):
 
 def test_get_state_returns_safe_default_when_read_raises(monkeypatch):
     class _RaisingClient(_FakeModbusClient):
-        def read_holding_registers(self, address, count, unit):
+        def read_holding_registers(self, address, count, slave):
             raise RuntimeError('modbus 통신 오류 (simulated)')
 
     _install_fake(monkeypatch, _RaisingClient())

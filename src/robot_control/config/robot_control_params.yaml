@@ -54,7 +54,7 @@
       v_max: 0.25               # 수평 속도 상한(m/s), 
       descend_speed: 0.10       # 하강 속도(m/s)
       eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
-      eps_grasp: 0.01          # 폐합 판정 수평 오차 임계(m)
+      eps_grasp: 1.0         # 폐합 판정 수평 오차 임계(m)
       n_stable: 1              # 폐합 판정에 필요한 연속 안정 주기 수, 일단 끈 상태(1)
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
       timeout: 5.0              # 서보 전체 타임아웃(s)
@@ -84,6 +84,15 @@
       future_poll_interval_s: 0.01            # _wait_for_future 내부 폴링 간격
       future_wait_timeout_s: 2.0              # 대부분의 서비스 응답 대기
       compliance_future_wait_timeout_s: 3.0   # task/release_compliance_ctrl 응답 대기
+      # dsr_controller2가 서비스/토픽 이름 앞에 붙이는 세그먼트. robot_id
+      # 네임스페이스(/dsr01) 바로 다음, motion/system/aux_control/force 등
+      # 나머지 경로 앞에 들어간다(예: /dsr01/dsr_controller2/motion/move_joint).
+      # 팀 대부분이 쓰는 doosan-robot2 버전은 이 세그먼트가 없어(빈 문자열이
+      # 기본값) 여기서는 건드리지 않는다 - 2026-03-06 이후의 새 포크를 쓰는
+      # 사람은 이 공유 파일 대신 개인 local_params_file에서
+      # controller_name: 'dsr_controller2'로 오버라이드한다
+      # (robot_control.launch.py의 local_params_file 인자 참고).
+      controller_name: ''
 
     move:
       vel_deg_s: 30.0    # movej 관절 속도(deg/s)

@@ -201,6 +201,15 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('doosan_driver.future_poll_interval_s', 0.01)
         self.declare_parameter('doosan_driver.future_wait_timeout_s', 2.0)
         self.declare_parameter('doosan_driver.compliance_future_wait_timeout_s', 3.0)
+        # doosan-robot2 릴리스마다 dsr_controller2가 서비스/토픽 이름 앞에 자기
+        # 노드 이름을 붙이는지가 달라졌다(2026-03-06 커밋부터 붙임) - robot_id
+        # 네임스페이스와 실제 드라이버 사이에 들어가는 이 세그먼트를 파라미터로
+        # 빼서, 팀원이 쓰는 doosan-robot2 포크/버전에 맞게 launch에서 바꿀 수 있게
+        # 한다. 기본값은 팀 대부분이 쓰는 옛 버전(세그먼트 없음) 기준 - 2026-03-06
+        # 이후의 새 포크(예: 이 개발 머신의 ~/cobot_ws)를 쓰는 사람만 개인
+        # local_params_file(robot_control.launch.py 참고)에서 'dsr_controller2'로
+        # 오버라이드한다.
+        self.declare_parameter('doosan_driver.controller_name', '')
 
         # servo_pick 실제 하드웨어 실행을 위한 별도 게이트. hardware_enabled=true여도
         # 이 값이 false면 servo_pick Goal 자체를 거부한다 (기본값 false).
@@ -360,6 +369,10 @@ class RobotControlNode(Node, TaskExecutor):
         # servo_pick 또는 handover_approach가 실제로 실행 중일 때만 TCP 위치를
         # 캐시에 반영한다 - 불필요한 상태 갱신을 피하기 위함이다.
         self._tcp_tracking_active = False
+        # servo_pick이 RG2 close를 백그라운드 스레드로 돌리는 동안 쓰는 상태
+        # (task_executor._servo_pick_tick/_execute_servo_pick 참고).
+        self._servo_pick_close_thread = None
+        self._servo_pick_close_success = None
         self._gripper_timer = self.create_timer(
             self.get_parameter('gripper_poll_period_s').value,
             self._on_gripper_timer, callback_group=self.sensor_callback_group)

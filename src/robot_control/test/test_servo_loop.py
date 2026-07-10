@@ -131,6 +131,23 @@ def test_should_close_requires_stable_error_and_z_gap_and_low_covariance():
     assert loop.get_state() == ServoState.CLOSING
 
 
+def test_grasp_locked_keeps_vz_zero_and_xy_tracking_after_should_close():
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2, cov_threshold=2.5)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
+    for _ in range(3):
+        loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop.should_close() is True
+
+    # 그리퍼가 닫히는 동안 z_gap이 다시 커져도(원래대로면 DESCENDING으로 되돌아가
+    # 재하강했을 상황) vz는 0으로 영구히 잠겨 있어야 하고, x,y는 계속 추적해야 한다.
+    cmd = loop.step((0.1, 0.1, 0.20, 0, 0, 0), time.monotonic())
+    assert cmd.vz == 0.0
+    assert loop.get_state() == ServoState.CLOSING
+    assert cmd.vx != 0.0 or cmd.vy != 0.0
+
+
 def test_should_close_blocked_by_high_velocity_covariance():
     loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2, cov_threshold=0.5)
     loop.start('spanner', 30.0, 20.0)
@@ -170,6 +187,25 @@ def test_vz_locks_to_zero_only_after_n_stable_z_consecutive_ticks():
     assert cmd.vz != 0.0  # 2번째 - 아직 안 멈춤
     cmd = loop.step(tcp_close, time.monotonic())
     assert cmd.vz == 0.0  # 3번째(n_stable_z) - 이제 멈춤
+
+
+def test_z_lock_persists_after_noisy_z_gap_reopens():
+    # n_stable_z에 한 번 도달해 vz=0으로 멈추면, 이후 depth 노이즈로 z_gap이 다시
+    # z_close 밖으로 벌어져 _z_stable_count가 리셋되더라도 재하강하지 않아야 한다.
+    loop = _make_loop(z_close=0.05, n_stable_z=3, eps_descend=0.5)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.5))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.5))
+    tcp_close = (0.0, 0.0, 0.48, 0, 0, 0)  # z_gap=0.02 < z_close(0.05)
+    tcp_far = (0.0, 0.0, 0.20, 0, 0, 0)    # z_gap=0.30 >= z_close(0.05), 노이즈로 재이탈
+    for _ in range(3):
+        cmd = loop.step(tcp_close, time.monotonic())
+    assert cmd.vz == 0.0
+    assert loop._z_locked is True
+
+    cmd = loop.step(tcp_far, time.monotonic())
+    assert loop._z_stable_count == 0  # 라이브 카운트는 리셋되지만
+    assert cmd.vz == 0.0              # 잠금 덕분에 재하강하지 않는다
 
 
 def test_should_abort_timeout():

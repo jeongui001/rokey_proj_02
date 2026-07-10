@@ -1,7 +1,34 @@
+import inspect
 import math
 import time
 
 from robot_control.safety_monitor import SafetyState
+
+
+def _import_modbus_tcp_client():
+    """pymodbus는 3.0에서 import 경로를 pymodbus.client.sync.ModbusTcpClient에서
+    pymodbus.client.ModbusTcpClient로 옮겼다. 팀원마다 설치된 pymodbus 버전이
+    다를 수 있어(일부는 2.x대가 남아있는 환경) 신버전 경로를 먼저 시도하고
+    실패하면 구버전 경로로 폴백한다."""
+    try:
+        from pymodbus.client import ModbusTcpClient
+    except ImportError:
+        from pymodbus.client.sync import ModbusTcpClient
+    return ModbusTcpClient
+
+
+def _resolve_modbus_id_kwarg(client) -> str:
+    """pymodbus는 버전마다 슬레이브/디바이스 ID를 넘기는 키워드 인자 이름이
+    하위호환 없이 완전히 바뀌어왔다: 2.x는 unit=, 3.0~3.11은 slave=, 3.12+는
+    device_id=. 팀원마다 pip이 설치해준 pymodbus 버전이 다를 수 있으므로(같은
+    Jazzy에서도 설치 시점에 따라 3.6대/3.13대가 섞여 있을 수 있음) 하드코딩 대신
+    실제 설치된 클라이언트 클래스의 시그니처를 보고 맞는 이름을 고른다."""
+    params = inspect.signature(type(client).read_holding_registers).parameters
+    for name in ('device_id', 'slave', 'unit'):
+        if name in params:
+            return name
+    # 세 이름 모두 없는 더 미래의 pymodbus 버전 - 최신 관례를 기본값으로 시도한다.
+    return 'device_id'
 
 
 class RG2Status:
@@ -18,6 +45,7 @@ class RG2Client:
 
     _CMD_STOP = 8
     _CMD_GRIP_W_OFFSET = 16
+    _TOOL_CHANGER_MODBUS_ID = 65  # OnRobot 툴체인저의 고정 Modbus 슬레이브/디바이스 ID
     MAX_WIDTH_MM = {'rg2': 110.0, 'rg6': 160.0}
     MAX_FORCE_N = {'rg2': 40.0, 'rg6': 120.0}
     _DEFAULT_COMMAND_TIMEOUT_S = 5.0
@@ -40,6 +68,7 @@ class RG2Client:
         self.gripper = gripper
         self._node = node
         self._client = None
+        self._modbus_id_kwarg = None  # _ensure_connected가 접속 시 감지해 채운다
         self._sim_width_mm = self.MAX_WIDTH_MM.get(gripper, 110.0)
         self._sim_grip_detected = False
         self.last_status = None
@@ -48,10 +77,14 @@ class RG2Client:
 
     def _ensure_connected(self):
         if self._client is None:
-            from pymodbus.client.sync import ModbusTcpClient
+            ModbusTcpClient = _import_modbus_tcp_client()
+            # stopbits/bytesize/parity/baudrate는 시리얼(RTU) 전용 파라미터라 Modbus
+            # TCP에는 애초에 의미가 없었다 - 예전 pymodbus는 **kwargs로 조용히
+            # 무시했지만, 3.12+는 ModbusTcpClient.__init__에서 **kwargs 자체를
+            # 없애 명시하지 않은 키워드 인자를 주면 TypeError가 난다.
             self._client = ModbusTcpClient(
-                self.ip, port=self.port, stopbits=1, bytesize=8, parity='E',
-                baudrate=115200, timeout=self._connect_timeout_s())
+                self.ip, port=self.port, timeout=self._connect_timeout_s())
+            self._modbus_id_kwarg = _resolve_modbus_id_kwarg(self._client)
         try:
             if not self._client.connect():
                 self._log_comm_failure('connect', detail='connect()가 False를 반환')
@@ -144,12 +177,15 @@ class RG2Client:
             or (hasattr(response, 'isError') and response.isError())
         )
 
+    def _id_kwargs(self) -> dict:
+        return {self._modbus_id_kwarg: self._TOOL_CHANGER_MODBUS_ID}
+
     def _read_busy_bit(self):
         try:
             client = self._ensure_connected()
             if client is None:
                 return None
-            response = client.read_holding_registers(address=268, count=1, unit=65)
+            response = client.read_holding_registers(address=268, count=1, **self._id_kwargs())
             if self._response_failed(response):
                 self._log_comm_failure('read_busy_bit', response=response)
                 self._reset_connection()
@@ -166,8 +202,8 @@ class RG2Client:
             client = self._ensure_connected()
             if client is None:
                 return None
-            width_response = client.read_holding_registers(address=267, count=1, unit=65)
-            status_response = client.read_holding_registers(address=268, count=1, unit=65)
+            width_response = client.read_holding_registers(address=267, count=1, **self._id_kwargs())
+            status_response = client.read_holding_registers(address=268, count=1, **self._id_kwargs())
             if self._response_failed(width_response) or self._response_failed(status_response):
                 self._log_comm_failure(
                     'read_final_state',
@@ -212,7 +248,7 @@ class RG2Client:
             return False
         try:
             response = client.write_registers(
-                address=0, values=[0, 0, self._CMD_STOP], unit=65)
+                address=0, values=[0, 0, self._CMD_STOP], **self._id_kwargs())
         except Exception as exc:
             self._log_comm_failure('send_stop', exc=exc)
             self._reset_connection()
@@ -249,7 +285,7 @@ class RG2Client:
         if client is None:
             return RG2Status.COMMUNICATION_ERROR
         try:
-            response = client.write_registers(address=0, values=values, unit=65)
+            response = client.write_registers(address=0, values=values, **self._id_kwargs())
         except Exception as exc:
             self._log_comm_failure('write_command', exc=exc)
             self._reset_connection()

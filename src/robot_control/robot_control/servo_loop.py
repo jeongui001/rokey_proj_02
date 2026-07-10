@@ -96,6 +96,8 @@ class ServoLoop:
         self._z_stable_count = 0         # z_close 이내로 연속 몇 주기째인지
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
+        self._grasp_locked = False       # should_close() 만족 이후 z를 영구 고정할지
+        self._z_locked = False           # z_stable_count가 n_stable_z 도달 이후 z를 영구 고정할지
         self._last_e_xy_norm = None      # DEBUG_LOG: 최근 xy 오차(m)
         self._last_command = ServoCommand()  # DEBUG_LOG: 최근 속도 명령
         self._last_innovation_xy = None  # DEBUG_LOG: 최근 Kalman innovation(m)
@@ -119,6 +121,8 @@ class ServoLoop:
         self._z_stable_count = 0
         self._error_history = []
         self._last_z_gap = None
+        self._grasp_locked = False
+        self._z_locked = False
         self._last_e_xy_norm = None
         self._last_command = ServoCommand()
         self._last_innovation_xy = None
@@ -220,7 +224,17 @@ class ServoLoop:
         # 무관하게 즉시 vz를 0으로 고정한다 - descend_speed는 비례 제어가 아니라 상수
         # 속도라서 should_close()의 복합 조건(폐합 가능 여부)이 늦게 만족돼도 목표 z를
         # 지나쳐 계속 하강하면 안 되기 때문이다.
+        # _z_stable_count가 n_stable_z에 한 번 도달하면(_z_locked) 이후 z_gap이 노이즈로
+        # 다시 벌어지더라도 재하강하지 않도록 영구히 고정한다. should_close()가 한 번이라도
+        # True가 된 뒤(_grasp_locked)에는 그리퍼가 실제로 닫히는 동안에도 xy 추적은 계속하되,
+        # z는 마찬가지로 절대 재하강하지 않도록 영구히 고정한다 - 그렇지 않으면 그리퍼 폐합
+        # 도중 depth 노이즈 등으로 z_gap이 잠시 벌어졌을 때 DESCENDING으로 되돌아가 이미
+        # 폐합 판정을 마친 물체를 다시 밀고 내려가게 된다.
         if self._z_stable_count >= self.n_stable_z:
+            self._z_locked = True
+        if self._grasp_locked:
+            vz = 0.0
+        elif self._z_locked:
             self._state = ServoState.TRACKING
             vz = 0.0
         elif e_xy_norm < self.eps_descend:
@@ -253,6 +267,7 @@ class ServoLoop:
         if self._filter.velocity_covariance_trace >= self.cov_threshold:
             return False
         self._state = ServoState.CLOSING
+        self._grasp_locked = True
         return True
 
     def should_abort(self):

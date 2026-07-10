@@ -53,6 +53,11 @@ def _parse_args(argv=None):
             'speedl_stream(비-RT) 서보잉 실현가능성 실측 검증 도구 - '
             '실제 로봇이 움직입니다.'))
     parser.add_argument('--robot-id', default='dsr01')
+    # dsr_controller2가 토픽 이름 앞에 자기 노드 이름을 붙이는지는 doosan-robot2
+    # 릴리스에 따라 다르다(robot_control_node의 doosan_driver.controller_name과
+    # 동일한 이유). 기본값은 팀 대부분이 쓰는 옛 버전(세그먼트 없음) 기준이므로
+    # 2026-03-06 이후의 새 포크를 쓰면 --controller-name dsr_controller2로 넘긴다.
+    parser.add_argument('--controller-name', default='')
     parser.add_argument('--axis', default='x', choices=list(AXIS_INDEX))
     parser.add_argument('--vel-mm-s', type=float, default=20.0)
     parser.add_argument('--acc-trans-mm-s2', type=float, default=100.0)
@@ -207,7 +212,9 @@ def main(argv=None):
 
     rclpy.init(args=None)
     node = rclpy.create_node('probe_speedl_stream')
-    pub = node.create_publisher(SpeedlStream, f'/{args.robot_id}/speedl_stream', 10)
+    prefix = (f'/{args.robot_id}/{args.controller_name}'
+              if args.controller_name else f'/{args.robot_id}')
+    pub = node.create_publisher(SpeedlStream, f'{prefix}/speedl_stream', 10)
     rg2_client = RG2Client(
         ip=args.rg2_ip, port=args.rg2_port, hardware_enabled=True,
         gripper=args.rg2_gripper, node=None)

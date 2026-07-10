@@ -1130,6 +1130,69 @@ def test_servo_pick_tick_abort(node):
     assert reason == 'diverged'
 
 
+def test_grasp_lock_keeps_tracking_while_gripper_closes_then_closes_once_done(node):
+    """RG2 close()가 그리퍼가 실제로 멈출 때까지 블로킹하는 동안에도, 그 완료를
+    기다리는 매 틱마다 'CONTINUE'를 반환해 x,y 시각 서보 추적(step 호출)이 멈추지
+    않아야 하고, 그리퍼가 완전히 닫힌 뒤에야 'CLOSE'를 반환해야 한다."""
+    import threading
+
+    close_started = threading.Event()
+    close_release = threading.Event()
+
+    def _fake_close(width, force, goal_handle=None):
+        close_started.set()
+        assert close_release.wait(timeout=2.0), 'close_release가 제때 set되지 않았습니다'
+        return True
+
+    node.rg2_client.close = _fake_close
+    node.servo_loop.should_abort = lambda: None
+    node.servo_loop.should_close = lambda: True
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    request = gh.request
+    request.grasp_width_mm = 30.0
+    request.grasp_force_n = 20.0
+    node._servo_pick_close_thread = None
+    node._servo_pick_close_success = None
+
+    status, reason = node._servo_pick_tick_with_grasp_lock(gh, request)
+    assert status == 'CONTINUE'  # close 스레드를 시작만 하고 루프는 계속돼야 한다
+    assert close_started.wait(timeout=2.0) is True
+
+    # 그리퍼가 여전히 닫히는 중(close_release 대기 중)이면 계속 추적을 유지해야 한다.
+    for _ in range(3):
+        status, reason = node._servo_pick_tick_with_grasp_lock(gh, request)
+        assert status == 'CONTINUE'
+
+    close_release.set()
+    node._servo_pick_close_thread.join(timeout=2.0)
+
+    status, reason = node._servo_pick_tick_with_grasp_lock(gh, request)
+    assert status == 'CLOSE'  # 그리퍼 폐합이 끝난 뒤에야 종료 신호를 보낸다
+    assert node._servo_pick_close_success is True
+
+
+def test_grasp_lock_defers_close_when_cancel_requested_right_at_close(node):
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    request = gh.request
+    request.grasp_width_mm = 30.0
+    request.grasp_force_n = 20.0
+    node._servo_pick_close_thread = None
+    node._servo_pick_close_success = None
+
+    node.servo_loop.should_abort = lambda: None
+    node.servo_loop.should_close = lambda: True
+    closed = []
+    node.rg2_client.close = lambda width, force, goal_handle=None: closed.append(True)
+    gh.is_cancel_requested = True
+
+    status, reason = node._servo_pick_tick_with_grasp_lock(gh, request)
+
+    assert status == 'CONTINUE'  # 취소 요청이 있으면 그리퍼를 닫기 시작하지 않는다
+    assert closed == []
+    assert node._servo_pick_close_thread is None
+
+
 def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
@@ -1154,7 +1217,9 @@ def test_execute_servo_pick_success_closes_gripper_and_returns_result(node, monk
     assert result.success is True
     assert result.final_width_mm == 29.4
     assert result.grip_detected is True
-    assert len(gh.feedback_msgs) == 3
+    # should_close 감지 이후 RG2 close 완료를 확인하기까지 최소 한 틱이 더 필요하므로
+    # (그 사이에도 x,y 추적을 계속하기 위함) 정확히 3회가 아니라 최소 3회 이상이다.
+    assert len(gh.feedback_msgs) >= 3
 
 
 def test_servo_pick_rg2_canceled_during_close_ends_as_canceled_not_fault(node, monkeypatch):
@@ -1537,7 +1602,10 @@ def test_servo_pick_publishes_speedl_only_when_hardware_ready(node, monkeypatch)
     result = node._execute_servo_pick(gh)
 
     assert result.success is True
-    assert len(fake.publish_calls) == 1
+    # should_close 감지(CLOSE) 이후에도 RG2 close 완료가 확인될 때까지 x,y 추적이
+    # 계속되며 speedl을 계속 발행하므로(그 사이 최소 한 번 더 publish), 정확히
+    # 1회가 아니라 최소 1회 이상이다.
+    assert len(fake.publish_calls) >= 1
 
 
 # ---- handover_hold ----
@@ -2654,10 +2722,29 @@ class _FakeRg2Client:
         return (20.0, True)
 
 
+def _fake_run_rt_tracking_with_close(node):
+    """_run_rt_tracking을 통째로 우회하는 체크포인트 테스트용 스텁.
+
+    실제로는 RG2 close가 _servo_pick_tick_with_grasp_lock을 통해 백그라운드
+    스레드로 트래킹 루프 "안에서" 실행되므로, 여기서도 그 스레드가 이미 끝난
+    것처럼 동일하게 흉내낸다 - 그래야 _execute_servo_pick의 이후 로직(join,
+    _servo_pick_close_success 확인, checkpoint 발행)이 실제 경로와 같게 동작한다."""
+    import threading
+
+    def _fake(goal_handle, **kw):
+        node._run_servo_pick_close(goal_handle, goal_handle.request)
+        thread = threading.Thread(target=lambda: None)
+        thread.start()
+        thread.join()
+        node._servo_pick_close_thread = thread
+        return ('ARRIVED', '')
+    return _fake
+
+
 def test_servo_pick_close_success_publishes_gripper_closed_pass(node, monkeypatch):
     node.rg2_client = _FakeRg2Client(close_ok=True)
     monkeypatch.setattr(
-        node, '_run_rt_tracking', lambda goal_handle, **kw: ('ARRIVED', ''))
+        node, '_run_rt_tracking', _fake_run_rt_tracking_with_close(node))
     published = []
     node.pub_debug_events.publish = published.append
     goal_handle = FakeGoalHandle(_goal('servo_pick'))
@@ -2677,7 +2764,7 @@ def test_servo_pick_close_success_publishes_gripper_closed_pass(node, monkeypatc
 def test_servo_pick_close_failure_publishes_gripper_closed_fail(node, monkeypatch):
     node.rg2_client = _FakeRg2Client(close_ok=False)
     monkeypatch.setattr(
-        node, '_run_rt_tracking', lambda goal_handle, **kw: ('ARRIVED', ''))
+        node, '_run_rt_tracking', _fake_run_rt_tracking_with_close(node))
     published = []
     node.pub_debug_events.publish = published.append
     goal_handle = FakeGoalHandle(_goal('servo_pick'))

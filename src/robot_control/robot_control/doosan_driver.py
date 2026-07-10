@@ -43,7 +43,13 @@ class DoosanDriver:
         self._ReleaseComplianceCtrl = ReleaseComplianceCtrl
         self._SpeedlStream = SpeedlStream
 
-        prefix = f"/{node.get_parameter('robot_id').value}"
+        # dsr_controller2는 자기 노드 이름을 서비스/토픽 이름 접두어로 쓴다
+        # (doosan-robot2 dsr_controller2.cpp의 svc_prefix_ = get_node()->get_name() + "/").
+        # 2026-03-06 이후 릴리스부터 이 세그먼트가 붙기 시작했으므로 파라미터로
+        # 빼서 doosan-robot2 버전이 다른 팀원도 launch에서 바꿔 쓸 수 있게 한다.
+        robot_id = node.get_parameter('robot_id').value
+        controller_name = node.get_parameter('doosan_driver.controller_name').value
+        prefix = f"/{robot_id}/{controller_name}" if controller_name else f"/{robot_id}"
         group = node.hardware_callback_group
         self._cli_move_joint = node.create_client(
             MoveJoint, f'{prefix}/motion/move_joint', callback_group=group)

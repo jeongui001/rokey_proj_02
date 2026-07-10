@@ -1,1 +1,9 @@
+# numpy<2 고정: 시스템 apt scipy/cv2(cv_bridge가 쓰는 것과 동일)가 numpy 1.x ABI로
+# 빌드돼 있어, pip이 ultralytics 의존성 해결 중 numpy 2.x나 numpy>=2를 요구하는
+# opencv-python/opencv-contrib-python을 같이 끌어오면 그 자리에서 깨진다
+# (2026-07-10 실측: robot_control/stt_node의 scipy import가 바로 ImportError).
+# ultralytics/mediapipe는 cv_bridge와 같은 apt cv2를 그대로 쓰면 되므로
+# opencv-python/opencv-contrib-python은 별도로 설치하지 않는다.
+numpy<2
 mediapipe
+ultralytics   # tool_detection_node의 YOLO 공구 탐지

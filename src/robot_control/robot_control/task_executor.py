@@ -1,4 +1,5 @@
 import math
+import threading
 import time
 
 import rclpy
@@ -275,6 +276,43 @@ class TaskExecutor:
             return ('CLOSE', None)
         return ('CONTINUE', None)
 
+    def _servo_pick_tick_with_grasp_lock(self, goal_handle, request):
+        """_servo_pick_tick()을 감싸 그리퍼 폐합을 x,y 추적과 병행시킨다.
+
+        _servo_pick_tick()이 처음 'CLOSE'를 반환하는 순간에도 루프를 바로 끝내지
+        않는다 - 대신 RG2 close()를 백그라운드 스레드로 시작만 해두고 'CONTINUE'를
+        반환해 step()이 계속 돌게 한다. 그러면 그리퍼가 실제로 폐합되는 동안에도
+        x,y 시각 서보 추적이 멈추지 않고(ServoLoop.step의 _grasp_locked로 z만 영구
+        고정), 로봇팔이 마지막 순간의 속도값을 관성처럼 유지한 채 멈춰있지 않는다.
+        스레드가 끝난 뒤에야 'CLOSE'를 반환해 루프를 종료한다.
+
+        그리퍼를 실제로 닫기 "직전"에 취소/안전상태를 한 번 더 확인한다(기존
+        _execute_servo_pick이 루프 종료 후 RG2 close 호출 전에 하던 것과 동일한
+        안전판) - 그리퍼 폐합은 물리적으로 되돌리기 어려우므로, 이미 취소/FAULT가
+        걸린 상태에서 새로 시작하지 않는다. 여기서 조용히 'CONTINUE'만 반환해도
+        _run_rt_tracking의 루프 최상단이 다음 tick에서 그 취소/FAULT를 바로
+        감지해 정상적으로 종료 경로를 타므로 따로 처리할 필요가 없다."""
+        if self._servo_pick_close_thread is not None:
+            if self._servo_pick_close_thread.is_alive():
+                return ('CONTINUE', None)
+            return ('CLOSE', None)
+        state, reason = self._servo_pick_tick()
+        if state != 'CLOSE':
+            return (state, reason)
+        if goal_handle.is_cancel_requested or self.safety_state != SafetyState.NORMAL:
+            return ('CONTINUE', None)
+        self._servo_pick_close_thread = threading.Thread(
+            target=self._run_servo_pick_close, args=(goal_handle, request), daemon=True)
+        self._servo_pick_close_thread.start()
+        return ('CONTINUE', None)
+
+    def _run_servo_pick_close(self, goal_handle, request):
+        """백그라운드 스레드에서 실행 - RG2Client.close()는 그리퍼가 완전히 멈출
+        때까지 블로킹하므로, 메인 RT 루프(_run_rt_tracking)가 그동안 x,y 추적을
+        계속할 수 있도록 별도 스레드로 뺐다."""
+        self._servo_pick_close_success = self.rg2_client.close(
+            request.grasp_width_mm, request.grasp_force_n, goal_handle=goal_handle)
+
     def _servo_pick_step(self):
         """칼만 ServoLoop.step(tcp_pose, now)에 필요한 현재 TCP 위치를 캐시에서
         읽어 넘긴다. 캐시가 아직 없거나 오래됐으면(_get_current_tcp_posx가 None을
@@ -497,6 +535,12 @@ class TaskExecutor:
         request = goal_handle.request
         self.servo_loop.start(
             request.tool_class, request.grasp_width_mm, request.grasp_force_n)
+        # should_close() 만족 시 _servo_pick_tick_with_grasp_lock이 여기 채워 넣는다
+        # (RG2 close를 백그라운드로 돌리는 동안에도 x,y 추적을 계속하기 위함 - 그
+        # 함수 독스트링 참고). 매 goal마다 새로 초기화해 이전 goal의 잔여 상태가
+        # 새지 않게 한다.
+        self._servo_pick_close_thread = None
+        self._servo_pick_close_success = None
         outcome, detail = self._run_rt_tracking(
             goal_handle,
             name='servo_pick',
@@ -505,26 +549,26 @@ class TaskExecutor:
             callback=self._on_tool_track_during_servo,
             servo=self.servo_loop,
             step=self._servo_pick_step,
-            tick=self._servo_pick_tick,
+            tick=lambda: self._servo_pick_tick_with_grasp_lock(goal_handle, request),
             validate_command=self._validate_servo_command,
             ready_parameter='servo_pick.hardware_ready',
             period_parameter='servo_pick.control_period_s',
             accel_param_prefix='servo_pick')
+        # _run_rt_tracking이 어떤 경로(정상 CLOSE/취소/중단/예외)로 빠져나왔든, RG2
+        # close 스레드가 떠 있는 채로 이 함수를 반환하면 안 되므로 항상 join한다.
+        # 스레드 내부의 rg2_client.close()도 goal_handle.is_cancel_requested/
+        # safety_state를 스스로 감시해 필요시 그리퍼에 stop을 보내고 끝나므로
+        # join이 무한정 걸리지는 않는다.
+        if self._servo_pick_close_thread is not None:
+            self._servo_pick_close_thread.join()
+
         if outcome != 'ARRIVED':
             return self._finish_tracking_result(goal_handle, outcome, detail)
 
-        if goal_handle.is_cancel_requested:
-            self._cleanup_stop_motion()
-            return self._finish_tracking_result(
-                goal_handle, 'CANCELED', 'servo_pick canceled before RG2 close')
-        if self.safety_state != SafetyState.NORMAL:
-            return self._finish_tracking_result(
-                goal_handle, 'ABORT',
-                f'servo_pick aborted - safety_state={self.safety_state}')
-
-        if not self.rg2_client.close(
-                request.grasp_width_mm, request.grasp_force_n,
-                goal_handle=goal_handle):
+        # 이 지점에 도달했다는 건 tick()이 'CLOSE'를 반환했다는 뜻 = RG2 close
+        # 스레드가 이미 완료됐다는 뜻이므로(위 join은 안전을 위한 재확인일 뿐),
+        # 별도로 close()를 다시 호출하지 않고 스레드가 남긴 결과를 그대로 쓴다.
+        if not self._servo_pick_close_success:
             if self.rg2_client.last_status == RG2Status.CANCELED:
                 self._cleanup_stop_motion()
                 return self._finish_tracking_result(
@@ -538,8 +582,8 @@ class TaskExecutor:
             'D', 'gripper_closed', 'PASS', '그리퍼가 정상적으로 닫혔습니다.',
             {'grasp_width_mm': request.grasp_width_mm, 'grasp_force_n': request.grasp_force_n})
         width_mm, grip_detected = self.rg2_client.get_state()
-        # 그리퍼 폐합이 끝난 뒤에도 servo_pick 마지막 vx/vy 명령이 남아있을 수 있으므로
-        # (vz는 step()에서 z 도착 시 이미 0으로 고정됨) 여기서 확실히 정지시킨다.
+        # 그리퍼가 완전히 닫히고 grip_detected를 확인한 지금에서야 x,y 추적도 함께
+        # 정지시킨다 (vz는 그리퍼가 닫히는 내내 _grasp_locked로 이미 0에 고정돼 있었다).
         self._cleanup_stop_motion()
         result = self._finish_tracking_result(goal_handle, 'ARRIVED', '')
         result.final_width_mm = width_mm

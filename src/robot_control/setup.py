@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/config', [
             'config/robot_control_params.yaml',
             'config/robot_control_calibration_params.yaml',
+            'config/robot_control_local_params.yaml',
         ]),
     ],
     install_requires=['setuptools'],

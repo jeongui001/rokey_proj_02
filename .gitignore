@@ -11,7 +11,7 @@ __pycache__/
 /dev/
 
 docs/superpowers/
-
+CLAUDE.md
 # OpenAI API 키 등 비밀값 - 커밋 금지
 .env
 

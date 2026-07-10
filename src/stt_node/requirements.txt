@@ -3,6 +3,8 @@ openwakeword     # 로컬/무료 웨이크워드 감지("헬로 로키", resourc
 pyaudio          # 웨이크워드 감지용 마이크 연속 스트림 캡처
 sounddevice      # 웨이크워드 감지 후 고정 구간 명령 녹음
 scipy            # WAV 저장(scipy.io.wavfile) + 리샘플링(48kHz -> 16kHz)
-numpy            # 오디오 버퍼 처리
+# numpy<2 고정: 시스템 apt scipy가 numpy 1.x ABI로 빌드돼 있어 numpy 2.x가 깔리면
+# 바로 ImportError가 난다(vision_node/requirements.txt 참고, 2026-07-10 실측).
+numpy<2          # 오디오 버퍼 처리
 openai           # 녹음된 명령을 텍스트로 변환(whisper-1 API)
 python-dotenv    # resource/.env에서 OPENAI_API_KEY 로드
