@@ -56,13 +56,15 @@ class ServoLoop:
                  timeout_s, t_lost_s,
                  innov_low=0.010, innov_high=0.040, w_alpha=0.3,
                  z_close=0.02, diverge_n=5, cov_threshold=0.05,
-                 q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0):
+                 q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
+                 eps_y_close=0.01):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
         self.descend_speed = descend_speed  # 하강 속도
         self.eps_descend = eps_descend   # 이 오차 이내여야 하강 시작
         self.eps_grasp = eps_grasp       # 폐합 판정 오차 임계
+        self.eps_y_close = eps_y_close   # 이 y오차 이내로 들어오면 vy를 0으로 래치
         self.n_stable = n_stable         # 폐합 판정에 필요한 연속 안정 주기 수
         # dt_latency에 2.3절의 "루프 반주기" 보정도 함께 흡수한다(1차 구현 단순화).
         self.dt_latency = dt_latency     # 지연 보상(lookahead) 시간
@@ -91,6 +93,7 @@ class ServoLoop:
         self._last_msg_time = None       # 마지막 ToolTrack을 "받은" 시각(monotonic) - t_lost 판정용
         self._start_time = None          # servo_pick 시작 시각(monotonic) - timeout 판정용
         self._stable_count = 0           # eps_grasp 이내로 연속 몇 주기째인지
+        self._y_locked = False           # 한 번 eps_y_close 이내로 들어오면 True로 래치
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
         self._last_e_xy_norm = None      # DEBUG_LOG: 최근 xy 오차(m)
@@ -113,6 +116,7 @@ class ServoLoop:
         self._last_msg_time = None
         self._start_time = time.monotonic()
         self._stable_count = 0
+        self._y_locked = False
         self._error_history = []
         self._last_z_gap = None
         self._last_e_xy_norm = None
@@ -193,9 +197,14 @@ class ServoLoop:
 
         self._last_z_gap = abs(tcp_z - p_ref[2])
 
+        # y는 고정 대상: 한 번 eps_y_close 이내로 들어오면 이후 오차가 다시 커져도
+        # vy를 계속 0으로 래치한다(재평가 안 함) - z_close와 달리 y는 복귀할 필요가 없음.
+        if not self._y_locked and abs(e_y) < self.eps_y_close:
+            self._y_locked = True
+
         # 핵심 제어식: v_cmd = w·v̂_tool + Kp·e (속도 피드포워드 + P 피드백)
         vx = self._w * v_tool[0] + self.kp_xy * e_x
-        vy = self._w * v_tool[1] + self.kp_xy * e_y
+        vy = 0.0 if self._y_locked else (self._w * v_tool[1] + self.kp_xy * e_y)
         speed = float(np.hypot(vx, vy))
         if speed > self.v_max:
             scale = self.v_max / speed
@@ -273,6 +282,7 @@ class ServoLoop:
             'innovation_xy_m': self._last_innovation_xy,
             'e_xy_norm_m': self._last_e_xy_norm,
             'stable_count': self._stable_count,
+            'y_locked': self._y_locked,
             'last_z_gap_m': self._last_z_gap,
             'velocity_covariance_trace': float(self._filter.velocity_covariance_trace),
             'error_history_m': [float(v) for v in self._error_history],

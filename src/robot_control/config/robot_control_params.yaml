@@ -55,6 +55,7 @@
       descend_speed: 0.10       # 하강 속도(m/s)
       eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
       eps_grasp: 0.005          # 폐합 판정 수평 오차 임계(m)
+      eps_y_close: 0.01         # 이 y오차(m) 이내로 들어오면 이후 vy를 계속 0으로 고정(래치), y는 재정렬하지 않음
       n_stable: 10              # 폐합 판정에 필요한 연속 안정 주기 수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~5.7개치)
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
       timeout: 5.0              # 서보 전체 타임아웃(s)

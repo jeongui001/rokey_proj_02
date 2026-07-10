@@ -160,3 +160,29 @@ def test_should_abort_none_when_healthy():
     loop.start('spanner', 30.0, 20.0)
     loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
     assert loop.should_abort() is None
+
+
+def test_vy_locks_to_zero_once_y_error_small():
+    loop = _make_loop(eps_y_close=0.01)
+    loop.start('spanner', 30.0, 20.0)
+    # x는 아직 멀고(0.80->0.78), y는 tcp_y(0.0)에 이미 충분히 가까움(0.005 < eps_y_close)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.80, 0.005, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.78, 0.005, 0.05))
+    cmd = loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert cmd.vy == 0.0
+    assert cmd.vx > 0.0
+
+
+def test_vy_stays_locked_even_if_y_error_grows_again():
+    loop = _make_loop(eps_y_close=0.01)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.80, 0.005, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.78, 0.005, 0.05))
+    loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+
+    # 이후 y 타깃이 다시 멀어져도(래치이므로) vy는 계속 0이어야 함
+    for i in range(5):
+        loop.on_tool_track(FakeToolTrack(0.04 + i * 0.02, 0.76 - i * 0.02, 0.5, 0.05))
+        cmd = loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop._last_e_xy_norm > 0.01
+    assert cmd.vy == 0.0

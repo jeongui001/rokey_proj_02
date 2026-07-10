@@ -87,6 +87,7 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.descend_speed', 0.10)
         self.declare_parameter('servo.eps_descend', 0.015)
         self.declare_parameter('servo.eps_grasp', 0.005)
+        self.declare_parameter('servo.eps_y_close', 0.01)
         self.declare_parameter('servo.n_stable', 10)
         self.declare_parameter('servo.dt_latency', 0.05)
         self.declare_parameter('servo.timeout', 5.0)
@@ -294,6 +295,7 @@ class RobotControlNode(Node, TaskExecutor):
             descend_speed=self.get_parameter('servo.descend_speed').value,
             eps_descend=self.get_parameter('servo.eps_descend').value,
             eps_grasp=self.get_parameter('servo.eps_grasp').value,
+            eps_y_close=self.get_parameter('servo.eps_y_close').value,
             n_stable=self.get_parameter('servo.n_stable').value,
             dt_latency=self.get_parameter('servo.dt_latency').value,
             timeout_s=self.get_parameter('servo.timeout').value,
