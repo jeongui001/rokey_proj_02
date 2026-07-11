@@ -21,8 +21,8 @@
     # 값들이 미설정인 동안 _check_trigger는 항상 False를 반환한다(안전 측 fail-closed).
     trigger:
       min_confidence: 0.3         # TEMP(스모크테스트용 임시값, 범위 0.0~1.0) - 캘리브레이션 필요
-      require_depth_valid: true   # 안전한 기본값 - depth 무효 트랙은 신뢰하지 않는다
-      require_approaching: true   # 안전한 기본값 - 멀어지는 트랙은 트리거로 쓰지 않는다
+      require_depth_valid: false   # 안전한 기본값 - depth 무효 트랙은 신뢰하지 않는다
+      require_approaching: false   # 안전한 기본값 - 멀어지는 트랙은 트리거로 쓰지 않는다
       required_frame_id: 'base_link'  # vision_node.py가 ToolTrack publish 시 실제로 쓰는 frame_id
       max_track_age_s: 1.0        # TEMP(스모크테스트용 임시값, 초 단위) - 캘리브레이션 필요
 

@@ -98,8 +98,13 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.innov_high', 0.040)
         self.declare_parameter('servo.w_alpha', 0.3)
         self.declare_parameter('servo.z_close', 0.02)
+        # z_close보다 작아야 한다(servo_loop.py ServoLoop.__init__ 주석 참고) -
+        # 하강 제동 곡선이 표면(z_gap=0)이 아니라 표면 위 이 마진에서 속도 0을
+        # 겨냥하게 해, 락 이후 관성으로도 표면과 이 만큼의 여유를 남긴다.
+        self.declare_parameter('servo.descend_stop_margin_m', 0.01)
         self.declare_parameter('servo.n_stable_z', 5)
         self.declare_parameter('servo.diverge_n', 15)
+        self.declare_parameter('servo.diverge_min_delta_m', 0.01)
         self.declare_parameter('servo.cov_threshold', 0.05)
         # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
         # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
@@ -165,6 +170,12 @@ class RobotControlNode(Node, TaskExecutor):
         # 안전 마진이었으나 다른 external_torque.* 값들과 함께 보이도록 승격했다.
         self.declare_parameter('safety.external_torque.stop_join_timeout_s', 2.0)
         self.declare_parameter('safety.fault_stop_mode', 1)  # DR_QSTOP: Quick stop Cat.2
+        # diverging/timeout/tracking_lost처럼 실제 위험 상황이 아니라 정상적으로
+        # 회수·재시도하는 정지에 쓴다(_run_rt_tracking의 cancel/abort 분기) -
+        # fault_stop_mode(QUICK)는 실제 안전 FAULT(외력 감지 등) 전용으로 남겨 둔다.
+        # 2026-07-10 실기: abort마다 QUICK으로 급정지해 매번 "덜컹"거림 확인 -
+        # STOP_TYPE_SLOW(2)로 완화. 0=QUICK_STO, 1=QUICK, 2=SLOW, 3=HOLD(비상정지).
+        self.declare_parameter('safety.recoverable_stop_mode', 2)
         self.declare_parameter('safety.state_poll_period_s', 0.1)
         # 진단용: true면 상태 폴링마다 tool_force를 1초 간격으로 로그에 남긴다.
         # handover_hold.pull_axis_index/pull_direction_sign/pull_force_threshold_n을
@@ -314,12 +325,19 @@ class RobotControlNode(Node, TaskExecutor):
             z_close=self.get_parameter('servo.z_close').value,
             n_stable_z=self.get_parameter('servo.n_stable_z').value,
             diverge_n=self.get_parameter('servo.diverge_n').value,
+            diverge_min_delta_m=self.get_parameter('servo.diverge_min_delta_m').value,
             cov_threshold=self.get_parameter('servo.cov_threshold').value,
             q_pos=self.get_parameter('servo.kalman_q_pos').value,
             q_vel=self.get_parameter('servo.kalman_q_vel').value,
             r_xy=self.get_parameter('servo.kalman_r_xy').value,
             r_z=self.get_parameter('servo.kalman_r_z').value,
             p0_vel_reset=self.get_parameter('servo.kalman_p0_vel_reset').value,
+            # 하강 감속 상한 계산용 - 실제 speedl에 걸리는 가속도 제한과 같은 값을
+            # 쓴다(단위만 mm/s²->m/s² 변환). 별도 servo.* 파라미터로 중복 선언하면
+            # 실기 가속도 값을 바꿀 때 두 곳을 같이 고쳐야 해서 어긋날 수 있다.
+            descend_accel_m_s2=(
+                self.get_parameter('servo_pick.speedl_acc_trans_mm_s2').value / 1000.0),
+            descend_stop_margin_m=self.get_parameter('servo.descend_stop_margin_m').value,
         )
 
         self.hand_servo_loop = HandServoLoop(

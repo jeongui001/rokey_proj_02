@@ -27,11 +27,6 @@ def generate_launch_description():
             'doosan_driver.controller_name). robot_control.launch.py의 '
             'local_params_file 인자 설명 참고.'))
 
-    stt_node_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource([
-            FindPackageShare('stt_node'), '/launch/stt_node.launch.py'
-        ])
-    )
     vision_node_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare('vision_node'), '/launch/vision_node.launch.py'
@@ -54,7 +49,6 @@ def generate_launch_description():
     return LaunchDescription([
         local_params_file_arg,
         task_manager_node,
-        stt_node_launch,
         vision_node_launch,
         robot_control_launch,
         operator_gui_launch,

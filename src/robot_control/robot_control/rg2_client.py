@@ -307,7 +307,12 @@ class RG2Client:
         if final is None:
             return RG2Status.COMMUNICATION_ERROR
         width_mm, grip_detected = final
-        if width_mm < 0.0 or width_mm > max_width:
+        # 캘리브레이션 오차로 실측 최대폭이 스펙값(max_width)을 살짝 넘는 경우까지
+        # "통신 오류"로 오판하지 않도록 open_width_tolerance_mm만큼 여유를 둔다
+        # (2026-07-11 실기: 그리퍼가 실제로는 다 열렸는데 COMMUNICATION_ERROR로 잘못
+        # 분류되어 재시도 끝에 FAULT로 이어짐).
+        tolerance = self._open_width_tolerance_mm()
+        if width_mm < 0.0 or width_mm > max_width + tolerance:
             return RG2Status.COMMUNICATION_ERROR
         self.last_width_mm = width_mm
         self.last_grip_detected = grip_detected

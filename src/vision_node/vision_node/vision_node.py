@@ -92,6 +92,12 @@ class VisionNode(Node):
         self.declare_parameter('vision.approach_ref_y', 0.0)
         self.declare_parameter('vision.tracker_alpha', 0.6)     # ToolTracker 위치 스무딩
         self.declare_parameter('vision.tracker_beta', 0.3)      # ToolTracker 속도 스무딩
+        # p0/p1/bbox 모드(한쪽 kpt만 보이거나 아예 없어 오프셋/bbox로 폴백) 전용 z
+        # 스무딩 - 이 모드들의 기준점(kpt0/kpt1/bbox 중심)은 mid(양쪽 kpt 중점)보다
+        # depth 노이즈가 훨씬 커서(2026-07-10 실기: 정지 물체인데도 mid 대비 p0에서
+        # z 변동이 ~3배로 커짐 -> servo_pick 조기 락 -> 바닥 충돌) tracker_alpha보다
+        # 더 낮게(더 세게 눌러) 잡는다. 실기 튜닝 대상.
+        self.declare_parameter('vision.tracker_alpha_z_offset_mode', 0.15)
         # 축(yaw) 계산 파라미터 - tool_detection_node와 동일 기본값
         self.declare_parameter('vision.yaw_depth_band_m', 0.008)  # 공구 윗면에서 이보다 깊은 픽셀은 벨트로 보고 제외
         self.declare_parameter('vision.axis_smooth_alpha', 0.25)
@@ -130,7 +136,9 @@ class VisionNode(Node):
         self._bridge = CvBridge()  # ROS Image msg <-> numpy 배열(OpenCV) 변환기
         self.tracker = ToolTracker(
             alpha=self.get_parameter('vision.tracker_alpha').value,
-            beta=self.get_parameter('vision.tracker_beta').value)
+            beta=self.get_parameter('vision.tracker_beta').value,
+            alpha_z_offset_mode=self.get_parameter(
+                'vision.tracker_alpha_z_offset_mode').value)
         self.axis_smoother = AxisSmoother(
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
         self._hand_detection = None  # (payload dict, 수신 시각) - 컨테이너(hand_track_docker_node)가 보낸 최신 검출 결과 캐시
@@ -466,6 +474,11 @@ class VisionNode(Node):
             return None  # 이번 프레임엔 tool_class 검출이 없었음 - 퍼블리시 안 함
 
         position, velocity, depth_valid, chosen_det = result
+        if bool(self.get_parameter('debug.log_vision_decisions').value):
+            self.get_logger().info(
+                f"tool_track 갱신: mode={self.tracker.last_mode} "
+                f"depth_valid={depth_valid} position_m={position}",
+                throttle_duration_sec=0.5)
         self._checkpoint_event(
             'C', 'tool_track_valid', 'PASS',
             'ToolTrack 위치/뎁스/접근 판정이 유효합니다.',

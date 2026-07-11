@@ -57,11 +57,28 @@ class ServoLoop:
                  innov_low=0.010, innov_high=0.040, w_alpha=0.3,
                  z_close=0.02, diverge_n=5, cov_threshold=0.05,
                  q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
-                 n_stable_z=5):
+                 n_stable_z=5, diverge_min_delta_m=0.01, descend_accel_m_s2=0.1,
+                 descend_stop_margin_m=0.0):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
         self.descend_speed = descend_speed  # 하강 속도
+        # speedl에 실제로 걸리는 가속도 제한(servo_pick.speedl_acc_trans_mm_s2와 동일
+        # 값, m/s² 단위) - vz=0을 명령해도 로봇이 이 가속도로만 감속하므로(2026-07-10
+        # 실기: descend_speed=0.1m/s에서 커맨드 0 이후 약 50mm 관성 하강 후 바닥 충돌
+        # 확인, v²/(2a)=0.1²/(2*0.1)=0.05m로 물리 계산과 일치), z_gap 기준으로 미리
+        # 감속해야 z_close 문턱과 무관하게 실제 정지 지점이 목표에 가까워진다.
+        self.descend_accel_m_s2 = descend_accel_m_s2
+        # safe_speed 공식(v=sqrt(2*a*거리))이 목표(z_gap=0, 즉 물리 접촉)에서 속도 0을
+        # 겨냥하면, z_close 문턱 자체가 "락 이후 예상 관성 오버슈트"로 고스란히
+        # 소진된다(2026-07-11 실기: z_close=0.03에서 락 시점 속도 ~77mm/s, 관성거리
+        # ~30mm=z_close와 거의 일치, 정지 물체인데도 바닥 충돌 확인 - 목표 z가 이미
+        # 테이블면에 가까운 얇은 도구라 여유가 전혀 없었음). 이 마진(m)만큼 목표를
+        # 미리 띄워 제동 곡선이 z_gap=margin에서 속도 0을 겨냥하게 해, 락 이후에도
+        # 표면 위 margin만큼 여유가 남도록 한다. z_close보다 작아야 한다(같거나 크면
+        # z_gap이 z_close 밑으로 내려가기 전에 이미 vz=0에 수렴해 폐합 조건이 영원히
+        # 안 걸릴 수 있다).
+        self.descend_stop_margin_m = descend_stop_margin_m
         self.eps_descend = eps_descend   # 이 오차 이내여야 하강 시작
         self.eps_grasp = eps_grasp       # 폐합 판정 오차 임계
         self.n_stable = n_stable         # 폐합 판정에 필요한 연속 안정 주기 수
@@ -75,6 +92,13 @@ class ServoLoop:
         self.w_alpha = w_alpha           # w의 저역통과 스무딩 계수
         self.z_close = z_close           # 폐합 판정 z_gap 임계
         self.diverge_n = diverge_n       # 발산 판정에 볼 연속 오차 개수
+        # diverge_n틱 연속 증가만으로는 부족하고, 그 구간 총 증가폭도 이 값(m) 이상이어야
+        # 발산으로 본다 - RT 루프(100Hz)가 비전(~55~60Hz)보다 빨라 비전 갱신 사이에는
+        # lead_time(dt_latency+elapsed_since_track) 외삽만으로도 오차가 매 틱 미세하게
+        # 늘어나는 구간이 정상적으로 생긴다(2026-07-10 실기: 정지 물체에서도 diverging
+        # 오탐 확인). 노이즈 수준의 연속 증가를 걸러내되 진짜 발산은 여전히 잡기 위한
+        # 최소 증가폭 문턱.
+        self.diverge_min_delta_m = diverge_min_delta_m
         self.cov_threshold = cov_threshold  # 폐합 판정용 속도 공분산 임계
         # 내부 KalmanXYZV로 그대로 전달되는 필터 노이즈 파라미터 (kalman.py 참고)
         self.q_pos = q_pos
@@ -239,7 +263,13 @@ class ServoLoop:
             vz = 0.0
         elif e_xy_norm < self.eps_descend:
             self._state = ServoState.DESCENDING
-            vz = -self.descend_speed
+            # 남은 z_gap 안에서 descend_accel_m_s2로 정지 가능한 속도로 상한을 건다
+            # (v = sqrt(2*a*거리)) - 그래야 vz=0 명령이 나가는 시점(z_locked)에 이미
+            # 속도가 충분히 낮아, 가속도 제한 때문에 생기는 관성 하강 거리가 z_close
+            # 수준으로 줄어든다. 그 전(z_gap이 클 때)에는 descend_speed로 상한이 걸린다.
+            brake_distance = max(self._last_z_gap - self.descend_stop_margin_m, 0.0)
+            safe_speed = math.sqrt(2.0 * self.descend_accel_m_s2 * brake_distance)
+            vz = -min(self.descend_speed, safe_speed)
         else:
             self._state = ServoState.TRACKING
             vz = 0.0
@@ -278,9 +308,11 @@ class ServoLoop:
             return 'timeout'
         if self._last_msg_time is not None and time.monotonic() - self._last_msg_time > self.t_lost_s:
             return 'tracking_lost'
-        if len(self._error_history) == self.diverge_n and all(
+        if (len(self._error_history) == self.diverge_n and all(
                 self._error_history[i] < self._error_history[i + 1]
-                for i in range(len(self._error_history) - 1)):
+                for i in range(len(self._error_history) - 1))
+                and self._error_history[-1] - self._error_history[0]
+                >= self.diverge_min_delta_m):
             return 'diverging'
         # 참고: "공구가 방향 전환하여 시야 이탈 예상"(2.8절)은 판정 기준이 모호해
         # 과설계 우려가 있으므로 1차 구현 범위에서 제외했다. 실측 후 필요하면 추가한다.

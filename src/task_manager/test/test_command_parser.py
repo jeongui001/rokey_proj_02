@@ -69,7 +69,7 @@ def test_mode_switch_without_mode_word():
 
 
 def test_fetch_tool_keyword():
-    assert parse_command('렌치 갖다줘') == {'type': Command.FETCH_TOOL, 'tool': 'wrench'}
+    assert parse_command('망치 갖다줘') == {'type': Command.FETCH_TOOL, 'tool': 'hammer'}
     assert parse_command('드라이버 가져다줘') == {'type': Command.FETCH_TOOL, 'tool': 'screwdriver'}
 
 
@@ -104,5 +104,5 @@ def test_automobile_does_not_switch_auto_mode():
 def test_fetch_tool_command_does_not_trigger_manual_move():
     # '컨베이어'/'위'처럼 이동 키워드와 겹치는 단어가 섞여 있어도, 이동 문구
     # 전체(조사 생략 변형 포함)가 없으면 fetch_tool로 정상 처리돼야 한다.
-    result = parse_command('컨베이어 위에 있는 렌치 가져와')
-    assert result == {'type': Command.FETCH_TOOL, 'tool': 'wrench'}
+    result = parse_command('컨베이어 위에 있는 망치 가져와')
+    assert result == {'type': Command.FETCH_TOOL, 'tool': 'hammer'}

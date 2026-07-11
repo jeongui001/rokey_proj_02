@@ -1,5 +1,10 @@
 # stt_node 음성 명령 인식(웨이크워드 + OpenAI STT)에 필요한 pip 의존성.
-openwakeword     # 로컬/무료 웨이크워드 감지("헬로 로키", resource/hello_rokey_8332_32.tflite)
+# openwakeword==0.6.0 고정: wakeup_word.py가 이 버전의 API(Model(wakeword_models=...),
+# openwakeword.utils.download_models(), tflite 기본 추론)에 맞춰 작성돼 있다 -
+# 안 고정하면 pip이 tflite-runtime 설치 가능 여부에 따라 다른 버전으로 떨어질 수
+# 있다(2026-07-10 실측: Python 3.12에는 tflite-runtime 휠이 없어 0.4.0으로 떨어지며
+# API가 안 맞아 깨짐 - Python 3.10/Humble에는 tflite-runtime 휠이 있어 문제 없음).
+openwakeword==0.6.0     # 로컬/무료 웨이크워드 감지("헬로 로키", resource/hello_rokey_8332_32.tflite)
 pyaudio          # 웨이크워드 감지용 마이크 연속 스트림 캡처
 sounddevice      # 웨이크워드 감지 후 고정 구간 명령 녹음
 scipy            # WAV 저장(scipy.io.wavfile) + 리샘플링(48kHz -> 16kHz)
