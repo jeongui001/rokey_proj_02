@@ -55,12 +55,10 @@ _NEGATION_KEYWORDS = ('가져오지 마', '갖다주지 마', '전달하지 마'
 # 포함) - vision_node가 검출 결과의 class_name을 그대로 ToolTrack.tool_class로
 # 실어 보내고, task_manager._check_trigger가 문자열을 그대로 비교하기 때문이다.
 _TOOL_KEYWORDS = {
-    '스패너': 'spanner',
-    '드라이버': 'screw_driver',
-    '십자드라이버': 'screw_driver',
-    '일자드라이버': 'screw_driver',
+    '드라이버': 'screwdriver',
+    '십자드라이버': 'screwdriver',
+    '일자드라이버': 'screwdriver',
     '렌치': 'wrench',
-    '펜치': 'pliers',
     '망치': 'hammer',
     '물병': 'bottle',
 }

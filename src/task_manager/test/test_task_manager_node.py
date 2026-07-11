@@ -831,11 +831,11 @@ def test_rejects_nan_inf_and_partial_config(node, case):
         node.current_tool = 'spanner'
         assert node._check_trigger(_fresh_tool_track(node, confidence=1.5)) is False
     elif case == 'grasp_spec_width_nan':
-        _configure_tool_spec(node, 'spanner', **{'tools.spanner.width_mm': float('nan')})
-        assert node._get_grasp_spec('spanner') is None
+        _configure_tool_spec(node, 'hammer', **{'tools.hammer.width_mm': float('nan')})
+        assert node._get_grasp_spec('hammer') is None
     elif case == 'grasp_spec_force_inf':
-        _configure_tool_spec(node, 'spanner', **{'tools.spanner.force_n': float('inf')})
-        assert node._get_grasp_spec('spanner') is None
+        _configure_tool_spec(node, 'hammer', **{'tools.hammer.force_n': float('inf')})
+        assert node._get_grasp_spec('hammer') is None
 # ---- AUTO/MANUAL 모드 전환 (취소 확인 후 전환) ----
 
 def test_mode_switch_immediate_when_idle_and_no_goal(node):
@@ -1207,7 +1207,7 @@ def test_fetch_tool_works_in_manual_mode_without_switching_to_auto(node):
     sent = []
     node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
 
-    node._on_user_command(String(data='스패너 갖다줘'))
+    node._on_user_command(String(data='망치 갖다줘'))
 
     assert node.state == State.MOVE_TO_WATCH
     assert sent == [('move_named', {'named_target': 'watch'})]
@@ -1221,10 +1221,10 @@ def test_user_command_triggers_move_to_watch(node):
     node._send_robot_goal = lambda task_type, **kw: sent_goals.append((task_type, kw))
     node._set_vision_mode = lambda mode, tool_class='': None
 
-    node._on_user_command(String(data='스패너 갖다줘'))
+    node._on_user_command(String(data='망치 갖다줘'))
 
     assert node.state == State.MOVE_TO_WATCH
-    assert node.current_tool == 'spanner'
+    assert node.current_tool == 'hammer'
     assert sent_goals == [('move_named', {'named_target': 'watch'})]
 
 
@@ -1543,9 +1543,9 @@ def _configure_tool_spec(node, tool, **overrides):
 
 
 def test_get_grasp_spec_returns_configured_values(node):
-    _configure_tool_spec(node, 'spanner')
+    _configure_tool_spec(node, 'hammer')
 
-    spec = node._get_grasp_spec('spanner')
+    spec = node._get_grasp_spec('hammer')
 
     assert spec.width_mm == 30.0
     assert spec.force_n == 20.0
@@ -1563,10 +1563,10 @@ def test_get_grasp_spec_returns_none_for_unknown_tool_class(node):
 
 
 def test_get_grasp_spec_returns_none_when_verify_range_inverted(node):
-    _configure_tool_spec(node, 'spanner', **{
-        'tools.spanner.verify_min_width_mm': 40.0, 'tools.spanner.verify_max_width_mm': 35.0})
+    _configure_tool_spec(node, 'hammer', **{
+        'tools.hammer.verify_min_width_mm': 40.0, 'tools.hammer.verify_max_width_mm': 35.0})
 
-    assert node._get_grasp_spec('spanner') is None
+    assert node._get_grasp_spec('hammer') is None
 
 
 # ---- _verify_grasp 실제 구현 ----
