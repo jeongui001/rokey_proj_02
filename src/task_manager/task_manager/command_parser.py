@@ -74,7 +74,7 @@ def parse_command(text: str) -> dict:
       {'type': Command.RESET}
       {'type': Command.MOVE_NAMED, 'named_target': 'home'}
       {'type': Command.MODE_SWITCH, 'mode': Mode.MANUAL}
-      {'type': Command.FETCH_TOOL, 'tool': 'spanner'}
+      {'type': Command.FETCH_TOOL, 'tool': 'screwdriver'}
       {'type': Command.UNKNOWN, 'text': text}
     """
     stripped = text.strip()

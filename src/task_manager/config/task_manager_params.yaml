@@ -29,7 +29,7 @@
     # 공구별 grasp spec. width_mm/force_n은 servo_pick goal에 실제로 실어 보내는 값,
     # verify_min/max_width_mm은 VERIFY_GRASP에서 final_width_mm 허용 범위다.
     # command_parser.py의 _TOOL_KEYWORDS 값(=YOLO 학습 클래스명)과 반드시 일치해야
-    # 한다: bottle, spanner, screw_driver, wrench, pliers, hammer.
+    # 한다: bottle, screwdriver, wrench, hammer.
     #
     # width_mm=80.0/force_n=30.0은 모든 공구에 우선 동일하게 적용한 테스트값이다
     # (공구 장난감류는 조건이 넉넉하지만, 500ml 물병을 기준으로 필요한 폭/힘에 맞춤).
