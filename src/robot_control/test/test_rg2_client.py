@@ -458,6 +458,20 @@ def test_open_records_final_width_on_success(monkeypatch):
     assert client.last_grip_detected is False
 
 
+def test_open_succeeds_when_final_width_exceeds_max_within_tolerance(monkeypatch):
+    """실측 폭이 스펙 최대값을 open_width_tolerance_mm 이내로 넘어도(캘리브레이션 오차)
+    정상 성공으로 처리해야 한다 - 실기에서 그리퍼가 실제로는 다 열렸는데도
+    COMMUNICATION_ERROR로 오판되어 재시도 끝에 FAULT로 이어지던 문제(2026-07-11) 재현."""
+    over_width = RG2Client.MAX_WIDTH_MM['rg2'] + 1.5  # 기본 tolerance(2.0mm) 이내 초과
+    _install_fake(monkeypatch, _FakeModbusClient(read_busy_values=[0, 0], final_width_mm=over_width))
+
+    client = RG2Client(ip='192.168.1.1', hardware_enabled=True)
+    result = client.open()
+
+    assert result is True
+    assert client.last_width_mm == over_width
+
+
 def test_open_fails_when_final_width_out_of_model_range(monkeypatch):
     _install_fake(monkeypatch, _FakeModbusClient(read_busy_values=[0, 0], final_width_mm=9999.0))
 
