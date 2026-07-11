@@ -22,7 +22,6 @@ from vision_node.tracking import (
     ToolTracker, pixel_to_camera_xyz, transform_to_matrix, camera_to_base, is_approaching,
     KPT_CONF_MIN, detection_center,
 )
-from vision_node.hand_tracking import create_hands_detector, detect_hand, is_fist
 from vision_node.grasp_geometry import (
     AxisSmoother, is_bbox_at_edge, patch_median_depth, tool_axis_from_depth,
     yaw_deg_to_quaternion,
@@ -105,6 +104,10 @@ class VisionNode(Node):
         # HandTrack.fist는 이미 이 확인을 거친 "확정된" 값이라는 계약이라(robot_control의
         # HandServoLoop는 재확인 없이 바로 정지 처리), 여기서 debounce를 책임진다.
         self.declare_parameter('vision.fist_confirm_frames', 5)
+        # mediapipe가 컨테이너로 분리되면서 손 검출 결과가 /vision/hand_track_docker로
+        # 비동기 도착한다 - 이 시간(초)보다 오래된 캐시는 "미검출"로 간주한다(TEMP: 실기
+        # 검증 후 조정).
+        self.declare_parameter('vision.hand_detection_max_age_s', 0.2)
         # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
         self.declare_parameter('debug.log_vision_decisions', False)
@@ -118,6 +121,7 @@ class VisionNode(Node):
         self.valid_min_ratio = self.get_parameter('vision.depth_valid_min_ratio').value
         self.publish_debug_image = self.get_parameter('vision.publish_debug_image').value
         self.fist_confirm_frames = self.get_parameter('vision.fist_confirm_frames').value
+        self.hand_detection_max_age_s = self.get_parameter('vision.hand_detection_max_age_s').value
         self.approach_ref_xy = (
             self.get_parameter('vision.approach_ref_x').value,
             self.get_parameter('vision.approach_ref_y').value,
@@ -129,7 +133,7 @@ class VisionNode(Node):
             beta=self.get_parameter('vision.tracker_beta').value)
         self.axis_smoother = AxisSmoother(
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
-        self._hands_detector = None  # 지연 생성 (TRACK_HAND 최초 진입 시 create_hands_detector() 호출)
+        self._hand_detection = None  # (payload dict, 수신 시각) - 컨테이너(hand_track_docker_node)가 보낸 최신 검출 결과 캐시
         self._fist_counter = 0  # TRACK_HAND에서 is_fist 연속 참 카운트(디바운스)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
@@ -142,6 +146,11 @@ class VisionNode(Node):
         self._timing_window = deque(maxlen=100)  # (callback_ms, e2e_ms, infer_ms) rolling 통계용
         self._timing_csv = None                 # timing_csv_path 설정 시 지연 오픈
         self.srv_set_mode = self.create_service(SetVisionMode, '/vision/set_mode', self._on_set_mode)  # 클라이언트: task_manager
+        # mediapipe를 도커 컨테이너로 분리한 뒤 손 검출 결과를 받는 임시 다리 - 컨테이너의
+        # hand_track_node.py가 String(JSON)으로 발행한다. HandTrack 커스텀 메시지로
+        # 정리되면 이 구독은 제거하고 컨테이너도 handover_interfaces를 직접 쓰도록 바꿀 것.
+        self.create_subscription(
+            String, '/vision/hand_track_docker', self._on_hand_track_docker, 10)
 
         # eye-in-hand라 3D 복원엔 "지금"이 아니라 "이미지가 찍힌 시각"의 flange pose가 필요하다
         # (전체 계획.md 2.4절) - 그래서 TF를 캐시해두고 이미지 stamp로 lookup_transform 한다.
@@ -324,6 +333,19 @@ class VisionNode(Node):
                 phase, checkpoint_id, 'PASS' if response.success else 'FAIL',
                 response.message, {'mode': request.mode, 'tool_class': request.tool_class})
         return response
+
+    def _on_hand_track_docker(self, msg):
+        """컨테이너(hand_track_docker_node)가 보낸 mediapipe 검출 결과(String/JSON)를
+        받아 캐싱한다. _track_hand는 여기 캐싱된 값을 쓰고, 수신 시각 기준으로
+        오래됐으면(vision.hand_detection_max_age_s) 무시한다."""
+        try:
+            payload = json.loads(msg.data)
+        except (json.JSONDecodeError, TypeError):
+            self.get_logger().warn(
+                f'/vision/hand_track_docker 메시지를 JSON으로 파싱할 수 없습니다: {msg.data!r}',
+                throttle_duration_sec=1.0)
+            return
+        self._hand_detection = (payload, self.get_clock().now())
 
     def _on_synced_images(self, color_msg, depth_msg, info_msg, detection_msg):
         """4개 토픽이 시간적으로 맞춰졌을 때마다(30~60Hz 목표) 호출되는 메인 루프.
@@ -686,23 +708,35 @@ class VisionNode(Node):
         track.header.frame_id = 'base_link'
         track.pose.orientation.w = 1.0  # 손 자세는 위치만 쓰고 방향은 무시
 
-        if self._hands_detector is None:
-            self._hands_detector = create_hands_detector()
-
-        image = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8')
-        detection = detect_hand(self._hands_detector, image)
-        if detection is None:
+        # mediapipe는 컨테이너(hand_track_docker_node)에서 돌고, 결과는
+        # _on_hand_track_docker가 /vision/hand_track_docker에서 받아 캐싱해둔 것을 쓴다
+        # (비동기 도착이라 "이 프레임 정확히"가 아니라 "충분히 최근" 결과를 쓴다).
+        if self._hand_detection is None:
             self._fist_counter = 0
-            self.get_logger().warn('MediaPipe가 손을 찾지 못했습니다.', throttle_duration_sec=1.0)
+            self.get_logger().warn(
+                '컨테이너에서 손 검출 결과를 아직 받지 못했습니다.', throttle_duration_sec=1.0)
             track.detected = False
             track.fist = False
             track.confidence = 0.0
             return track
 
-        (px, py), landmarks, confidence = detection
+        payload, received_at = self._hand_detection
+        age_s = (self.get_clock().now() - received_at).nanoseconds * 1e-9
+        if age_s > self.hand_detection_max_age_s or not payload.get('detected'):
+            self._fist_counter = 0
+            self.get_logger().warn(
+                f'손 검출 결과가 없거나 오래됐습니다(age_s={age_s:.3f}).',
+                throttle_duration_sec=1.0)
+            track.detected = False
+            track.fist = False
+            track.confidence = 0.0
+            return track
+
+        px, py = payload['palm_px']
+        confidence = payload['confidence']
         track.confidence = float(confidence)
 
-        raw_fist = is_fist(landmarks)
+        raw_fist = bool(payload['is_fist'])
         self._fist_counter = self._fist_counter + 1 if raw_fist else 0
         confirmed_fist = self._fist_counter >= self.fist_confirm_frames
         track.fist = confirmed_fist
