@@ -1,3 +1,20 @@
+# === 추적 범위 화이트리스트 (2026-07-11) ===
+# 루트를 전부 무시하고, 커밋 대상으로 정한 항목만 다시 허용한다. 이렇게 하면
+# 루트에 쌓이는 실험/스크래치 더미(tools/, *.ipynb, 루트 *.py/*.md/*.txt/*.png,
+# 데이터·모델 산출물 등)가 git status의 untracked 목록을 더럽히지 않는다.
+# 추적하려는 새 최상위 항목이 생기면 아래에 !/<이름> 을 추가하면 된다.
+/*
+!/docs/
+!/src/
+!/model/
+!/README.md
+!/LICENSE
+!/.gitignore
+
+# === src/·docs/ 내부에서 추가로 무시할 것 ===
+# 위 /* 는 루트 항목만 거르므로, 화이트리스트로 다시 포함된 디렉토리(src/·docs/)
+# 안쪽의 빌드/런타임 산출물·비밀값 등은 여기서 개별적으로 무시해야 한다.
+# (슬래시로 끝나지만 앵커가 없어 루트뿐 아니라 src/*/log/ 같은 중첩 경로도 매칭)
 build/
 install/
 log/
@@ -6,29 +23,10 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
-
-# 로컬 개발용 임시 launch/스크립트 - 커밋 대상 아님
-/dev/
-
-docs/superpowers/
-CLAUDE.md
-# OpenAI API 키 등 비밀값 - 커밋 금지
+# OpenAI API 키 등 비밀값 - 커밋 금지 (src/*/resource/.env 포함)
 .env
-
-# 대용량 데이터/모델/실험 산출물 - ~/object_detection_data/ 로 이동됨.
-# 슬래시 없이 작성: 일부는 저장소 루트에 심볼릭 링크로 남아있는데, git의
-# 트레일링 슬래시(/datasets/) 패턴은 심볼릭 링크를 매칭하지 않으므로 주의.
-/datasets
-/datasets_session
-/datasets_pose_pilot*
-/roboflow_staging
-/roboflow_export_130
-/label_review_all
-/local_pose_labels
-/model_prelabels
-/runs
-/Fruits
-/bbox_check
-/dataset_manifest.csv
-/robust_run_v2.log
+# 도구 문서 번들 - 커밋 대상 아님
+docs/superpowers/
+# 배포 모델(src/vision_node/resource/*.pt)은 계속 추적한다. 과거 루트에 있던
+# 대용량 .pt 산출물만 무시하면 되므로 루트 앵커로 한정한다(하위 경로엔 영향 없음).
 /*.pt

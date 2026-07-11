@@ -27,8 +27,14 @@ def _resolve_modbus_id_kwarg(client) -> str:
     for name in ('device_id', 'slave', 'unit'):
         if name in params:
             return name
-    # 세 이름 모두 없는 더 미래의 pymodbus 버전 - 최신 관례를 기본값으로 시도한다.
-    return 'device_id'
+    # 세 이름 모두 시그니처에 없다는 건 read_holding_registers가 **kwargs로만
+    # 받는다는 뜻이다 - 이건 pymodbus 2.x의 실제 시그니처(read_holding_registers(self,
+    # address, count=1, **kwargs), unit_id는 ModbusPDU.__init__이 내부적으로
+    # kwargs.get('unit', ...)으로 읽음)이며, 3.0 이후 버전은 계속 이름 있는
+    # 키워드 인자로 명시해왔으므로 unit을 기본값으로 쓴다. (device_id를 기본값으로
+    # 쓰면 2.x에서 unit 인자가 그냥 조용히 무시되어 unit_id가 0으로 통신하게 되고
+    # 툴체인저(id=65)와 통신이 안 되어 Modbus 오류가 난다.)
+    return 'unit'
 
 
 class RG2Status:
