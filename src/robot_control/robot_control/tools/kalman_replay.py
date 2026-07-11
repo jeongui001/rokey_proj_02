@@ -111,22 +111,31 @@ class _ReplayToolTrack:
 # robot_control_params.yaml의 servo: 섹션 기본값과 동일하게 고정한다.
 _SERVO_FIXED_KWARGS = dict(
     kp_xy=1.2, kp_yaw=1.0, v_max=0.25, descend_speed=0.05,
-    eps_descend=0.015, eps_grasp=1.0, n_stable=1, timeout_s=10.0,
+    eps_descend=0.015, eps_grasp=1.0, n_stable=1,
     z_close=0.03, diverge_n=15, cov_threshold=100.0)
 
 
 def replay_servo(rows, dt_latency, t_lost_s, innov_low, innov_high, w_alpha,
-                  q_pos, q_vel, r_xy, r_z, p0_vel_reset):
+                  q_pos, q_vel, r_xy, r_z, p0_vel_reset, timeout_s=10.0):
     """rows를 ServoLoop.on_tool_track()에 순서대로 주입하며, 매 행 주입 직전에
     should_abort()를 호출해 그 행 도착 전까지의 경과시간 기준으로 t_lost/timeout
     오탐 여부를 기록한다(3단계). step()은 실측 TCP가 없어 호출하지 않으므로
     e_xy_norm/z_gap/should_close/'diverging'은 이 함수로 검증할 수 없다.
     ServoLoop 내부가 time.monotonic()을 직접 호출하므로, 로그의
-    recv_monotonic_s를 그대로 '현재 시각'으로 쓰도록 monkeypatch한다."""
+    recv_monotonic_s를 그대로 '현재 시각'으로 쓰도록 monkeypatch한다.
+
+    주의: rows의 span이 timeout_s 초를 초과하면, timeout_s 이후의 행들은
+    tracking_lost 이벤트의 유무와 관계없이 abort_reason='timeout'으로 표시된다.
+    따라서 tracking_lost 오탐 여부를 검증할 때는 timeout_s를 로그의 span보다
+    길게 설정해야 한다."""
+    if not rows:
+        return []
+
     loop = ServoLoop(
         dt_latency=dt_latency, t_lost_s=t_lost_s, innov_low=innov_low,
         innov_high=innov_high, w_alpha=w_alpha, q_pos=q_pos, q_vel=q_vel,
-        r_xy=r_xy, r_z=r_z, p0_vel_reset=p0_vel_reset, **_SERVO_FIXED_KWARGS)
+        r_xy=r_xy, r_z=r_z, p0_vel_reset=p0_vel_reset, timeout_s=timeout_s,
+        **_SERVO_FIXED_KWARGS)
 
     clock = {'t': rows[0].recv_monotonic_s}
 
@@ -170,6 +179,7 @@ def _parse_args(argv=None):
     parser.add_argument('--w-alpha', type=float, default=0.3)
     parser.add_argument('--dt-latency', type=float, default=0.05)
     parser.add_argument('--t-lost', type=float, default=0.3)
+    parser.add_argument('--timeout', type=float, default=10.0)
     return parser.parse_args(argv)
 
 
@@ -185,7 +195,7 @@ def main(argv=None):
         records = replay_servo(
             rows, dt_latency=args.dt_latency, t_lost_s=args.t_lost,
             innov_low=args.innov_low, innov_high=args.innov_high,
-            w_alpha=args.w_alpha, **kalman_kwargs)
+            w_alpha=args.w_alpha, timeout_s=args.timeout, **kalman_kwargs)
     write_replay_csv(args.out, records)
     print(f'{len(records)}개 행 재생 완료: {args.out}')
 
