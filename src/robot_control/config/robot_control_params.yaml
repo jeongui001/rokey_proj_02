@@ -90,8 +90,12 @@
       cov_threshold: 100.0 # 폐합 판정용 속도 공분산 임계, 일단 끈 상태(1)
       kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
       kalman_q_vel: 1.0e-2      # 프로세스 노이즈(속도)
-      kalman_r_xy: 1.0e-4       # 측정 노이즈(x,y)
-      kalman_r_z: 1.0e-4        # 측정 노이즈(z)
+      # 2026-07-11 실기: 정지 렌치 155프레임(tool_track_logger) x,y 표본분산 실측값으로
+      # 교체(kalman_replay --target kalman 재생 게이트 통과 - 실측 평균 대비 오차
+      # dx=0.22mm dy=-0.83mm dz=-0.02mm). 코드 기본값(1e-4)은 실제 카메라 노이즈보다
+      # 훨씬 보수적이었음.
+      kalman_r_xy: 3.84009e-07  # 측정 노이즈(x,y) - 실측
+      kalman_r_z: 9.98258e-09   # 측정 노이즈(z) - 실측
       kalman_p0_vel_reset: 1.0  # 방향전환 감지 시 속도 공분산 리셋값
       # _validate_servo_command(task_executor.py)의 부동소수점 비교 허용오차 -
       # 물리량이 아닌 수치 오차 마진이지만 한 곳에서 보이도록 승격했다.
