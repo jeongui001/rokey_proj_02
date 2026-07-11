@@ -2,6 +2,7 @@
 컨베이어 3가지 시나리오(전체 계획.md 7절 4번)를 흉내낸 ToolTrack을 만들어 흘려보내고,
 받은 v_cmd를 적분해 tcp_pose를 갱신하며 w/오차를 기록한다."""
 
+import argparse
 import math
 
 
@@ -83,16 +84,27 @@ def run_servo_sim(loop, scenario, dt=0.02):
     return log
 
 
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            '합성(노이즈 없는) 시나리오로 kp_xy 후보를 실기 전 사전점검 - '
+            '참고용, 최종 확정은 실기 스텝 응답으로 한다(설계 문서 6단계).'))
+    parser.add_argument('--kp-xy', type=float, nargs='+', default=[1.2])
+    return parser.parse_args(argv)
+
+
 if __name__ == '__main__':
     from robot_control.servo_loop import ServoLoop
 
-    for name in ('constant', 'long_reversal', 'short_oscillation'):
-        loop = ServoLoop(kp_xy=1.2, kp_yaw=1.0, v_max=0.25, descend_speed=0.10,
-                          eps_descend=0.015, eps_grasp=0.005, n_stable=10,
-                          dt_latency=0.05, timeout_s=5.0, t_lost_s=0.3,
-                          innov_low=0.010, innov_high=0.040, w_alpha=0.3,
-                          diverge_n=15)
-        log = run_servo_sim(loop, make_scenario(name, duration_s=4.0, dt=0.02), dt=0.02)
-        avg_w = sum(row['w'] for row in log) / len(log)
-        avg_e = sum(row['e_xy'] for row in log) / len(log)
-        print(f'{name}: avg_w={avg_w:.3f} avg_e_xy={avg_e:.4f}m')
+    args = _parse_args()
+    for kp_xy in args.kp_xy:
+        for name in ('constant', 'long_reversal', 'short_oscillation'):
+            loop = ServoLoop(kp_xy=kp_xy, kp_yaw=1.0, v_max=0.25, descend_speed=0.10,
+                              eps_descend=0.015, eps_grasp=0.005, n_stable=10,
+                              dt_latency=0.05, timeout_s=5.0, t_lost_s=0.3,
+                              innov_low=0.010, innov_high=0.040, w_alpha=0.3,
+                              diverge_n=15)
+            log = run_servo_sim(loop, make_scenario(name, duration_s=4.0, dt=0.02), dt=0.02)
+            avg_w = sum(row['w'] for row in log) / len(log)
+            avg_e = sum(row['e_xy'] for row in log) / len(log)
+            print(f'kp_xy={kp_xy} {name}: avg_w={avg_w:.3f} avg_e_xy={avg_e:.4f}m')
