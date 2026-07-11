@@ -27,6 +27,7 @@ setup(
         'console_scripts': [
             'robot_control_node = robot_control.robot_control_node:main',
             'probe_speedl_stream = robot_control.tools.probe_speedl_stream:main',
+            'tool_track_logger = robot_control.tools.tool_track_logger:main',
         ],
     },
 )
