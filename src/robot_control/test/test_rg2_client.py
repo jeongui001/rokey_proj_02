@@ -91,6 +91,19 @@ class _FakeModbusClientUnit(_FakeModbusClient):
         return super().read_holding_registers(address, count, unit)
 
 
+class _FakeModbusClientKwargsOnly(_FakeModbusClient):
+    """pymodbus 2.x의 실제 read_holding_registers/write_registers 시그니처를
+    흉내낸다 - unit을 명명된 파라미터가 아니라 **kwargs로만 받는다(실제로는
+    ModbusPDU.__init__이 kwargs.get('unit', ...)으로 읽는다). unit/slave/device_id
+    중 어느 것도 시그니처에 이름으로 노출되지 않는다는 점에서 위 fake들과 다르다."""
+
+    def write_registers(self, address, values, **kwargs):
+        return super().write_registers(address, values, kwargs.get('unit'))
+
+    def read_holding_registers(self, address, count, **kwargs):
+        return super().read_holding_registers(address, count, kwargs.get('unit'))
+
+
 def _install_fake(monkeypatch, fake):
     monkeypatch.setattr('pymodbus.client.ModbusTcpClient', lambda *a, **kw: fake)
     return fake
@@ -122,14 +135,15 @@ def test_resolve_modbus_id_kwarg_prefers_device_id_then_slave_then_unit():
     assert _resolve_modbus_id_kwarg(_FakeModbusClientUnit()) == 'unit'
 
 
-def test_resolve_modbus_id_kwarg_falls_back_to_device_id_for_unknown_signature():
+def test_resolve_modbus_id_kwarg_falls_back_to_unit_for_kwargs_only_signature():
+    """실제 pymodbus 2.x의 read_holding_registers(self, address, count, **kwargs)처럼
+    unit/slave/device_id 중 어느 것도 명명된 파라미터로 노출하지 않는 시그니처에서는
+    unit으로 폴백해야 한다 - device_id로 폴백하면 unit 인자가 조용히 무시되어(2.x의
+    ModbusPDU.__init__이 kwargs.get('unit', ...)로만 읽으므로) 실제 슬레이브 ID
+    대신 0으로 통신하게 되어 Modbus 오류가 난다."""
     from robot_control.rg2_client import _resolve_modbus_id_kwarg
 
-    class _UnknownFutureClient:
-        def read_holding_registers(self, address, count, some_new_kwarg_name):
-            pass
-
-    assert _resolve_modbus_id_kwarg(_UnknownFutureClient()) == 'device_id'
+    assert _resolve_modbus_id_kwarg(_FakeModbusClientKwargsOnly()) == 'unit'
 
 
 def test_close_and_get_state_work_with_pymodbus_3_12_plus_device_id_api(monkeypatch):
