@@ -150,3 +150,45 @@ def replay_servo(rows, dt_latency, t_lost_s, innov_low, innov_high, w_alpha,
                 'abort_reason': abort_reason or '',
             })
     return records
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            '수집된 tool_track CSV를 KalmanXYZV/ServoLoop에 재생 - '
+            '실기 없이 필터 파라미터를 튜닝하기 위한 도구.'))
+    parser.add_argument('--in', dest='in_path', required=True)
+    parser.add_argument('--out', required=True)
+    parser.add_argument('--target', choices=['kalman', 'servo'], default='kalman')
+    parser.add_argument('--r-xy', type=float, default=1e-4)
+    parser.add_argument('--r-z', type=float, default=1e-4)
+    parser.add_argument('--q-pos', type=float, default=1e-4)
+    parser.add_argument('--q-vel', type=float, default=1e-2)
+    parser.add_argument('--p0-vel-reset', type=float, default=1.0)
+    parser.add_argument('--innov-low', type=float, default=0.010)
+    parser.add_argument('--innov-high', type=float, default=0.040)
+    parser.add_argument('--w-alpha', type=float, default=0.3)
+    parser.add_argument('--dt-latency', type=float, default=0.05)
+    parser.add_argument('--t-lost', type=float, default=0.3)
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = _parse_args(argv)
+    rows = read_track_csv(args.in_path)
+    kalman_kwargs = dict(
+        q_pos=args.q_pos, q_vel=args.q_vel, r_xy=args.r_xy, r_z=args.r_z,
+        p0_vel_reset=args.p0_vel_reset)
+    if args.target == 'kalman':
+        records = replay_kalman(rows, **kalman_kwargs)
+    else:
+        records = replay_servo(
+            rows, dt_latency=args.dt_latency, t_lost_s=args.t_lost,
+            innov_low=args.innov_low, innov_high=args.innov_high,
+            w_alpha=args.w_alpha, **kalman_kwargs)
+    write_replay_csv(args.out, records)
+    print(f'{len(records)}개 행 재생 완료: {args.out}')
+
+
+if __name__ == '__main__':
+    main()

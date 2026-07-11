@@ -1,5 +1,5 @@
 import pytest
-from robot_control.tools.kalman_replay import TrackRow, read_track_csv, write_replay_csv, replay_kalman, replay_servo
+from robot_control.tools.kalman_replay import TrackRow, read_track_csv, write_replay_csv, replay_kalman, replay_servo, _parse_args, main
 
 
 def test_read_track_csv_parses_rows_and_casts_types(tmp_path):
@@ -98,3 +98,43 @@ def test_replay_servo_no_false_tracking_lost_for_normal_frame_gaps():
                             innov_high=0.040, w_alpha=0.3, q_pos=1e-4, q_vel=1e-2,
                             r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0)
     assert all(r['abort_reason'] == '' for r in records)
+
+
+def test_parse_args_requires_in_and_out():
+    with pytest.raises(SystemExit):
+        _parse_args(['--target', 'kalman'])
+
+
+def test_parse_args_defaults():
+    args = _parse_args(['--in', 'a.csv', '--out', 'b.csv'])
+    assert args.target == 'kalman'
+    assert args.r_xy == pytest.approx(1e-4)
+    assert args.innov_low == pytest.approx(0.010)
+
+
+def test_main_target_kalman_writes_output_csv(tmp_path):
+    in_path = tmp_path / 'in.csv'
+    in_path.write_text(
+        'stamp_s,recv_monotonic_s,x,y,z,depth_valid\n'
+        '0.0,100.0,0.5,0.1,0.05,True\n'
+        '0.02,100.02,0.5,0.1,0.05,True\n'
+    )
+    out_path = tmp_path / 'out.csv'
+    main(['--in', str(in_path), '--out', str(out_path), '--target', 'kalman'])
+    lines = out_path.read_text().strip().splitlines()
+    assert lines[0] == 'stamp_s,innovation_xy_m,x,y,z,vx,vy'
+    assert len(lines) == 3
+
+
+def test_main_target_servo_writes_output_csv(tmp_path):
+    in_path = tmp_path / 'in.csv'
+    in_path.write_text(
+        'stamp_s,recv_monotonic_s,x,y,z,depth_valid\n'
+        '0.0,100.0,0.5,0.1,0.05,True\n'
+        '0.02,100.02,0.49,0.1,0.05,True\n'
+    )
+    out_path = tmp_path / 'out.csv'
+    main(['--in', str(in_path), '--out', str(out_path), '--target', 'servo'])
+    lines = out_path.read_text().strip().splitlines()
+    assert lines[0] == 'stamp_s,w,w_target,innovation_xy_m,depth_valid,abort_reason'
+    assert len(lines) == 3
