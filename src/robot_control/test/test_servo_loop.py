@@ -1,3 +1,4 @@
+import math
 import time
 
 import numpy as np
@@ -208,6 +209,63 @@ def test_z_lock_persists_after_noisy_z_gap_reopens():
     assert cmd.vz == 0.0              # 잠금 덕분에 재하강하지 않는다
 
 
+def test_descend_vz_capped_by_stopping_distance_near_target():
+    # z_gap이 작을 땐 descend_accel_m_s2로 정지 가능한 속도(sqrt(2*a*z_gap))로
+    # vz가 캡핑되어야 한다 - 감속 없이 descend_speed 그대로 내려가다 명령만 0으로
+    # 바뀌면 가속도 제한 때문에 관성으로 더 내려간다(2026-07-10 실기: 바닥 충돌).
+    loop = _make_loop(eps_descend=0.5, z_close=0.001, n_stable_z=100,
+                       descend_accel_m_s2=0.1)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.02))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.02))
+    tcp = (0.0, 0.0, 0.03, 0, 0, 0)
+    cmd = loop.step(tcp, time.monotonic())
+    expected_speed = math.sqrt(2.0 * 0.1 * loop._last_z_gap)
+    assert cmd.vz == pytest.approx(-expected_speed, rel=1e-3)
+    assert abs(cmd.vz) < loop.descend_speed
+
+
+def test_descend_vz_capped_using_margin_shifted_brake_distance():
+    # descend_stop_margin_m>0이면 제동 곡선이 z_gap=0이 아니라 z_gap=margin에서
+    # 속도 0을 겨냥해야 한다 - sqrt(2*a*max(z_gap-margin,0)).
+    loop = _make_loop(eps_descend=0.5, z_close=0.001, n_stable_z=100,
+                       descend_accel_m_s2=0.1, descend_stop_margin_m=0.01)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.02))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.02))
+    tcp = (0.0, 0.0, 0.08, 0, 0, 0)
+    cmd = loop.step(tcp, time.monotonic())
+    expected_speed = math.sqrt(2.0 * 0.1 * max(loop._last_z_gap - 0.01, 0.0))
+    assert cmd.vz == pytest.approx(-expected_speed, rel=1e-3)
+    assert abs(cmd.vz) > 0.0
+
+
+def test_descend_vz_is_zero_when_z_gap_within_margin():
+    # z_gap이 margin 이내로 좁혀지면(제동 곡선상 남은 제동거리가 0) vz가 0이어야
+    # 한다 - 표면 접촉 없이 margin 지점에서 자연스럽게 멈춰야 한다.
+    loop = _make_loop(eps_descend=0.5, z_close=0.001, n_stable_z=100,
+                       descend_accel_m_s2=0.1, descend_stop_margin_m=0.01)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.02))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.02))
+    tcp = (0.0, 0.0, 0.025, 0, 0, 0)
+    cmd = loop.step(tcp, time.monotonic())
+    assert loop._last_z_gap <= 0.01
+    assert cmd.vz == 0.0
+
+
+def test_descend_vz_equals_descend_speed_when_far_from_target():
+    # z_gap이 커서 정지 가능 속도가 descend_speed보다 크면, 예전처럼 descend_speed
+    # 그대로 상한이 걸려야 한다(원거리 하강 속도는 그대로 유지).
+    loop = _make_loop(eps_descend=0.5, descend_speed=0.10, descend_accel_m_s2=0.1)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.5))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.5))
+    tcp = (0.0, 0.0, 0.3, 0, 0, 0)
+    cmd = loop.step(tcp, time.monotonic())
+    assert cmd.vz == pytest.approx(-0.10, abs=1e-6)
+
+
 def test_should_abort_timeout():
     loop = _make_loop(timeout_s=0.0)
     loop.start('spanner', 30.0, 20.0)
@@ -227,3 +285,22 @@ def test_should_abort_none_when_healthy():
     loop.start('spanner', 30.0, 20.0)
     loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
     assert loop.should_abort() is None
+
+
+def test_should_abort_not_diverging_when_monotonic_increase_below_min_delta():
+    # 5틱 연속 증가하지만 총 증가폭이 diverge_min_delta_m(기본 0.01m) 미만인 경우 -
+    # 비전 갱신 사이 lead_time 외삽만으로 생기는 노이즈 수준 증가는 발산으로 보면 안 된다.
+    loop = _make_loop(diverge_n=5)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
+    loop._error_history = [0.100, 0.101, 0.102, 0.103, 0.104]
+    assert loop.should_abort() is None
+
+
+def test_should_abort_diverging_when_monotonic_increase_meets_min_delta():
+    # 5틱 연속 증가하고 총 증가폭도 diverge_min_delta_m 이상이면 여전히 발산으로 잡아야 한다.
+    loop = _make_loop(diverge_n=5)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
+    loop._error_history = [0.10, 0.12, 0.14, 0.16, 0.20]
+    assert loop.should_abort() == 'diverging'

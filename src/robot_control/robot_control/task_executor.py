@@ -16,11 +16,15 @@ from robot_control.speedl_watchdog import SpeedlWatchdog
 class TaskExecutor:
     """RobotTask 5종을 실행하는 RobotControlNode용 mixin."""
 
-    def _cleanup_stop_motion(self) -> bool:
-        """M0609 MoveStop 정지를 시도한다. 실패/예외 시에도 절대 상위로 전파하지 않는다."""
+    def _cleanup_stop_motion(self, stop_mode=None) -> bool:
+        """M0609 MoveStop 정지를 시도한다. 실패/예외 시에도 절대 상위로 전파하지 않는다.
+        stop_mode 미지정 시 safety.fault_stop_mode(빠른 정지)를 쓴다 - 원인이 불명확한
+        예외/종료 경로의 기본값이다. 취소/일반 abort처럼 위험 상황이 아닌 정지는
+        호출측이 safety.recoverable_stop_mode(부드러운 정지)를 명시적으로 넘긴다."""
         if not self.hardware_enabled or self._doosan is None:
             return True
-        stop_mode = self.get_parameter('safety.fault_stop_mode').value
+        if stop_mode is None:
+            stop_mode = self.get_parameter('safety.fault_stop_mode').value
         try:
             return bool(self._doosan.stop(stop_mode))
         except Exception as exc:
@@ -328,9 +332,18 @@ class TaskExecutor:
         tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
         command = self.servo_loop.step(tcp_pose_m, time.monotonic())
         if bool(self.get_parameter('debug.log_servo_decisions').value):
+            snap = self.servo_loop.debug_snapshot()
+            # 2026-07-11 실기: 락(vz=0) 이후에도 tcp z가 추가로 내려가는 현상의 원인
+            # 후보 중 하나가 이 캐시의 staleness라 임시로 나이도 같이 남긴다 - throttle도
+            # 0.5s->0.05s로 줄여 락 전후 수백 ms 구간을 촘촘히 볼 수 있게 한다. 진단
+            # 끝나면 원래 값(0.5s, age_s 없이)으로 되돌려도 된다.
+            cache_age_s = time.monotonic() - self._tcp_pose_cache['received_at']
             self.get_logger().info(
-                f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m}',
-                throttle_duration_sec=0.5)
+                f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m} '
+                f'z_gap={snap["last_z_gap_m"]} z_stable_count={snap["z_stable_count"]} '
+                f'depth_valid={snap["depth_valid"]} vz={snap["cmd_m_s"]["vz"]} '
+                f'tcp_cache_age_s={cache_age_s:.3f}',
+                throttle_duration_sec=0.05)
         return command
 
     def _get_current_tcp_posx(self, max_age_parameter='servo_pick.tcp_pose_max_age_s'):
@@ -449,7 +462,9 @@ class TaskExecutor:
 
             while rclpy.ok():
                 if goal_handle.is_cancel_requested:
-                    if not self._cleanup_stop_motion():
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    if not self._cleanup_stop_motion(recoverable_stop_mode):
                         detail = f'{name} 취소 중 MoveStop 실패'
                         self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                         outcome = 'FAULT'
@@ -466,7 +481,19 @@ class TaskExecutor:
                 feedback.state = servo.get_state()
                 goal_handle.publish_feedback(feedback)
                 if state == 'ABORT':
-                    outcome, detail = 'ABORT', reason
+                    # 취소/예외 경로와 달리 이 분기가 그냥 break만 하던 시절에는
+                    # SpeedlWatchdog이 곧장 stop()으로 해제되어(finally 블록)
+                    # 타임아웃이 뜰 새도 없이 로봇이 마지막 속도로 계속 움직였다
+                    # (2026-07-10 실기에서 diverging abort 후 관성 하강으로 바닥 충돌
+                    # 확인). 취소 경로와 동일하게 여기서도 명시적으로 MoveStop을 건다.
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    if not self._cleanup_stop_motion(recoverable_stop_mode):
+                        detail = f'{name} aborted({reason}) 중 MoveStop 실패'
+                        self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                        outcome = 'FAULT'
+                    else:
+                        outcome, detail = 'ABORT', reason
                     break
                 if state in ('CLOSE', 'STOP'):
                     outcome, detail = 'ARRIVED', ''

@@ -184,7 +184,9 @@ def test_track_tool_filters_by_class_and_reconstructs_position(node):
     assert track is not None
     assert track.tool_class == 'spanner'
     assert track.pose.position.z == pytest.approx(0.5, abs=1e-3)
-    assert track.depth_valid is True
+    # keypoint 없는 Detection2D는 bbox 모드로 잡히고, bbox는 mid가 아니라서
+    # depth_valid가 False로 강제된다(2026-07-11 - mid가 아닌 z는 신뢰하지 않음).
+    assert track.depth_valid is False
     assert track.confidence == pytest.approx(0.9, abs=1e-6)
     # position/orientation을 base_link로 변환했으므로 frame_id도 base_link여야 한다 -
     # color_msg.header(카메라 프레임)를 그대로 복사하면 robot_control의 프레임 검증에서 거부됨.
@@ -652,7 +654,8 @@ def test_track_tool_success_publishes_tool_track_valid_checkpoint(node):
     assert matches[0]['phase'] == 'C'
     assert matches[0]['status'] == 'PASS'
     assert matches[0]['data']['tool_class'] == 'spanner'
-    assert matches[0]['data']['depth_valid'] is True
+    # keypoint 없는 Detection2D는 bbox 모드 - mid가 아니라서 depth_valid는 False.
+    assert matches[0]['data']['depth_valid'] is False
 
 
 def test_track_tool_missing_target_does_not_publish_checkpoint(node):

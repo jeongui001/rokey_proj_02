@@ -1091,6 +1091,12 @@ def test_servo_loop_wires_innovation_and_kalman_params_from_ros_params(node):
     assert node.servo_loop.w_alpha == node.get_parameter('servo.w_alpha').value
     assert node.servo_loop.z_close == node.get_parameter('servo.z_close').value
     assert node.servo_loop.diverge_n == node.get_parameter('servo.diverge_n').value
+    assert (node.servo_loop.diverge_min_delta_m
+            == node.get_parameter('servo.diverge_min_delta_m').value)
+    assert node.servo_loop.descend_accel_m_s2 == pytest.approx(
+        node.get_parameter('servo_pick.speedl_acc_trans_mm_s2').value / 1000.0)
+    assert (node.servo_loop.descend_stop_margin_m
+            == node.get_parameter('servo.descend_stop_margin_m').value)
     assert node.servo_loop.cov_threshold == node.get_parameter('servo.cov_threshold').value
     assert node.servo_loop._filter.q_pos == node.get_parameter('servo.kalman_q_pos').value
     assert node.servo_loop._filter.q_vel == node.get_parameter('servo.kalman_q_vel').value
@@ -1273,6 +1279,63 @@ def test_execute_servo_pick_abort_returns_reason(node, monkeypatch):
     assert result.message == 'diverged'
 
 
+def test_execute_servo_pick_abort_calls_move_stop_when_hardware_enabled(node, monkeypatch):
+    # diverging/timeout/tracking_lost 같은 일반 ABORT도 취소 경로와 동일하게 실제
+    # MoveStop을 걸어야 한다 - 안 그러면 로봇이 마지막 속도로 계속 움직인다
+    # (2026-07-10 실기: diverging abort 후 관성 하강으로 바닥 충돌 확인).
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    node._servo_pick_tick = lambda: ('ABORT', 'diverged')
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert result.message == 'diverged'
+    assert fake.stop_calls == [node.get_parameter('safety.recoverable_stop_mode').value]
+
+
+def test_execute_servo_pick_abort_declares_fault_when_move_stop_fails(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
+    fake = _FakeDoosanDriver()
+    fake.stop_return_value = False
+    node._doosan = fake
+    node._servo_pick_tick = lambda: ('ABORT', 'diverged')
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+    published = []
+    node.pub_fault.publish = published.append
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert node.safety_state == SafetyState.FAULT
+    assert len(published) == 1
+    assert published[0].data.startswith(FaultPrefix.FAULT)
+
+
 def test_execute_servo_pick_cancel_mid_loop_calls_canceled(node, monkeypatch):
     import time as time_module
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
@@ -1314,7 +1377,7 @@ def test_execute_servo_pick_cancel_calls_real_move_stop_when_hardware_enabled(no
 
     assert gh.was_canceled is True
     assert result.success is False
-    assert fake.stop_calls == [node.get_parameter('safety.fault_stop_mode').value]
+    assert fake.stop_calls == [node.get_parameter('safety.recoverable_stop_mode').value]
 
 
 # ---- servo_pick: cleanup(MoveStop/subscription) 실패 시 취소 성공으로 가장하지 않음 ----

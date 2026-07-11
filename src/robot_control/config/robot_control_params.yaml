@@ -52,19 +52,41 @@
       kp_xy: 1.2               # 수평 P 게인, 클수록 오차에 민감하게 반응
       kp_yaw: 1.0               # yaw P 게인(현재 yaw=0 고정이라 미사용), 클수록 오차에 민감
       v_max: 0.25               # 수평 속도 상한(m/s), 
-      descend_speed: 0.10       # 하강 속도(m/s)
+      descend_speed: 0.05       # 하강 속도(m/s)
       eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
       eps_grasp: 1.0         # 폐합 판정 수평 오차 임계(m)
       n_stable: 1              # 폐합 판정에 필요한 연속 안정 주기 수, 일단 끈 상태(1)
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
-      timeout: 5.0              # 서보 전체 타임아웃(s)
+      timeout: 10.0              # 서보 전체 타임아웃(s)
       t_lost: 0.3               # 추적 유실 판정 시간(s)
       innov_low: 0.010   # 이 잔차(m) 이하 -> w=1(피드포워드 완전 신뢰)
       innov_high: 0.040  # 이 잔차(m) 이상 -> w=0 + 속도 공분산 리셋
       w_alpha: 0.3        # w의 저역통과 스무딩 계수
-      z_close: 0.05       # 폐합 판정 z_gap(m) 임계, 너무 위에서 잡으면 낮추고 너무 아래서 잡으면 키우기
-      n_stable_z: 2       # z_close 판정에 필요한 연속 안정 주기 수 - depth 단발 노이즈로 조기 정지되는 걸 막음(n_stable과 같은 방식)
+      # 폐합 판정 z_gap(m) 임계, 너무 위에서 잡으면 낮추고 너무 아래서 잡으면 키우기.
+      # 2026-07-10부터 하강이 남은 z_gap 기준으로 미리 감속한다(servo_pick.
+      # speedl_acc_trans_mm_s2 가속도로 정지 가능한 속도로 상한, servo_loop.py
+      # step() 참고). 단, descend_stop_margin_m 도입 전에는 제동 곡선이 표면
+      # (z_gap=0)에서 속도 0을 겨냥해 z_close 자체가 "락 이후 예상 관성
+      # 오버슈트"로 고스란히 소진됐다 - 2026-07-11 실기: z_close=0.03, 락 시점
+      # 속도 ~77mm/s, 관성거리 ~30mm(≈z_close)로 정지 물체인데도 바닥 충돌
+      # 확인(목표 z가 이미 테이블면에 가까운 얇은 도구라 여유가 없었음).
+      # 2026-07-11 실기: margin=0.005/0.02 모두 락 이후에도(vz=0 로깅된 뒤에도)
+      # tcp z가 추가로 십수 mm 더 내려가는 현상 확인(정확한 메커니즘 미확정 -
+      # tcp_pose 캐시 staleness 또는 그리퍼 폐합 반력 추정 중). margin이 z_close에
+      # 바짝 붙어 있으면 이 여유를 흡수 못 하므로 z_close도 함께 올려 여유를 키운다.
+      z_close: 0.03 # 언제 도착 판정을 시작할지 결정
+      # 하강 제동 곡선이 표면이 아니라 표면 위 이 마진(m)에서 속도 0을 겨냥하게 해,
+      # 락 이후 관성으로도 표면과 이 만큼의 여유를 남긴다 - z_close보다 반드시
+      # 작아야 한다(같거나 크면 z_gap이 z_close 밑으로 내려가기 전에 이미 속도가
+      # 0에 수렴해 폐합 조건이 영원히 안 걸릴 수 있다). 실측 없이 추정한 값이라
+      # 실기에서 그리퍼-테이블 간극에 맞게 튜닝이 필요하다.
+      descend_stop_margin_m: 0.010 # 낮추면 더 아래로 잡음, 높이면 더 위로 잡음
+      n_stable_z: 5       # z_close 판정에 필요한 연속 안정 주기 수 - depth 단발 노이즈로 조기 정지되는 걸 막음(n_stable과 같은 방식)
       diverge_n: 15       # 발산 판정에 볼 연속 오차 개수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~8.6개치)
+      # diverge_n틱 연속 증가에 더해 요구하는 최소 총 증가폭(m) - 비전 갱신 사이 lead_time
+      # 외삽만으로 생기는 미세한 연속 증가(정지 물체에서도 관측됨, 2026-07-10)를 걸러내기
+      # 위함. 실기 튜닝 대상 - diverging이 안 잡히면 낮추고, 여전히 오탐이면 올리기.
+      diverge_min_delta_m: 0.01
       cov_threshold: 100.0 # 폐합 판정용 속도 공분산 임계, 일단 끈 상태(1)
       kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
       kalman_q_vel: 1.0e-2      # 프로세스 노이즈(속도)
@@ -208,6 +230,11 @@
         # 종료 안전 마진이었으나 다른 external_torque.* 값들과 함께 승격했다.
         stop_join_timeout_s: 2.0
       fault_stop_mode: 1  # TODO(전문가 검토 필요): MoveStop stop_mode 0~3 중 선택
+      # diverging/timeout/tracking_lost/취소처럼 위험 상황이 아닌 정상 회수 정지용
+      # (_run_rt_tracking cancel/abort 분기) - fault_stop_mode(QUICK)는 실제 안전
+      # FAULT 전용으로 남겨 둔다. 0=QUICK_STO, 1=QUICK, 2=SLOW, 3=HOLD(비상정지).
+      # 2026-07-10 실기: abort마다 QUICK 급정지로 매번 "덜컹"거림 확인 - SLOW로 완화.
+      recoverable_stop_mode: 2
       # DRFL 직접 연결 도입 전에는 이 폴링 주기 자체를 줄여서 두산 자체 반응
       # 속도와 격차를 줄이려 했으나(0.1 -> 0.02), 외력 감지를 DrflForceMonitor로
       # 완전히 옮기면서 그 이유가 없어져 기본값(0.1)으로 되돌렸다 - 이 폴링은 이제

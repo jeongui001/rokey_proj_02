@@ -86,7 +86,9 @@ def test_tracker_first_frame_uses_highest_score_and_zero_velocity():
         dets, 'spanner', reconstruct, stamp=0.0)
     assert position == pytest.approx((0.25, 0.25, 0.05))
     assert velocity == pytest.approx((0.0, 0.0))
-    assert depth_valid is True
+    # keypoint가 없는 FakeDetection은 bbox 모드로 잡히고, bbox는 mid가 아니라서
+    # depth_valid가 False로 강제된다(2026-07-11 - mid가 아닌 z는 신뢰하지 않음).
+    assert depth_valid is False
     assert chosen_det is dets[1]  # 최고 score 검출의 원본이 그대로 돌아와야 한다
 
 
@@ -204,13 +206,73 @@ def test_tracker_single_kpt_without_history_falls_back_to_bbox():
     assert position[0] == pytest.approx(0.2, abs=1e-6)
 
 
+def test_tracker_p0_mode_freezes_z_at_last_mid_value():
+    """mid가 아닌 모드(p0/p1/bbox)의 raw z는 신뢰하지 않고 마지막 mid z에 고정해야
+    한다(2026-07-11) - p0/p1/bbox의 raw z는 파지점이 아닌 kpt/bbox 중심 depth라
+    노이즈가 커서(실기: 이동 물체 픽에서 p0 구간 5초 동안 raw z가 1.6~12.3mm로
+    흔들리며 그 위로도 벗어난 값에 정착 - 허공을 잡음) 스무딩만으로는 못 거른다.
+    컨베이어 평면 가정상 z는 접근 중 안 변해야 하므로 mid에서 확정한 값을 계속
+    믿는 게 재측정보다 낫다."""
+    def reconstruct(cx, cy, bw, bh):
+        z = 0.55 if (cx, cy) == (110.0, 130.0) and calls['n'] > 0 else 0.40
+        return (cx / 1000.0, cy / 1000.0, z, True)
+
+    calls = {'n': 0}
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    tracker.update([_kpt_det()], 'spanner', reconstruct, stamp=0.0)  # mid, z=0.40
+    assert tracker.position[2] == pytest.approx(0.40, abs=1e-6)
+
+    calls['n'] = 1
+    d = _kpt_det(bbox=(100, 100, 200, 240), p1=(190.0, 110.0, 0.002))
+    position, _, depth_valid, _ = tracker.update([d], 'spanner', reconstruct, stamp=0.1)
+    assert tracker.last_mode == 'p0'
+    # raw z=0.55이지만 mid가 아니므로 무시되고 마지막 mid z(0.40)에 고정돼야 한다
+    assert position[2] == pytest.approx(0.40, abs=1e-6)
+    assert depth_valid is False
+
+
+def test_tracker_uses_raw_z_when_no_mid_ever_seen():
+    """mid를 한 번도 못 거친 채로 시작부터 p0/p1/bbox면(얼릴 last_mid_z가 없음)
+    어쩔 수 없이 raw z를 alpha_z_offset_mode로 스무딩해 쓴다."""
+    tracker = ToolTracker(alpha=1.0, beta=1.0, alpha_z_offset_mode=0.1)
+    d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
+    position, _, depth_valid, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
+    assert tracker.last_mode == 'bbox'
+    assert position[2] == pytest.approx(0.5, abs=1e-6)
+    assert depth_valid is False
+
+
+def test_tracker_last_mode_is_mid_when_both_kpts_confident():
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
+    assert tracker.last_mode == 'mid'
+
+
+def test_tracker_last_mode_falls_back_to_bbox_without_offset_history():
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
+    tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
+    assert tracker.last_mode == 'bbox'
+
+
+def test_tracker_last_mode_is_p0_when_offset_learned_and_p1_lost():
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
+    d = _kpt_det(bbox=(100, 100, 200, 240), p1=(190.0, 110.0, 0.002))
+    tracker.update([d], 'spanner', _px_reconstruct, stamp=0.1)
+    assert tracker.last_mode == 'p0'
+
+
 def test_tracker_reset_clears_learned_offset():
     """set_mode 재진입(reset) 후에는 이전 도구의 오프셋이 새 도구에 새어들면 안 된다."""
     tracker = ToolTracker(alpha=1.0, beta=1.0)
     tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
     assert tracker.kpt_offset is not None
+    assert tracker.last_mid_z is not None
     tracker.reset()
     assert tracker.kpt_offset is None
+    assert tracker.last_mode is None
+    assert tracker.last_mid_z is None
     d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
     position, _, _, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.1)
     assert position[0] == pytest.approx(0.2, abs=1e-6)  # bbox 폴백
