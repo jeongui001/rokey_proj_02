@@ -9,6 +9,8 @@ docs/superpowers/specs/2026-07-11-kalman-servo-control-tuning-design.md
 import argparse
 import csv
 
+from robot_control.kalman import KalmanXYZV
+
 
 class TrackRow:
     def __init__(self, stamp_s, recv_monotonic_s, x, y, z, depth_valid):
@@ -45,3 +47,31 @@ def write_replay_csv(path, records):
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(records)
+
+
+def replay_kalman(rows, q_pos, q_vel, r_xy, r_z, p0_vel_reset):
+    """rows를 KalmanXYZV.predict()/update_*()에 순서대로 주입 - ServoLoop의
+    w/innovation 스무딩 없이 필터 자체의 수렴만 본다(1단계 r_xy/r_z 검증용)."""
+    kf = KalmanXYZV(q_pos=q_pos, q_vel=q_vel, r_xy=r_xy, r_z=r_z, p0_vel_reset=p0_vel_reset)
+    records = []
+    prev_stamp = None
+    for row in rows:
+        if not kf._initialized:
+            kf.initialize(row.x, row.y, row.z)
+            prev_stamp = row.stamp_s
+            innovation = None
+        else:
+            dt = max(row.stamp_s - prev_stamp, 1e-3)
+            kf.predict(dt)
+            if row.depth_valid:
+                innovation = kf.update_xyz([row.x, row.y, row.z])
+            else:
+                innovation = kf.update_xy_only([row.x, row.y])
+            prev_stamp = row.stamp_s
+        records.append({
+            'stamp_s': row.stamp_s,
+            'innovation_xy_m': innovation,
+            'x': kf.position[0], 'y': kf.position[1], 'z': kf.position[2],
+            'vx': kf.velocity[0], 'vy': kf.velocity[1],
+        })
+    return records
