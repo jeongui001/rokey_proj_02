@@ -1,6 +1,6 @@
 import pytest
 from robot_control.servo_loop import ServoLoop
-from robot_control.tools.simulate_conveyor import make_scenario, run_servo_sim
+from robot_control.tools.simulate_conveyor import make_scenario, run_servo_sim, _parse_args
 
 
 def _make_loop():
@@ -42,3 +42,13 @@ def test_short_oscillation_scenario_produces_lower_average_w_than_constant():
     avg_w_const = sum(row['w'] for row in const_log) / len(const_log)
     avg_w_osc = sum(row['w'] for row in osc_log) / len(osc_log)
     assert avg_w_osc < avg_w_const
+
+
+def test_parse_args_defaults_to_current_yaml_kp_xy():
+    args = _parse_args([])
+    assert args.kp_xy == [1.2]
+
+
+def test_parse_args_accepts_multiple_kp_xy_candidates():
+    args = _parse_args(['--kp-xy', '1.0', '1.5', '2.0'])
+    assert args.kp_xy == [1.0, 1.5, 2.0]
