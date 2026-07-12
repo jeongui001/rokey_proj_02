@@ -389,7 +389,13 @@ class VisionNode(Node):
                 self._track_hand, color_msg, depth_msg, info_msg, tf_at_stamp, default=None)
             if hand_track is not None:
                 self.pub_hand_track.publish(hand_track)
-        # mode == OFF면 아무것도 안 하고 그냥 리턴 (프레임 버림)
+        elif self.publish_debug_image:
+            # mode == OFF: 추적/서보 목표용 데이터는 발행하지 않지만(ToolTrack/
+            # HandTrack), GUI가 카메라 연결 여부를 항상 눈으로 확인할 수 있도록
+            # 인식 박스 없는 원본 화면은 그대로 흘려보낸다. tool_detection_node는
+            # 모드와 무관하게 항상 돌고 있어 detection_msg는 이미 매 프레임
+            # 들어오지만, OFF일 때는 그 결과를 화면에 그리지 않는다(detections=[]).
+            self._safe_call(self._publish_debug_image, color_msg, [], None, None, default=None)
 
     def _tf_matrix(self, tf_at_stamp):
         """TransformStamped -> tracking.transform_to_matrix가 쓰는 (translation, rotation) 형태로."""

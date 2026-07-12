@@ -10,6 +10,7 @@ def test_stop_keyword_synonyms():
     assert parse_command('스톱') == {'type': Command.STOP}
     assert parse_command('중지해줘') == {'type': Command.STOP}
     assert parse_command('그만') == {'type': Command.STOP}
+    assert parse_command('일시정지') == {'type': Command.STOP}
 
 
 def test_reset_keyword():

@@ -491,7 +491,7 @@ class MainWindow(QtWidgets.QMainWindow):
         move_group.setLayout(pose_grid)
 
         estop_group = QtWidgets.QGroupBox('비상 조치')
-        self.stop_button = QtWidgets.QPushButton('작업 중단')
+        self.stop_button = QtWidgets.QPushButton('일시정지')
         self.stop_button.setObjectName('dangerButton')
         self.stop_button.clicked.connect(lambda: self._send_text(CMD_STOP))
         self.reset_button = QtWidgets.QPushButton('복구 요청 (리셋)')
@@ -516,6 +516,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.command_input.setPlaceholderText('예: 드라이버 가져와')
         self.send_button = QtWidgets.QPushButton('전송')
         self.send_button.clicked.connect(self._on_send_clicked)
+        self.command_input.returnPressed.connect(self._on_send_clicked)
         free_command_layout = QtWidgets.QHBoxLayout()
         free_command_layout.addWidget(self.command_input)
         free_command_layout.addWidget(self.send_button)

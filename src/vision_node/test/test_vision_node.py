@@ -118,6 +118,36 @@ def test_synced_images_skips_when_tf_lookup_fails(node):
     assert called == []
 
 
+def test_synced_images_off_mode_still_publishes_raw_debug_image(node):
+    # mode==OFF에서도 GUI가 카메라 연결을 상시 확인할 수 있도록 인식 박스 없는
+    # 원본 프리뷰는 계속 흘려보낸다 (ToolTrack/HandTrack은 발행하지 않음).
+    node.mode = SetVisionMode.Request.OFF
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+
+    calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: calls.append(
+        (detections, chosen_det, axis_debug))
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [([], None, None)]
+
+
+def test_synced_images_off_mode_skips_debug_image_when_disabled(node):
+    node.mode = SetVisionMode.Request.OFF
+    node.publish_debug_image = False
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+
+    calls = []
+    node._publish_debug_image = lambda *a, **k: calls.append(1)
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == []
+
+
 def test_synced_images_dispatches_to_track_hand(node):
     node.mode = SetVisionMode.Request.TRACK_HAND
     node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'

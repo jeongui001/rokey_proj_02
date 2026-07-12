@@ -157,6 +157,101 @@ def test_move_named_unconfigured_named_pose_rejected_when_hardware_enabled(node)
     assert result.success is False
 
 
+# ---- move_named: 이동 전 그리퍼 open 보장 (home/watch - 물건 가지러 가기 시작점) ----
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_opens_gripper_before_moving_when_not_already_open(node, named_target):
+    calls = []
+    node._is_gripper_already_open = lambda: False
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
+    node._call_move_service = lambda **kw: calls.append(('move', kw)) or True
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+
+    result = node._execute_move_named(gh)
+
+    assert calls[0] == 'open'
+    assert calls[1] == ('move', {'named_target': named_target, 'goal_handle': gh})
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_skips_open_when_gripper_already_open(node, named_target):
+    # 이미 열려있는 상태에서 또 여는 명령을 보내 불필요한 재통신(및 그로 인한
+    # 오탐 FAULT 위험)을 만들지 않는다 - _is_gripper_already_open()의 존재 이유.
+    calls = []
+    node._is_gripper_already_open = lambda: True
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
+    node._call_move_service = lambda **kw: calls.append(('move', kw)) or True
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+
+    result = node._execute_move_named(gh)
+
+    assert calls == [('move', {'named_target': named_target, 'goal_handle': gh})]
+    assert gh.succeeded is True
+    assert result.success is True
+
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_cancel_before_opening_gripper_does_not_open(node, named_target):
+    calls = []
+    node._is_gripper_already_open = lambda: False
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+    gh.is_cancel_requested = True
+
+    result = node._execute_move_named(gh)
+
+    assert calls == []
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_fault_before_opening_gripper_does_not_open(node, named_target):
+    calls = []
+    node._is_gripper_already_open = lambda: False
+    node.rg2_client.open = lambda goal_handle=None: calls.append('open') or True
+    node.safety_state = SafetyState.FAULT
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+
+    result = node._execute_move_named(gh)
+
+    assert calls == []
+    assert gh.aborted is True
+    assert result.success is False
+
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_rg2_open_failure_declares_fault(node, named_target):
+    node._is_gripper_already_open = lambda: False
+    node.rg2_client.open = lambda goal_handle=None: False
+    node.rg2_client.last_status = RG2Status.COMMUNICATION_ERROR
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.aborted is True
+    assert result.success is False
+    assert node.safety_state == SafetyState.FAULT
+
+
+@pytest.mark.parametrize('named_target', ['home', 'watch'])
+def test_move_named_rg2_open_canceled_during_open_ends_as_canceled_not_fault(node, named_target):
+    node._is_gripper_already_open = lambda: False
+    node.rg2_client.open = lambda goal_handle=None: False
+    node.rg2_client.last_status = RG2Status.CANCELED
+    gh = FakeGoalHandle(_goal('move_named', named_target=named_target))
+
+    result = node._execute_move_named(gh)
+
+    assert gh.was_canceled is True
+    assert gh.aborted is False
+    assert result.success is False
+    assert node.safety_state == SafetyState.NORMAL
+
+
 def test_move_named_unknown_pose_name_rejected_even_in_dry_run(node):
     gh = FakeGoalHandle(_goal('move_named', named_target='not_a_real_pose'))
 

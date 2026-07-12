@@ -16,7 +16,7 @@ class Command:
     UNKNOWN = 'unknown'
 
 
-_STOP_KEYWORDS = ('멈춰', '정지', '스톱', '중지', '그만')
+_STOP_KEYWORDS = ('멈춰', '정지', '스톱', '중지', '그만', '일시정지')
 _RESET_KEYWORDS = ('리셋', '초기화', '복구')  # '복구'는 operator_gui 버튼 라벨("복구 요청")과도 일치
 _RESUME_KEYWORDS = ('재개', '계속', '이어서')
 

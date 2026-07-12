@@ -148,22 +148,24 @@ class TaskExecutor:
             return result
         named_target = goal_handle.request.named_target
         try:
-            if named_target == 'home':
-                # 홈으로 이동하기 전에는 다음 작업을 위해 그리퍼가 열린 상태임을
-                # 보장한다 - 이전에 어떤 경로로 왔든(수동 이동, pick 중단, 검증
-                # 실패 등) 그리퍼가 물체를 쥔 채로 홈에 도착하지 않도록 하는
-                # 안전/리셋 동작이다(_execute_release_and_retry의 RG2 open 처리와
-                # 동일한 패턴). 이미 열려있으면 불필요한 재통신을 피해 생략한다.
+            if named_target in ('home', 'watch'):
+                # home으로 이동하기 전, 그리고 watch(물건을 가지러 가기 시작점)로
+                # 이동하기 전에는 그리퍼가 열린 상태임을 보장한다 - 이전에 어떤
+                # 경로로 왔든(수동 이동, pick 중단, 검증 실패 등) 그리퍼가 물체를
+                # 쥔 채로 다음 작업을 시작하지 않도록 하는 안전/리셋 동작이다
+                # (_execute_release_and_retry의 RG2 open 처리와 동일한 패턴).
+                # 이미 열려있으면 불필요한 재통신(및 그로 인한 오탐 FAULT 위험)을
+                # 피해 생략한다 - _is_gripper_already_open() 참고.
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                     result.success = False
-                    result.message = 'move_named(home) canceled before opening gripper'
+                    result.message = f'move_named({named_target}) canceled before opening gripper'
                     return result
                 if self.safety_state != SafetyState.NORMAL:
                     goal_handle.abort()
                     result.success = False
                     result.message = (
-                        f'move_named(home) aborted before opening gripper - '
+                        f'move_named({named_target}) aborted before opening gripper - '
                         f'safety_state={self.safety_state}')
                     return result
                 if not self._is_gripper_already_open():
@@ -171,10 +173,10 @@ class TaskExecutor:
                         if self.rg2_client.last_status == RG2Status.CANCELED:
                             goal_handle.canceled()
                             result.success = False
-                            result.message = 'move_named(home) canceled during RG2 open'
+                            result.message = f'move_named({named_target}) canceled during RG2 open'
                             return result
                         detail = (
-                            f'move_named(home) RG2 open 실패'
+                            f'move_named({named_target}) RG2 open 실패'
                             f'(status={self.rg2_client.last_status}) - 안전을 위해 FAULT 처리')
                         self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
                         goal_handle.abort()

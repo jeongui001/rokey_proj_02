@@ -94,9 +94,30 @@ class SafetyRecovery:
             self.get_logger().warn(
                 f'사용자 명령을 파싱하지 못했습니다: {msg.data}', throttle_duration_sec=1.0)
 
+    def _clear_resume_snapshot(self):
+        self._resume_kind = None
+        self._resume_state = None
+        self._resume_tool = None
+        self._resume_grasp_spec = None
+
     def _handle_reset(self):
         if self.safety_state == Safety.NORMAL:
-            self._publish_status(detail='정상 상태입니다.')
+            # 정상 상태에서의 리셋은 "확실하게 대기모드로 되돌리기"다 - 일시정지로
+            # 남은 재개 스냅샷을 지우거나(_handle_stop 참고), 아직 진행 중인
+            # 작업이 있다면 취소까지 함께 한다(예전 "작업 중단" 버튼이 하던 일).
+            # 재개할 스냅샷도 없고 이미 IDLE이면 정말 할 일이 없는 경우다.
+            if self.state == State.IDLE and self._resume_kind is None:
+                self._publish_status(detail='정상 상태입니다.')
+                return
+            self._clear_resume_snapshot()
+            if self.state == State.IDLE:
+                self._set_state(State.IDLE, detail='리셋: 대기모드로 복귀')
+                return
+            if self._cancel_pending_callback is not None:
+                self._publish_status(detail='이미 취소 처리 중입니다.')
+                return
+            self._set_state(State.CANCELLING, detail='리셋 - 작업 취소 중')
+            self._request_cancel(lambda: self._set_state(State.IDLE, detail='리셋: 대기모드로 복귀'))
             return
         if self._recovery_in_progress:
             self._publish_status(detail='이미 복구 요청이 진행 중입니다.')

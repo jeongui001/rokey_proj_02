@@ -130,6 +130,14 @@ def test_send_button_ignores_empty_input(window, qtbot):
     assert window.ros_client.published == []
 
 
+def test_enter_key_in_command_input_publishes_command_and_clears_input(window, qtbot):
+    window.command_input.setText('스패너 갖다줘')
+    qtbot.keyClick(window.command_input, Qt.Key_Return)
+
+    assert window.ros_client.published == ['스패너 갖다줘']
+    assert window.command_input.text() == ''
+
+
 # ---- 연결 안 됐을 때 명령 차단 ----
 
 def test_command_blocked_when_not_connected(qtbot):

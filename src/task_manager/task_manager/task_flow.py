@@ -66,10 +66,7 @@ class TaskFlow:
         grasp_spec = self._resume_grasp_spec
         resume_state = self._resume_state
         # 재개는 1회성이다 - 실행을 시작하는 시점에 스냅샷을 지워 중복 재개를 막는다.
-        self._resume_kind = None
-        self._resume_state = None
-        self._resume_tool = None
-        self._resume_grasp_spec = None
+        self._clear_resume_snapshot()
 
         self.current_tool = tool
         if kind == 'continue':
@@ -123,12 +120,26 @@ class TaskFlow:
         self._set_state(State.IDLE, detail=f'{mode} 모드로 전환')
 
     def _handle_stop(self):
+        """"일시정지" 명령. 취소가 아니라 일시정지다 - 진행 중이던 동작을 그
+        자리에서 멈추되(robot_control이 action cancel 시 실제로 move_stop을
+        호출해 그 자리에서 서게 한다 - 이동 목표까지 다 가고 나서 멈추는 게
+        아니다) 재개 가능한 스냅샷을 남긴다. self.state가 아직 바뀌기 전에
+        캡처해야 하므로 _set_state(CANCELLING)보다 먼저 호출한다
+        (_enter_fault와 동일한 패턴, _capture_resume_snapshot 참고). 재개할 수
+        없는 상태(IDLE/MOVE_TO_WATCH/DETECT_TRACK 등)에서는 스냅샷이 비어
+        일반 취소와 동일하게 동작한다. "리셋"을 누르면 이 스냅샷을 지우고 완전히
+        취소한다(_handle_reset 참고)."""
         if self._cancel_pending_callback is not None:
             # 이미 취소 처리 중 - 기존 콜백을 덮어쓰지 않는다.
             self._publish_status(detail='이미 취소 처리 중입니다.')
             return
-        self._set_state(State.CANCELLING, detail='정지 명령 - 작업 취소 중')
-        self._request_cancel(lambda: self._set_state(State.IDLE, detail='정지: 작업 취소 완료'))
+        self._capture_resume_snapshot()
+        self._set_state(State.CANCELLING, detail='일시정지 - 현재 동작을 멈추는 중')
+        self._request_cancel(lambda: self._set_state(
+            State.IDLE,
+            detail=(
+                '일시정지됨 - 재개 버튼으로 이어서 진행할 수 있습니다.'
+                if self._resume_kind is not None else '일시정지: 취소 완료')))
 
     def _handle_manual_move(self, named_target):
         if self.operation_mode != Mode.MANUAL:
@@ -542,10 +553,7 @@ class TaskFlow:
             self._active_grasp_spec = None
             # 정상적으로 한 사이클을 완주했다 - 남아있을 수 있는 오래된 재개
             # 스냅샷(예: 이번 사이클 이전의 FAULT 기록)을 정리한다.
-            self._resume_kind = None
-            self._resume_state = None
-            self._resume_tool = None
-            self._resume_grasp_spec = None
+            self._clear_resume_snapshot()
             self._set_state(State.IDLE, detail=detail)
         else:
             self._enter_fault(result.message)
