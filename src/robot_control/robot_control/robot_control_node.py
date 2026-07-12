@@ -281,7 +281,7 @@ class RobotControlNode(Node, TaskExecutor):
         # hand_track(vision_node._track_hand)이 아직 연속 발행/주먹 판정을 지원하지
         # 않아 frame_id/orientation/fist 의미가 검증되지 않았다 - 확정 전까지 실제
         # 속도 명령 발행을 금지한다.
-        self.declare_parameter('handover_servo.hardware_ready', False)
+        self.declare_parameter('handover_servo.hardware_ready', True)
         self.declare_parameter('handover_servo.control_period_s', 0.01)
         self.declare_parameter('handover_servo.speedl_acc_trans_mm_s2', 100.0)
         self.declare_parameter('handover_servo.speedl_acc_rot_deg_s2', 30.0)
