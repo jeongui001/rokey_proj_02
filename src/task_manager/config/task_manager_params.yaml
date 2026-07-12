@@ -68,4 +68,5 @@
     wait_pull_reminder_interval_s: 10.0
     cancel_timeout_s: 5.0
     recovery_timeout_s: 5.0
+    vision_mode_timeout_s: 5.0
     status_publish_period_s: 1.0

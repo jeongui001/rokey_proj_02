@@ -68,6 +68,39 @@ def test_set_mode_off(node):
     assert node.mode == SetVisionMode.Request.OFF
 
 
+def test_set_mode_track_hand_enables_docker_hand_detection(node):
+    published = []
+    node.pub_hand_enable.publish = published.append
+    request = SetVisionMode.Request()
+    request.mode = SetVisionMode.Request.TRACK_HAND
+
+    node._on_set_mode(request, SetVisionMode.Response())
+
+    assert [msg.data for msg in published] == [True]
+
+
+def test_set_mode_track_tool_and_off_disable_docker_hand_detection(node):
+    published = []
+    node.pub_hand_enable.publish = published.append
+
+    for mode in (SetVisionMode.Request.TRACK_TOOL, SetVisionMode.Request.OFF):
+        request = SetVisionMode.Request()
+        request.mode = mode
+        node._on_set_mode(request, SetVisionMode.Response())
+
+    assert [msg.data for msg in published] == [False, False]
+
+
+def test_set_mode_track_hand_clears_stale_hand_detection(node):
+    node._hand_detection = ({'detected': True}, node.get_clock().now())
+    request = SetVisionMode.Request()
+    request.mode = SetVisionMode.Request.TRACK_HAND
+
+    node._on_set_mode(request, SetVisionMode.Response())
+
+    assert node._hand_detection is None
+
+
 def test_synced_images_dispatches_to_track_tool_and_publishes(node):
     node.mode = SetVisionMode.Request.TRACK_TOOL
     node.tool_class = 'spanner'

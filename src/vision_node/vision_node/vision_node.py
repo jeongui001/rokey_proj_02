@@ -10,10 +10,12 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data,
+)
 from tf2_ros import Buffer, TransformListener, TransformException
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from handover_interfaces.msg import ToolTrack, HandTrack, DetectionArray, VisionTiming
 from handover_interfaces.srv import SetVisionMode
@@ -150,6 +152,18 @@ class VisionNode(Node):
             CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
         self.pub_timing = self.create_publisher(VisionTiming, '/perception/timing', 10)  # 서브스크라이버: 팀 모니터링/tools 분석
+        # 컨테이너(hand_track_docker_node)를 TRACK_HAND 구간에서만 돌리기 위한 게이트.
+        # 컨테이너가 vision_node보다 늦게 떠도 현재 모드를 즉시 알 수 있어야 하므로
+        # transient_local로 마지막 값을 래치한다(구독자도 같은 QoS여야 래치를 받는다).
+        # 컨테이너 이미지에는 handover_interfaces가 없어서 std_msgs 타입만 쓸 수 있다.
+        gate_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_hand_enable = self.create_publisher(
+            Bool, '/vision/hand_track_enable', gate_qos)  # 서브스크라이버: hand_track_docker_node(컨테이너)
+        self._publish_hand_enable(False)  # 기동 직후엔 꺼진 상태로 시작
         self._t = {}                            # 이번 프레임의 구간 타이밍/추적 기록 (콜백마다 리셋)
         self._timing_window = deque(maxlen=100)  # (callback_ms, e2e_ms, infer_ms) rolling 통계용
         self._timing_csv = None                 # timing_csv_path 설정 시 지연 오픈
@@ -182,9 +196,14 @@ class VisionNode(Node):
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_detections = message_filters.Subscriber(
             self, DetectionArray, '/detection/tool_boxes')  # 퍼블리셔: object_detection(팀원3)
+        # queue_size는 "카메라 fps x 허용할 최대 검출 지연"으로 잡아야 한다. tool_detection_node는
+        # YOLO 결과에 입력 컬러 프레임의 stamp를 그대로 실어 보내므로, 추론이 오래 걸리면 검출이
+        # 도착했을 때 짝이 맞는 컬러/뎁스 프레임이 큐에 남아 있어야 동기화가 성립한다. 60fps에서
+        # queue_size=10은 166ms 분량뿐이라, 추론이 그보다 느려지는 순간 동기화가 영구히 실패했다
+        # (= tool_track도 debug_image도 아예 안 나감). 120이면 약 2초 분량을 버틴다.
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth, self.sub_info, self.sub_detections],
-            queue_size=10, slop=0.05)
+            queue_size=120, slop=0.05)
         self._sync.registerCallback(self._on_synced_images)
 
     def _checkpoint_event(
@@ -332,6 +351,10 @@ class VisionNode(Node):
             self.axis_smoother.reset(request.tool_class)  # 이전 사이클의 축 이력도 함께 초기화
         elif request.mode == SetVisionMode.Request.TRACK_HAND:
             self._fist_counter = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
+            self._hand_detection = None  # 게이트가 꺼져 있던 동안의 마지막 검출 잔상을 지운다
+        # 컨테이너는 TRACK_HAND일 때만 mediapipe를 돌린다 - 그 이전 단계(공구 추적/서보)에서
+        # CPU를 YOLO와 나눠 쓰지 않게 해야 검출 지연이 동기화 큐를 넘기지 않는다.
+        self._publish_hand_enable(request.mode == SetVisionMode.Request.TRACK_HAND)
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
         checkpoint = self._SET_MODE_CHECKPOINTS.get(request.mode)
@@ -341,6 +364,12 @@ class VisionNode(Node):
                 phase, checkpoint_id, 'PASS' if response.success else 'FAIL',
                 response.message, {'mode': request.mode, 'tool_class': request.tool_class})
         return response
+
+    def _publish_hand_enable(self, enabled):
+        """컨테이너의 mediapipe 추론 on/off 게이트를 발행한다."""
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.pub_hand_enable.publish(msg)
 
     def _on_hand_track_docker(self, msg):
         """컨테이너(hand_track_docker_node)가 보낸 mediapipe 검출 결과(String/JSON)를

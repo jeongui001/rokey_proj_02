@@ -1275,6 +1275,106 @@ def test_old_vision_response_cannot_start_goal_after_stop(node):
     assert sent == []
 
 
+# ---- /vision/set_mode 응답 타임아웃 ----
+
+def _arm_vision_call(node):
+    """AUTO 모드에서 _handle_fetch_tool로 /vision/set_mode 응답 대기 상태를 만든다."""
+    node.set_parameters([Parameter('auto.config_ready', value=True)])
+    node.operation_mode = Mode.AUTO
+    future = _FakeVisionFuture()
+    node.set_mode_client.service_is_ready = lambda: True
+    node.set_mode_client.call_async = lambda request: future
+    node._request_cancel = lambda callback: callback()
+    return future
+
+
+def test_vision_mode_success_before_timeout_cancels_timeout_timer(node):
+    future = _arm_vision_call(node)
+    sent = []
+    node._send_robot_goal = lambda task_type, **kwargs: sent.append((task_type, kwargs))
+
+    node._handle_fetch_tool('spanner')
+    assert node._vision_timeout_timer is not None
+
+    future.fire(success=True)
+
+    assert node._vision_timeout_timer is None
+    assert sent == [('move_named', {'named_target': 'watch'})]
+
+
+def test_vision_mode_timeout_without_response_enters_fault(node):
+    _arm_vision_call(node)
+    node._send_robot_goal = lambda *args, **kwargs: pytest.fail('goal must not be sent')
+
+    node._handle_fetch_tool('spanner')
+    generation = node._vision_generation
+
+    node._on_vision_mode_timeout(generation)
+
+    assert node.safety_state == Safety.FAULT
+    assert node._vision_timeout_timer is None
+
+
+def test_vision_mode_late_response_after_timeout_does_not_send_goal(node):
+    future = _arm_vision_call(node)
+    sent = []
+    node._send_robot_goal = lambda task_type, **kwargs: sent.append((task_type, kwargs))
+
+    node._handle_fetch_tool('spanner')
+    node._on_vision_mode_timeout(node._vision_generation)
+    sent.clear()  # FAULT 진입 과정에서 생길 수 있는 goal은 이 테스트의 관심사가 아니다
+
+    future.fire(success=True)  # 타임아웃 이후 뒤늦게 도착한 응답
+
+    assert sent == []
+
+
+def test_vision_mode_timeout_stale_generation_is_noop(node):
+    _arm_vision_call(node)
+    node._send_robot_goal = lambda *args, **kwargs: None
+
+    node._handle_fetch_tool('spanner')
+    stale_generation = node._vision_generation - 1
+
+    node._on_vision_mode_timeout(stale_generation)
+
+    assert node.safety_state == Safety.NORMAL
+    assert node._vision_timeout_timer is not None  # 현재 세대의 타이머는 살아있어야 한다
+
+
+def test_stale_vision_response_does_not_cancel_new_vision_timer(node):
+    first = _FakeVisionFuture()
+    node.set_mode_client.service_is_ready = lambda: True
+    node.set_mode_client.call_async = lambda request: first
+
+    node._start_after_vision_mode(
+        SetVisionMode.Request.TRACK_TOOL, 'spanner', node.state, lambda: None)
+    stale_generation = node._vision_generation
+
+    second = _FakeVisionFuture()
+    node.set_mode_client.call_async = lambda request: second
+    node._start_after_vision_mode(
+        SetVisionMode.Request.TRACK_HAND, '', node.state, lambda: None)
+    new_timer = node._vision_timeout_timer
+
+    first.fire(success=True)  # 이전 세대의 지연 응답
+
+    assert node._vision_timeout_timer is new_timer  # 새 세대의 타이머를 취소하면 안 된다
+    assert node._vision_timeout_owner_generation == stale_generation + 1
+
+
+def test_enter_fault_stops_vision_timeout_timer(node):
+    _arm_vision_call(node)
+    node._send_robot_goal = lambda *args, **kwargs: None
+
+    node._handle_fetch_tool('spanner')
+    assert node._vision_timeout_timer is not None
+
+    node._enter_fault('다른 원인의 fault')
+
+    assert node._vision_timeout_timer is None
+
+
 # ---- AUTO 설정 준비 게이트 (auto.config_ready) ----
 
 def test_fetch_tool_blocked_when_config_not_ready(node):

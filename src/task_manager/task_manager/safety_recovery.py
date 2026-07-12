@@ -38,6 +38,10 @@ class SafetyRecovery:
         self._recovery_generation += 1
         self._recovery_in_progress = False
         self._stop_recovery_timeout_timer()
+        # 진행 중이던 /vision/set_mode 응답 대기도 함께 무효화한다 - 아래 _request_cancel이
+        # _set_vision_mode(OFF)로 세대를 올리므로 그 응답/타임아웃은 어차피 무시되지만,
+        # 타이머 자체를 남겨두지 않는다.
+        self._stop_vision_timeout_timer()
         self.safety_state = safety_state
         self._publish_status(detail=detail)
         self.get_logger().error(
