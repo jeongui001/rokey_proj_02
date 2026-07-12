@@ -53,7 +53,7 @@
       kp_yaw: 1.0               # yaw P 게인(현재 yaw=0 고정이라 미사용), 클수록 오차에 민감
       v_max: 0.25               # 수평 속도 상한(m/s), 
       descend_speed: 0.05       # 하강 속도(m/s)
-      eps_descend: 0.015        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
+      eps_descend: 0.03        # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기
       eps_grasp: 1.0         # 폐합 판정 수평 오차 임계(m)
       n_stable: 1              # 폐합 판정에 필요한 연속 안정 주기 수, 일단 끈 상태(1)
       dt_latency: 0.05          # 지연 보상(lookahead) 시간(s)
@@ -88,6 +88,10 @@
       # 위함. 실기 튜닝 대상 - diverging이 안 잡히면 낮추고, 여전히 오탐이면 올리기.
       diverge_min_delta_m: 0.01
       cov_threshold: 100.0 # 폐합 판정용 속도 공분산 임계, 일단 끈 상태(1)
+      # 폐합 판정용 공구 속도(xy 평면, m/s) 상한 - 실기 튜닝 전이라 사실상 항상
+      # 통과하는 관대한 값으로 시작(위 cov_threshold와 같은 이유). 실측 후 낮출 것.
+      v_grasp_max: 0.05 # (m/s)
+      n_stable_v: 5      # v_grasp_max 판정에 필요한 연속 안정 주기 수(n_stable_z와 동일 방식)
       kalman_q_pos: 1.0e-4      # 프로세스 노이즈(위치)
       kalman_q_vel: 1.0e-2      # 프로세스 노이즈(속도)
       # 2026-07-11 실기: 정지 렌치 155프레임 표본분산 실측값(r_xy=3.84e-07)을 그대로
@@ -175,6 +179,17 @@
       # SpeedlWatchdog(speedl_watchdog.py)이 pet() 유무를 확인하는 내부 폴링 주기 -
       # 통신 타이밍 상수였다가 다른 servo_pick.* 값들과 함께 보이도록 승격했다.
       watchdog_poll_interval_s: 0.05
+      # 그리퍼 폐합 확인 직후, VERIFY_GRASP 판정 전에 z를 이 만큼(m) 들어올린다 -
+      # 검증 결과와 무관하게 항상 수행하며, 실패해 release_and_retry로 이어지더라도
+      # 원래 높이로 되돌리지 않고 이 들어올려진 위치에서 그대로 연다(2026-07-12 확정).
+      lift_height_m: 0.05
+      # 들어올림 전용 속도 - servo.descend_speed(하강용, 표면 근접 제동거리에 맞춰
+      # 신중하게 잡은 값)와 별개다. 위쪽엔 장애물이 없어 더 빠르게 둘 수 있다
+      # (descend_speed 0.05 대비 3배, 2026-07-12 확정).
+      lift_speed_m_s: 0.15
+      # TCP 위치 피드백이 멈추는 등 목표 높이에 도달하지 못하는 이상 상황에서
+      # 무한 루프에 빠지지 않도록 하는 안전 타임아웃(s).
+      lift_timeout_s: 5.0
       # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
       # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlStream 단위,
       # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는

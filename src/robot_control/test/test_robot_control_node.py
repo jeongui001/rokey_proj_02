@@ -1740,7 +1740,14 @@ def test_servo_pick_publishes_speedl_only_when_hardware_ready(node, monkeypatch)
     monkeypatch.setattr(time_module, 'sleep', lambda s: None)
 
     node.hardware_enabled = True
-    node.set_parameters([Parameter('servo_pick.hardware_ready', value=True)])
+    node.set_parameters([
+        Parameter('servo_pick.hardware_ready', value=True),
+        # 이 테스트는 그리퍼 폐합 전 x,y 추적 단계의 speedl 발행 게이팅만 검증하는
+        # 것이라, 새로 추가된 들어올림 단계(_run_grasp_lift)는 꺼둔다 - 안 그러면
+        # 아래 고정된 fake TCP z값이 절대 움직이지 않아 들어올림이 목표 높이에
+        # 도달하지 못해 타임아웃(FAULT)으로 끝난다.
+        Parameter('servo_pick.lift_height_m', value=0.0),
+    ])
     fake = _FakeDoosanDriver()
     node._doosan = fake
     ticks = iter(['CONTINUE', 'CLOSE'])
@@ -1764,6 +1771,81 @@ def test_servo_pick_publishes_speedl_only_when_hardware_ready(node, monkeypatch)
     # 계속되며 speedl을 계속 발행하므로(그 사이 최소 한 번 더 publish), 정확히
     # 1회가 아니라 최소 1회 이상이다.
     assert len(fake.publish_calls) >= 1
+
+
+def test_servo_pick_lift_after_grip_moves_up_before_returning_result(node, monkeypatch):
+    """그리퍼 폐합 확인 후 VERIFY_GRASP 판정 전에 z를 lift_height_m만큼 들어올려야
+    한다(docs/전체 계획.md "즉시 들어올림", 2026-07-12 결정) - TCP z가 목표
+    높이에 도달할 때까지 양의 vz speedl을 발행하고, 도달하면 결과를 성공으로
+    반환해야 한다."""
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([
+        Parameter('servo_pick.hardware_ready', value=True),
+        Parameter('servo_pick.lift_height_m', value=0.05),
+    ])
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    ticks = iter(['CONTINUE', 'CLOSE'])
+    node._servo_pick_tick = lambda: (next(ticks), None)
+    node.servo_loop.step = lambda *a, **k: None
+    node.servo_loop.start = lambda *a, **k: None
+    node.servo_loop.get_state = lambda: 'closing'
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
+    node.rg2_client.get_state = lambda: (30.0, True)
+
+    # 50.0mm에서 시작해 매 호출마다 10mm씩 상승 - lift_height_m(0.05m=50mm)만큼
+    # 오른 100.0mm에서 목표 도달.
+    z_values = iter(50.0 + 10.0 * i for i in range(20))
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, next(z_values), 0.0, 0.0, 0.0]
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert result.success is True
+    lift_calls = [c for c in fake.publish_calls if c.vz > 0.0]
+    assert len(lift_calls) >= 1
+    assert any(fb.state == 'lifting' for fb in gh.feedback_msgs)
+
+
+def test_servo_pick_lift_times_out_as_fault_when_z_never_reaches_target(node, monkeypatch):
+    """TCP z 피드백이 멈춰 목표 높이에 영영 도달하지 못하면(하드웨어 이상 등),
+    무한 루프에 빠지지 않고 lift_timeout_s 안에 FAULT로 끝나야 한다."""
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    node.hardware_enabled = True
+    node.set_parameters([
+        Parameter('servo_pick.hardware_ready', value=True),
+        Parameter('servo_pick.lift_height_m', value=0.05),
+        Parameter('servo_pick.lift_timeout_s', value=0.05),
+    ])
+    fake = _FakeDoosanDriver()
+    node._doosan = fake
+    ticks = iter(['CONTINUE', 'CLOSE'])
+    node._servo_pick_tick = lambda: (next(ticks), None)
+    node.servo_loop.step = lambda *a, **k: None
+    node.servo_loop.start = lambda *a, **k: None
+    node.servo_loop.get_state = lambda: 'closing'
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
+    node.rg2_client.get_state = lambda: (30.0, True)
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 50.0, 0.0, 0.0, 0.0]  # 고정 - 절대 안 오름
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    result = node._execute_servo_pick(gh)
+
+    assert result.success is False
+    assert '타임아웃' in result.message
 
 
 # ---- handover_hold ----
@@ -2773,6 +2855,10 @@ def test_servo_pick_watchdog_publishes_zero_when_no_command_computed(node):
         Parameter('servo_pick.hardware_ready', value=True),
         Parameter('servo_pick.watchdog_timeout_s', value=0.05),
         Parameter('servo_pick.control_period_s', value=0.01),
+        # 이 테스트는 xy 추적 단계의 워치독 동작만 검증한다 - TCP 위치 캐시를
+        # 아예 None으로 고정해 두었으므로 들어올림 단계(_run_grasp_lift)는 시작
+        # 자체가 안 되고 FAULT로 끝나버린다. 이 테스트와 무관하므로 꺼둔다.
+        Parameter('servo_pick.lift_height_m', value=0.0),
     ])
     fake = _FakeDoosanDriver()
     node._doosan = fake

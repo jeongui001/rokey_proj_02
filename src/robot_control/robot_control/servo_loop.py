@@ -58,7 +58,7 @@ class ServoLoop:
                  z_close=0.02, diverge_n=5, cov_threshold=0.05,
                  q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
                  n_stable_z=5, diverge_min_delta_m=0.01, descend_accel_m_s2=0.1,
-                 descend_stop_margin_m=0.0):
+                 descend_stop_margin_m=0.0, v_grasp_max=0.05, n_stable_v=5):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
@@ -100,6 +100,8 @@ class ServoLoop:
         # 최소 증가폭 문턱.
         self.diverge_min_delta_m = diverge_min_delta_m
         self.cov_threshold = cov_threshold  # 폐합 판정용 속도 공분산 임계
+        self.v_grasp_max = v_grasp_max   # 폐합 판정용 공구 속도(xy, m/s) 상한
+        self.n_stable_v = n_stable_v     # v_grasp_max 판정에 필요한 연속 안정 주기 수(z_close와 동일 방식)
         # 내부 KalmanXYZV로 그대로 전달되는 필터 노이즈 파라미터 (kalman.py 참고)
         self.q_pos = q_pos
         self.q_vel = q_vel
@@ -118,6 +120,7 @@ class ServoLoop:
         self._start_time = None          # servo_pick 시작 시각(monotonic) - timeout 판정용
         self._stable_count = 0           # eps_grasp 이내로 연속 몇 주기째인지
         self._z_stable_count = 0         # z_close 이내로 연속 몇 주기째인지
+        self._v_stable_count = 0         # v_grasp_max 이내로 연속 몇 주기째인지
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
         self._grasp_locked = False       # should_close() 만족 이후 z를 영구 고정할지
@@ -127,6 +130,7 @@ class ServoLoop:
         self._last_innovation_xy = None  # DEBUG_LOG: 최근 Kalman innovation(m)
         self._last_w_target = None       # DEBUG_LOG: 최근 feed-forward 목표 가중치
         self._last_depth_valid = None    # DEBUG_LOG: 최근 ToolTrack depth_valid
+        self._last_tool_speed = None     # DEBUG_LOG: 최근 공구 xy 속력(m/s)
 
     def start(self, tool_class, grasp_width_mm, grasp_force_n):
         """servo_pick goal 수신 시 1회 호출 - 모든 내부 상태를 초기화한다."""
@@ -143,6 +147,7 @@ class ServoLoop:
         self._start_time = time.monotonic()
         self._stable_count = 0
         self._z_stable_count = 0
+        self._v_stable_count = 0
         self._error_history = []
         self._last_z_gap = None
         self._grasp_locked = False
@@ -152,6 +157,7 @@ class ServoLoop:
         self._last_innovation_xy = None
         self._last_w_target = None
         self._last_depth_valid = None
+        self._last_tool_speed = None
 
     def on_tool_track(self, msg):
         """/vision/tool_track 수신마다 호출 - 칼만 필터를 갱신하고 innovation으로
@@ -243,6 +249,16 @@ class ServoLoop:
         else:
             self._z_stable_count = 0
 
+        # 공구 속도(xy 평면) 판정 - z_close와 같은 방식으로 디바운스한다: 필터
+        # 속도 추정치는 단발 프레임에서 튈 수 있으므로, n_stable_v주기 연속으로
+        # v_grasp_max 이내여야 "충분히 느림"으로 인정한다.
+        tool_speed = float(np.hypot(v_tool[0], v_tool[1]))
+        self._last_tool_speed = tool_speed
+        if tool_speed < self.v_grasp_max:
+            self._v_stable_count += 1
+        else:
+            self._v_stable_count = 0
+
         # 하강은 별도 프로파일: 수평 오차가 충분히 작을 때만 진행, 아니면 대기(수평 정렬 우선).
         # z가 안정적으로 z_close 이내에 들어오면 xy 안정성/공분산(should_close 조건)과
         # 무관하게 즉시 vz를 0으로 고정한다 - descend_speed는 비례 제어가 아니라 상수
@@ -288,13 +304,16 @@ class ServoLoop:
         return self._state
 
     def should_close(self):
-        """그리퍼 폐합 판정(2.6절) - 세 조건 모두 만족해야 True:
-        오차가 n_stable주기 연속 충분히 작고, z까지 충분히 가깝고, 필터가 수렴했을 것."""
+        """그리퍼 폐합 판정(2.6절) - 네 조건 모두 만족해야 True:
+        오차가 n_stable주기 연속 충분히 작고, z까지 충분히 가깝고, 필터가 수렴했고,
+        공구 속도가 n_stable_v주기 연속 충분히 느릴 것."""
         if self._stable_count < self.n_stable:
             return False
         if self._last_z_gap is None or self._z_stable_count < self.n_stable_z:
             return False
         if self._filter.velocity_covariance_trace >= self.cov_threshold:
+            return False
+        if self._v_stable_count < self.n_stable_v:
             return False
         self._state = ServoState.CLOSING
         self._grasp_locked = True
@@ -335,6 +354,8 @@ class ServoLoop:
             'stable_count': self._stable_count,
             'last_z_gap_m': self._last_z_gap,
             'z_stable_count': self._z_stable_count,
+            'tool_speed_m_s': self._last_tool_speed,
+            'v_stable_count': self._v_stable_count,
             'velocity_covariance_trace': float(self._filter.velocity_covariance_trace),
             'error_history_m': [float(v) for v in self._error_history],
             'depth_valid': self._last_depth_valid,

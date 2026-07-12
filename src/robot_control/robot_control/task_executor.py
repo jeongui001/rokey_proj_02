@@ -9,7 +9,7 @@ from handover_interfaces.msg import HandTrack, ToolTrack
 
 from robot_control.rg2_client import RG2Status
 from robot_control.safety_monitor import FaultPrefix, SafetyState
-from robot_control.servo_loop import ServoCommand
+from robot_control.servo_loop import ServoCommand, ServoState
 from robot_control.speedl_watchdog import SpeedlWatchdog
 
 
@@ -343,6 +343,7 @@ class TaskExecutor:
             self.get_logger().info(
                 f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m} '
                 f'z_gap={snap["last_z_gap_m"]} z_stable_count={snap["z_stable_count"]} '
+                f'tool_speed_m_s={snap["tool_speed_m_s"]} v_stable_count={snap["v_stable_count"]} '
                 f'depth_valid={snap["depth_valid"]} vz={snap["cmd_m_s"]["vz"]} '
                 f'tcp_cache_age_s={cache_age_s:.3f} '
                 f'e_xy_norm_m={snap["e_xy_norm_m"]} w={snap["w"]} '
@@ -418,6 +419,23 @@ class TaskExecutor:
         if abs(cmd.vz) > descend_speed + tol:
             self.get_logger().error(
                 f'서보 z 속도 명령이 descend_speed({descend_speed}) 제한을 넘었습니다: vz={cmd.vz}')
+            return False
+        return True
+
+    def _validate_lift_command(self, cmd) -> bool:
+        """_run_grasp_lift 전용 발행 경계 검사(_validate_servo_command와 동일 형태) -
+        들어올림은 servo_pick.lift_speed_m_s를 쓰는데 이 값이 servo.descend_speed보다
+        커도 되므로(위쪽엔 장애물이 없어 표면 근접 제동거리 제약을 받지 않음),
+        descend_speed 기준인 _validate_servo_command를 그대로 쓰면 항상 거부된다."""
+        values = (cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate)
+        if not all(math.isfinite(v) for v in values):
+            self.get_logger().error(f'들어올림 속도 명령에 NaN/Inf가 포함되어 있습니다: {values}')
+            return False
+        tol = self.get_parameter('servo.command_validate_tolerance').value
+        lift_speed_m_s = abs(self.get_parameter('servo_pick.lift_speed_m_s').value)
+        if abs(cmd.vz) > lift_speed_m_s + tol:
+            self.get_logger().error(
+                f'들어올림 속도 명령이 lift_speed_m_s({lift_speed_m_s}) 제한을 넘었습니다: vz={cmd.vz}')
             return False
         return True
 
@@ -555,6 +573,124 @@ class TaskExecutor:
             goal_handle.abort()
         return result
 
+    def _run_grasp_lift(self, goal_handle):
+        """그리퍼 폐합 확인 직후, VERIFY_GRASP 판정 전에 z를 servo_pick.lift_height_m
+        만큼 들어올린다(docs/전체 계획.md 2/9번 "즉시 들어올림") - 검증 결과와
+        무관하게 항상 수행하며, 검증 실패로 release_and_retry가 이어지더라도
+        원래 높이로 되돌리지 않고 이 들어올려진 위치에서 그대로 연다(2026-07-12
+        확정). xy는 그리퍼가 이미 공구를 붙잡고 있어 더 추적할 필요가 없으므로
+        vz만 명령한다. 속도는 servo_pick.lift_speed_m_s를 쓴다 - 위쪽엔 장애물이
+        없어 표면 근접 제동거리로 신중하게 잡은 servo.descend_speed보다 빠르게
+        둘 수 있다(2026-07-12 확정)."""
+        height_m = float(self.get_parameter('servo_pick.lift_height_m').value)
+        if height_m <= 0.0:
+            return 'ARRIVED', ''
+        publish_active = (
+            self.hardware_enabled and self._doosan is not None
+            and bool(self.get_parameter('servo_pick.hardware_ready').value))
+        if not publish_active:
+            return 'ARRIVED', ''
+
+        # _run_rt_tracking이 xy 추적 종료 직후 이 플래그를 이미 False로 되돌려놔서
+        # (_tf_broadcast_timer가 TCP 위치 캐시 갱신을 멈춘 상태, _on_tf_broadcast_timer
+        # 참고) - 들어올림 동안 z 진행을 확인하려면 다시 켜둬야 한다. 이 함수를 나가는
+        # 모든 경로(ARRIVED/CANCELED/ABORT/FAULT/예외)에서 반드시 원래대로 꺼야
+        # 하므로 아래 try/finally로 감싼다.
+        self._tcp_tracking_active = True
+        try:
+            return self._run_grasp_lift_loop(goal_handle, height_m)
+        finally:
+            self._tcp_tracking_active = False
+
+    def _run_grasp_lift_loop(self, goal_handle, height_m):
+        start_tcp_mm = self._get_current_tcp_posx()
+        if start_tcp_mm is None:
+            detail = 'servo_pick 들어올림 시작 실패 - TCP 위치 캐시 없음'
+            self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+            return 'FAULT', detail
+        start_z_m = start_tcp_mm[2] / 1000.0
+        speed_m_s = abs(float(self.get_parameter('servo_pick.lift_speed_m_s').value))
+        period = float(self.get_parameter('servo_pick.control_period_s').value)
+        deadline = time.monotonic() + float(self.get_parameter('servo_pick.lift_timeout_s').value)
+
+        watchdog = SpeedlWatchdog(
+            timeout_s=float(self.get_parameter('servo_pick.watchdog_timeout_s').value),
+            on_timeout=lambda: self._doosan.publish_speedl(
+                ServoCommand(), accel_param_prefix='servo_pick',
+                period_param_name='servo_pick.control_period_s'),
+            poll_interval_s=float(
+                self.get_parameter('servo_pick.watchdog_poll_interval_s').value))
+        watchdog.start()
+        outcome, detail = 'ARRIVED', ''
+        try:
+            while rclpy.ok():
+                feedback = RobotTask.Feedback()
+                feedback.state = ServoState.LIFTING
+                goal_handle.publish_feedback(feedback)
+                if goal_handle.is_cancel_requested:
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    if not self._cleanup_stop_motion(recoverable_stop_mode):
+                        detail = 'servo_pick 들어올림 취소 중 MoveStop 실패'
+                        self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                        outcome = 'FAULT'
+                    else:
+                        outcome, detail = 'CANCELED', 'servo_pick 들어올림 canceled'
+                    break
+                if self.safety_state != SafetyState.NORMAL:
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    self._cleanup_stop_motion(recoverable_stop_mode)
+                    outcome, detail = (
+                        'ABORT', f'servo_pick 들어올림 aborted - safety_state={self.safety_state}')
+                    break
+
+                if time.monotonic() >= deadline:
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    self._cleanup_stop_motion(recoverable_stop_mode)
+                    detail = 'servo_pick 들어올림 타임아웃 - 목표 높이에 도달하지 못했습니다'
+                    self._declare_fault(f'{FaultPrefix.FAULT}{detail}')
+                    outcome = 'FAULT'
+                    break
+
+                tcp_mm = self._get_current_tcp_posx()
+                if tcp_mm is None:
+                    time.sleep(period)
+                    continue
+                if (tcp_mm[2] / 1000.0) - start_z_m >= height_m:
+                    break
+
+                command = ServoCommand(vz=speed_m_s)
+                if not self._validate_lift_command(command):
+                    recoverable_stop_mode = self.get_parameter(
+                        'safety.recoverable_stop_mode').value
+                    self._cleanup_stop_motion(recoverable_stop_mode)
+                    outcome, detail = 'ABORT', 'servo_pick 들어올림 aborted - invalid velocity command'
+                    break
+                self._doosan.publish_speedl(
+                    command, accel_param_prefix='servo_pick',
+                    period_param_name='servo_pick.control_period_s')
+                watchdog.pet()
+                time.sleep(period)
+            else:
+                self._cleanup_stop_motion()
+                outcome, detail = 'ABORT', 'servo_pick 들어올림 aborted - rclpy 종료 중'
+        except Exception as exc:
+            self.get_logger().error(f'servo_pick 들어올림 중 예외: {exc}')
+            stop_ok = self._cleanup_stop_motion()
+            if goal_handle.is_cancel_requested and stop_ok:
+                outcome, detail = 'CANCELED', f'servo_pick 들어올림 canceled after exception: {exc}'
+            else:
+                outcome, detail = 'ABORT', f'servo_pick 들어올림 exception: {exc}'
+                if not stop_ok:
+                    self._declare_fault(
+                        f'{FaultPrefix.FAULT}servo_pick 들어올림 예외 처리 중 MoveStop 실패: {exc}')
+                    outcome = 'FAULT'
+        finally:
+            watchdog.stop()
+        return outcome, detail
+
     def _execute_servo_pick(self, goal_handle):
         if self.safety_state != SafetyState.NORMAL:
             return self._finish_tracking_result(
@@ -618,6 +754,10 @@ class TaskExecutor:
         width_mm, grip_detected = self.rg2_client.get_state()
         # 그리퍼가 완전히 닫히고 grip_detected를 확인한 지금에서야 x,y 추적도 함께
         # 정지시킨다 (vz는 그리퍼가 닫히는 내내 _grasp_locked로 이미 0에 고정돼 있었다).
+        self._cleanup_stop_motion()
+        lift_outcome, lift_detail = self._run_grasp_lift(goal_handle)
+        if lift_outcome != 'ARRIVED':
+            return self._finish_tracking_result(goal_handle, lift_outcome, lift_detail)
         self._cleanup_stop_motion()
         result = self._finish_tracking_result(goal_handle, 'ARRIVED', '')
         result.final_width_mm = width_mm

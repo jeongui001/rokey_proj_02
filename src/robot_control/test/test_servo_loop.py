@@ -41,7 +41,8 @@ def _make_loop(**overrides):
                   eps_descend=0.015, eps_grasp=0.005, n_stable=3,
                   dt_latency=0.05, timeout_s=5.0, t_lost_s=0.3,
                   innov_low=0.010, innov_high=0.040, w_alpha=1.0,
-                  z_close=0.02, diverge_n=5, cov_threshold=0.5)
+                  z_close=0.02, diverge_n=5, cov_threshold=0.5,
+                  v_grasp_max=1.0, n_stable_v=1)
     kwargs.update(overrides)
     return ServoLoop(**kwargs)
 
@@ -157,6 +158,30 @@ def test_should_close_blocked_by_high_velocity_covariance():
     for _ in range(3):
         loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
     assert loop.should_close() is False
+
+
+def test_should_close_blocked_by_high_tool_velocity():
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2,
+                       v_grasp_max=0.01, n_stable_v=2)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.5, 0.0, 0.05))  # 빠른 이동 -> 추정 속도 큼
+    for _ in range(3):
+        loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop.should_close() is False
+
+
+def test_v_stable_count_requires_consecutive_low_velocity_ticks():
+    loop = _make_loop(v_grasp_max=0.01, n_stable_v=3)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))  # 정지 물체 -> 추정 속도 ~0
+    loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop._v_stable_count == 1
+    loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop._v_stable_count == 2
+    loop.step((0.0, 0.0, 0.05, 0, 0, 0), time.monotonic())
+    assert loop._v_stable_count == 3
 
 
 def test_single_noisy_z_gap_dip_does_not_latch_descent_stop():

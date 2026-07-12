@@ -106,6 +106,8 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.diverge_n', 15)
         self.declare_parameter('servo.diverge_min_delta_m', 0.01)
         self.declare_parameter('servo.cov_threshold', 0.05)
+        self.declare_parameter('servo.v_grasp_max', 0.05)
+        self.declare_parameter('servo.n_stable_v', 5)
         # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
         # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
         self.declare_parameter('servo.kalman_q_pos', 1e-4)
@@ -256,6 +258,19 @@ class RobotControlNode(Node, TaskExecutor):
         # TF 방송용 폴링 결과에 캐시 갱신을 얹어 폴링 스트림을 하나로 합쳤다
         # (_on_tf_broadcast_timer 참고, tcp_pose_refresh_period_s 파라미터는 제거됨).
         self.declare_parameter('servo_pick.tcp_pose_max_age_s', 0.2)
+        # 그리퍼 폐합 확인 직후, VERIFY_GRASP 판정 전에 z를 이 만큼(m) 들어올린다
+        # (docs/전체 계획.md 2/9번 "즉시 들어올림" - 검증 결과와 무관하게 항상
+        # 수행한다, 2026-07-12 확정). 0 이하면 들어올림을 건너뛴다.
+        self.declare_parameter('servo_pick.lift_height_m', 0.05)
+        # 들어올림 전용 속도 - servo.descend_speed(하강용, 표면 근접 제동거리에 맞춰
+        # 신중하게 잡은 값)와 별개다. 들어올릴 때는 위쪽에 장애물이 없어 descend_speed
+        # 제약을 받을 이유가 없어 별도로 더 빠르게 둘 수 있다(2026-07-12: descend_speed
+        # 대비 3배로 설정).
+        self.declare_parameter('servo_pick.lift_speed_m_s', 0.15)
+        # TCP 위치 피드백이 멈추거나(캐시 정체 등) 실제로 목표 높이에 도달하지
+        # 못하는 이상 상황에서 들어올림 단계가 무한 루프에 빠지지 않도록 하는
+        # 안전 타임아웃 - RG2 command_timeout_s/ServoLoop.timeout_s와 같은 성격.
+        self.declare_parameter('servo_pick.lift_timeout_s', 5.0)
 
         # handover_servo: handover_safe 도착 후 /vision/hand_track(작업자 손 위치, 연속
         # 스트림)을 따라 TCP->손 방향 위 offset_m 지점을 계속 추종하다 주먹이 확정되면
@@ -327,6 +342,8 @@ class RobotControlNode(Node, TaskExecutor):
             diverge_n=self.get_parameter('servo.diverge_n').value,
             diverge_min_delta_m=self.get_parameter('servo.diverge_min_delta_m').value,
             cov_threshold=self.get_parameter('servo.cov_threshold').value,
+            v_grasp_max=self.get_parameter('servo.v_grasp_max').value,
+            n_stable_v=self.get_parameter('servo.n_stable_v').value,
             q_pos=self.get_parameter('servo.kalman_q_pos').value,
             q_vel=self.get_parameter('servo.kalman_q_vel').value,
             r_xy=self.get_parameter('servo.kalman_r_xy').value,
