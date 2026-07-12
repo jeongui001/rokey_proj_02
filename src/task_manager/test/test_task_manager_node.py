@@ -1451,7 +1451,7 @@ def test_check_trigger_rejects_different_tool(node):
     _configure_trigger_params(node)
     node.current_tool = 'spanner'
 
-    assert node._check_trigger(_fresh_tool_track(node, tool_class='screw_driver')) is False
+    assert node._check_trigger(_fresh_tool_track(node, tool_class='screwdriver')) is False
 
 
 def test_check_trigger_rejects_no_current_tool(node):
@@ -2063,6 +2063,90 @@ def test_home_result_success_clears_stale_resume_snapshot(node):
     assert node._resume_state is None
     assert node._resume_tool is None
     assert node._resume_grasp_spec is None
+
+
+# ---- 일시정지(STOP)가 재개 스냅샷을 남기고, 리셋이 취소+스냅샷 정리를 담당 ----
+
+def test_stop_during_resumable_state_captures_snapshot_and_becomes_resumable(node):
+    node.operation_mode = Mode.AUTO
+    node.current_tool = 'spanner'
+    node._active_grasp_spec = _make_spec()
+    node.state = State.MOVE_SAFE
+    goal_handle = _send_and_accept(node, 'move_named', named_target='handover_safe')
+    node.state = State.MOVE_SAFE
+
+    node._on_user_command(String(data='멈춰'))
+
+    assert node._resume_kind == 'continue'
+    assert node.state == State.CANCELLING
+
+    goal_handle.result_future.fire(_FakeResult(success=False, message='canceled'))
+
+    assert node.state == State.IDLE
+    published = []
+    node.pub_status.publish = published.append
+    node._publish_status(detail='')
+    assert json.loads(published[-1].data)['resumable'] is True
+
+
+def test_stop_during_non_resumable_state_leaves_no_snapshot(node):
+    node.operation_mode = Mode.MANUAL
+    node.state = State.DETECT_TRACK
+
+    node._on_user_command(String(data='멈춰'))
+
+    assert node._resume_kind is None
+    assert node.state == State.IDLE
+
+
+def test_reset_while_normal_and_idle_with_no_snapshot_is_noop(node):
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    sent = []
+    node._send_robot_goal = lambda task_type, **kw: sent.append((task_type, kw))
+
+    node._handle_reset()
+
+    assert sent == []
+    assert node.state == State.IDLE
+
+
+def test_reset_while_paused_clears_snapshot_and_stays_idle(node):
+    # 일시정지로 남은 재개 스냅샷을 리셋이 지운다 - "재개" 없이 완전히 취소.
+    node.safety_state = Safety.NORMAL
+    node.state = State.IDLE
+    node._resume_kind = 'continue'
+    node._resume_state = State.WAIT_PULL
+    node._resume_tool = 'wrench'
+    node._resume_grasp_spec = _make_spec()
+
+    node._handle_reset()
+
+    assert node._resume_kind is None
+    assert node._resume_state is None
+    assert node._resume_tool is None
+    assert node._resume_grasp_spec is None
+    assert node.state == State.IDLE
+
+
+def test_reset_while_task_in_progress_cancels_and_returns_idle_without_snapshot(node):
+    # SERVO_PICK은 _capture_resume_snapshot 기준으로는 재개 가능(retry_pick)
+    # 분류지만, 리셋은 애초에 스냅샷을 캡처하지 않는다 - 일시정지와 달리 완전
+    # 취소가 목적이라 재개할 게 남으면 안 된다(_handle_stop과의 핵심 차이).
+    node.operation_mode = Mode.AUTO
+    node.state = State.SERVO_PICK
+    goal_handle = _send_and_accept(node, 'servo_pick', tool_class='spanner')
+    node.state = State.SERVO_PICK
+
+    node._handle_reset()
+
+    assert goal_handle.cancel_called
+    assert node.state == State.CANCELLING
+
+    goal_handle.result_future.fire(_FakeResult(success=False, message='canceled'))
+
+    assert node.state == State.IDLE
+    assert node._resume_kind is None
 
 
 # ---- 체크포인트 이벤트 ----

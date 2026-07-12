@@ -118,6 +118,36 @@ def test_synced_images_skips_when_tf_lookup_fails(node):
     assert called == []
 
 
+def test_synced_images_off_mode_still_publishes_raw_debug_image(node):
+    # mode==OFF에서도 GUI가 카메라 연결을 상시 확인할 수 있도록 인식 박스 없는
+    # 원본 프리뷰는 계속 흘려보낸다 (ToolTrack/HandTrack은 발행하지 않음).
+    node.mode = SetVisionMode.Request.OFF
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+
+    calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: calls.append(
+        (detections, chosen_det, axis_debug))
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [([], None, None)]
+
+
+def test_synced_images_off_mode_skips_debug_image_when_disabled(node):
+    node.mode = SetVisionMode.Request.OFF
+    node.publish_debug_image = False
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+
+    calls = []
+    node._publish_debug_image = lambda *a, **k: calls.append(1)
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == []
+
+
 def test_synced_images_dispatches_to_track_hand(node):
     node.mode = SetVisionMode.Request.TRACK_HAND
     node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
@@ -136,20 +166,24 @@ def test_synced_images_dispatches_to_track_hand(node):
 
 
 def _prime_track_hand(node, monkeypatch, detection, fist, depth=(0.5, 1.0)):
-    """_track_hand의 이미지 변환/검출/깊이/tf 의존을 전부 모의로 대체한다."""
+    """_track_hand의 depth 변환/tf 의존을 모의로 대체하고, 컨테이너(hand_track_docker_node)가
+    보낸 것처럼 _hand_detection 캐시를 직접 채운다."""
     import numpy as np
     import vision_node.vision_node as vn
 
-    node._hands_detector = object()  # create_hands_detector() 호출 방지
     monkeypatch.setattr(
         node._bridge, 'imgmsg_to_cv2',
         lambda msg, desired_encoding=None: np.zeros((240, 424, 3), dtype=np.uint8))
-    monkeypatch.setattr(vn, 'detect_hand', lambda detector, image: detection)
-    monkeypatch.setattr(vn, 'is_fist', lambda landmarks: fist)
     monkeypatch.setattr(vn, 'patch_median_depth', lambda *a, **k: depth)
     node._tf_matrix = lambda tf: [[1.0, 0.0, 0.0, 0.0],
                                   [0.0, 1.0, 0.0, 0.0],
                                   [0.0, 0.0, 1.0, 0.0]]
+    if detection is None:
+        payload = {'detected': False}
+    else:
+        (px, py), _landmarks, confidence = detection
+        payload = {'detected': True, 'palm_px': [px, py], 'confidence': confidence, 'is_fist': fist}
+    node._hand_detection = (payload, node.get_clock().now())
 
 
 def test_track_hand_none_when_no_hand(node, monkeypatch):
@@ -196,6 +230,47 @@ def test_track_hand_invalid_depth_keeps_fist_but_not_detected(node, monkeypatch)
 
     assert track.detected is False
     assert track.fist is True
+
+
+def test_on_hand_track_docker_caches_payload(node):
+    import json as _json
+    from std_msgs.msg import String
+
+    msg = String()
+    msg.data = _json.dumps({'detected': True, 'palm_px': [1, 2], 'confidence': 0.5, 'is_fist': False})
+    node._on_hand_track_docker(msg)
+
+    assert node._hand_detection is not None
+    payload, _received_at = node._hand_detection
+    assert payload['palm_px'] == [1, 2]
+    assert payload['is_fist'] is False
+
+
+def test_on_hand_track_docker_ignores_invalid_json(node):
+    from std_msgs.msg import String
+
+    node._hand_detection = None
+    msg = String()
+    msg.data = 'not json'
+    node._on_hand_track_docker(msg)
+
+    assert node._hand_detection is None
+
+
+def test_track_hand_stale_detection_is_not_detected(node, monkeypatch):
+    import time
+
+    detection = ((212, 120), [(0.5, 0.5)] * 21, 0.9)
+    _prime_track_hand(node, monkeypatch, detection=detection, fist=True)
+    node.hand_detection_max_age_s = 0.0  # 캐시가 있어도 즉시 stale 처리되게
+    node._fist_counter = 3
+    time.sleep(0.01)
+
+    track = node._track_hand(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), 'fake_tf')
+
+    assert track.detected is False
+    assert node._fist_counter == 0
 
 
 class FakeTransform:

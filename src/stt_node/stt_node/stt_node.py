@@ -49,7 +49,12 @@ class SttNode(Node):
         self.declare_parameter('mic.rate', 48000)
         self.declare_parameter('mic.chunk', 12000)
         self.declare_parameter('mic.buffer_size', 24000)
-        self.declare_parameter('wakeword.threshold', 0.3)
+        # 0.3에서는 실측상 놓치는 경우가 많아 0.2로 낮춤 - 오탐(false positive)이
+        # 늘면 command.silence_rms_threshold/no_speech_prob 필터가 2차로 걸러준다.
+        # 여전히 놓치면 `ros2 param set /stt_node wakeword.threshold <값>`으로는
+        # 반영 안 됨(생성자에서 WakeupWord에 값을 한 번만 복사해 사용) - 이 기본값을
+        # 더 낮추거나 launch 시 --ros-args -p wakeword.threshold:=<값>으로 재시작해야 함.
+        self.declare_parameter('wakeword.threshold', 0.2)
         self.declare_parameter('command.record_seconds', 5.0)
         self.declare_parameter('command.sample_rate', 16000)
         # 녹음 구간이 이 RMS(진폭 제곱평균제곱근, int16 기준) 미만이면 거의 무음으로
@@ -58,6 +63,11 @@ class SttNode(Node):
         # 자막으로 학습된 부작용, 잘 알려진 현상). 마이크/환경마다 잡음 크기가 달라
         # 실측 후 조정이 필요할 수 있다.
         self.declare_parameter('command.silence_rms_threshold', 150.0)
+        # RMS 게이트를 통과할 만큼 신호는 있지만(예: 팬 소음, 발소리) 실제 발화가
+        # 아닌 경우까지는 RMS만으로 못 거른다 - Whisper verbose_json 응답의
+        # no_speech_prob(구간이 무음/비음성일 확률)이 이 값 이상이면 환각으로 보고
+        # 버린다 (_run_whisper 참고).
+        self.declare_parameter('command.no_speech_prob_threshold', 0.6)
         # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
 
@@ -249,12 +259,25 @@ class SttNode(Node):
     def _command_rms(audio: np.ndarray) -> float:
         return float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
 
+    # RMS 게이트를 통과하고도 Whisper가 지어내는 것으로 잘 알려진 한국어 환각
+    # 문구들(유튜브 자막 학습 부작용) - no_speech_prob 필터의 2차 안전망.
+    _HALLUCINATION_PHRASES = (
+        '시청해주셔서 감사합니다',
+        '구독과 좋아요 부탁드립니다',
+        '다음 영상에서 만나요',
+        '이 영상은 유료광고를 포함하고 있습니다',
+    )
+
     def _run_whisper(self, utterance_audio: bytes) -> str:
         """utterance_audio(WAV bytes)를 OpenAI whisper-1 API로 전사한다.
 
         language='ko'로 고정해 무음/잡음에서 엉뚱한 언어(태국어 등)로 잘못 감지되는
         현상을 막는다. OPENAI_API_KEY가 없으면 NotImplementedError로 fail-closed -
-        잘못된 키 없이 조용히 넘어가지 않고 _safe_call이 로그로 남기게 한다."""
+        잘못된 키 없이 조용히 넘어가지 않고 _safe_call이 로그로 남기게 한다.
+
+        response_format='verbose_json'으로 구간별 no_speech_prob을 받아, RMS
+        게이트는 통과했지만(팬 소음 등) 실제 발화가 아닌 구간에서 Whisper가 지어낸
+        텍스트를 걸러낸다(_looks_like_hallucination 참고)."""
         if self._openai_client is None:
             raise NotImplementedError('OPENAI_API_KEY 미설정 - resource/.env를 확인하세요.')
         with tempfile.NamedTemporaryFile(suffix='.wav') as temp_wav:
@@ -262,8 +285,33 @@ class SttNode(Node):
             temp_wav.flush()
             with open(temp_wav.name, 'rb') as f:
                 transcript = self._openai_client.audio.transcriptions.create(
-                    model='whisper-1', file=f, language='ko')
-        return transcript.text
+                    model='whisper-1', file=f, language='ko',
+                    response_format='verbose_json')
+        text = transcript.text.strip()
+        if self._looks_like_hallucination(text, getattr(transcript, 'segments', None)):
+            self.get_logger().info(f'Whisper 결과를 환각으로 판단해 버립니다: "{text}"')
+            self._publish_status('hallucination_dropped', '인식된 문장이 신뢰도가 낮아 버렸습니다.', {'text': text})
+            return ''
+        return text
+
+    def _looks_like_hallucination(self, text: str, segments) -> bool:
+        normalized = text.replace(' ', '')
+        if any(phrase.replace(' ', '') in normalized for phrase in self._HALLUCINATION_PHRASES):
+            return True
+        if not segments:
+            return False
+        threshold = float(self.get_parameter('command.no_speech_prob_threshold').value)
+        no_speech_probs = [
+            p for p in (self._segment_no_speech_prob(seg) for seg in segments)
+            if p is not None
+        ]
+        return bool(no_speech_probs) and max(no_speech_probs) >= threshold
+
+    @staticmethod
+    def _segment_no_speech_prob(segment):
+        if isinstance(segment, dict):
+            return segment.get('no_speech_prob')
+        return getattr(segment, 'no_speech_prob', None)
 
 
 def main(args=None):

@@ -63,31 +63,74 @@ def test_run_whisper_raises_when_no_api_key(node):
         node._run_whisper(b'')
 
 
-def test_run_whisper_calls_openai_and_returns_text(node):
-    calls = []
+class _FakeTranscript:
+    def __init__(self, text, segments=None):
+        self.text = text
+        self.segments = segments
 
-    class _FakeTranscript:
-        text = '스패너 갖다줘'
 
-    class _FakeTranscriptions:
-        def create(self, model, file, language=None):
-            calls.append((model, language))
-            return _FakeTranscript()
+class _FakeTranscriptions:
+    def __init__(self, transcript):
+        self._transcript = transcript
+        self.calls = []
+
+    def create(self, model, file, language=None, response_format=None):
+        self.calls.append((model, language, response_format))
+        return self._transcript
+
+
+def _client_returning(transcript):
+    transcriptions = _FakeTranscriptions(transcript)
 
     class _FakeAudio:
-        transcriptions = _FakeTranscriptions()
+        pass
+
+    audio = _FakeAudio()
+    audio.transcriptions = transcriptions
 
     class _FakeClient:
-        audio = _FakeAudio()
+        pass
 
-    node._openai_client = _FakeClient()
+    client = _FakeClient()
+    client.audio = audio
+    return client, transcriptions
+
+
+def test_run_whisper_calls_openai_and_returns_text(node):
+    client, transcriptions = _client_returning(
+        _FakeTranscript('스패너 갖다줘', segments=[{'no_speech_prob': 0.05}]))
+    node._openai_client = client
 
     result = node._run_whisper(b'RIFF....fake-wav-bytes')
 
     assert result == '스패너 갖다줘'
     # language='ko' 고정 - 무음/잡음에서 엉뚱한 언어로 오감지되는 걸 방지
     # (Whisper hallucination 완화, /user_command/text 진단 세션에서 발견).
-    assert calls == [('whisper-1', 'ko')]
+    assert transcriptions.calls == [('whisper-1', 'ko', 'verbose_json')]
+
+
+def test_run_whisper_drops_high_no_speech_prob_result(node):
+    client, _ = _client_returning(
+        _FakeTranscript('시청해주셔서 감사합니다', segments=[{'no_speech_prob': 0.92}]))
+    node._openai_client = client
+
+    assert node._run_whisper(b'RIFF....fake-wav-bytes') == ''
+
+
+def test_run_whisper_drops_known_hallucination_phrase_even_without_segments(node):
+    client, _ = _client_returning(
+        _FakeTranscript('시청해주셔서 감사합니다', segments=None))
+    node._openai_client = client
+
+    assert node._run_whisper(b'RIFF....fake-wav-bytes') == ''
+
+
+def test_run_whisper_keeps_low_no_speech_prob_result(node):
+    client, _ = _client_returning(
+        _FakeTranscript('펜치 갖다줘', segments=[{'no_speech_prob': 0.1}]))
+    node._openai_client = client
+
+    assert node._run_whisper(b'RIFF....fake-wav-bytes') == '펜치 갖다줘'
 
 
 # ---- _detect_wake_word (openwakeword 위임) ----
