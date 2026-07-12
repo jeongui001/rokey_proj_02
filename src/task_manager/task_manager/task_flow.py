@@ -201,9 +201,42 @@ class TaskFlow:
         future.add_done_callback(
             lambda done: self._on_vision_mode_response(
                 done, generation, expected_state, on_success))
+        self._start_vision_timeout_timer(generation)
+
+    # ---- /vision/set_mode 응답 타임아웃 (one-shot 성격의 재사용 타이머) ----
+
+    def _start_vision_timeout_timer(self, generation):
+        self._stop_vision_timeout_timer()
+        timeout_s = self.get_parameter('vision_mode_timeout_s').value
+        self._vision_timeout_timer = self.create_timer(
+            timeout_s, lambda: self._on_vision_mode_timeout(generation))
+        self._vision_timeout_owner_generation = generation
+
+    def _stop_vision_timeout_timer(self):
+        if self._vision_timeout_timer is not None:
+            self._vision_timeout_timer.cancel()
+            self._vision_timeout_timer = None
+        self._vision_timeout_owner_generation = None
+
+    def _stop_vision_timeout_timer_if_owned_by(self, generation):
+        """현재 살아있는 타이머가 정확히 이 generation 소유일 때만 정리한다 - 늦게 도착한
+        이전 세대의 응답이 새 요청의 타이머를 실수로 취소하지 못하게 한다."""
+        if self._vision_timeout_owner_generation == generation:
+            self._stop_vision_timeout_timer()
+
+    def _on_vision_mode_timeout(self, generation):
+        if generation != self._vision_generation:
+            return  # 이미 새 요청/취소 등으로 세대가 바뀜
+        self._stop_vision_timeout_timer_if_owned_by(generation)
+        # 세대를 올려, 타임아웃 이후 뒤늦게 도착한 응답이 로봇 goal을 시작하지 못하게 한다
+        # (_enter_fault -> _request_cancel도 OFF 요청으로 세대를 올리지만, 그 부수효과에
+        # 기대지 않고 여기서 명시적으로 무효화한다).
+        self._vision_generation += 1
+        self._enter_fault('/vision/set_mode 응답 타임아웃 - vision_node가 응답하지 않습니다.')
 
     def _on_vision_mode_response(
             self, future, generation, expected_state, on_success):
+        self._stop_vision_timeout_timer_if_owned_by(generation)
         if generation != self._vision_generation or self.state != expected_state:
             return
         try:

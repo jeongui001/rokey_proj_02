@@ -12,9 +12,11 @@ import json
 import rclpy
 from cv_bridge import CvBridge
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from hand_tracking import create_hands_detector, detect_hand, is_fist
 
@@ -24,11 +26,39 @@ class HandTrackDockerNode(Node):
     def __init__(self):
         super().__init__('hand_track_docker_node')
         self._bridge = CvBridge()
-        self._hands = create_hands_detector()
+        self._hands = create_hands_detector()  # 게이트가 꺼져 있어도 디텍터는 warm하게 유지한다
+        self._enabled = False
+        # 게이트가 꺼져 있는 동안에는 이미지 구독 자체를 만들지 않는다. 구독만 걸어두고
+        # 콜백에서 일찍 빠져나오는 방식으로는 카메라 퍼블리셔가 여전히 305KB짜리 프레임을
+        # 이 컨테이너로 계속 보내야 해서(424x240 RGB, ~38Hz -> 약 11MB/s), DDS/UDP 부하가
+        # 그대로 남아 같은 카메라를 보는 vision_node 쪽 프레임이 깨진다. TRACK_HAND일 때만
+        # 구독을 만들고, 꺼지면 destroy_subscription으로 트래픽을 0으로 만든다.
+        self._image_sub = None
         self._pub = self.create_publisher(String, '/vision/hand_track_docker', 10)
+        # vision_node가 TRACK_HAND 모드일 때만 True를 보낸다. transient_local이라
+        # 이 컨테이너가 vision_node보다 늦게 떠도 마지막 값을 즉시 받는다 - 기본 QoS(VOLATILE)로
+        # 구독하면 래치된 값을 못 받아 손 검출이 영영 안 켜지므로 QoS를 반드시 맞춰야 한다.
         self.create_subscription(
-            Image, '/camera/color/image_raw', self._on_image, qos_profile_sensor_data)
+            Bool, '/vision/hand_track_enable', self._on_enable,
+            QoSProfile(
+                depth=1,
+                reliability=QoSReliabilityPolicy.RELIABLE,
+                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            ))
         self.get_logger().info('hand_track_docker_node started, waiting for images...')
+
+    def _on_enable(self, msg):
+        if msg.data == self._enabled:
+            return
+        self._enabled = msg.data
+        if self._enabled:
+            self._image_sub = self.create_subscription(
+                Image, '/camera/color/image_raw', self._on_image, qos_profile_sensor_data)
+        elif self._image_sub is not None:
+            self.destroy_subscription(self._image_sub)
+            self._image_sub = None
+        self.get_logger().info(
+            f'hand detection {"ENABLED" if self._enabled else "DISABLED"}')
 
     def _on_image(self, msg):
         bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -46,7 +76,7 @@ class HandTrackDockerNode(Node):
         out = String()
         out.data = json.dumps(payload)
         self._pub.publish(out)
-        self.get_logger().info(f'published: {out.data}')
+        self.get_logger().info(f'published: {out.data}', throttle_duration_sec=1.0)
 
 
 def main():

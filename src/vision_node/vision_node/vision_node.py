@@ -10,10 +10,13 @@ import rclpy
 from cv_bridge import CvBridge
 from rclpy.duration import Duration
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import (
+    QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy, qos_profile_sensor_data,
+)
+from rclpy.time import Time
 from tf2_ros import Buffer, TransformListener, TransformException
 from sensor_msgs.msg import Image, CameraInfo, CompressedImage
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 from handover_interfaces.msg import ToolTrack, HandTrack, DetectionArray, VisionTiming
 from handover_interfaces.srv import SetVisionMode
@@ -23,8 +26,8 @@ from vision_node.tracking import (
     KPT_CONF_MIN, detection_center,
 )
 from vision_node.grasp_geometry import (
-    AxisSmoother, is_bbox_at_edge, patch_median_depth, tool_axis_from_depth,
-    yaw_deg_to_quaternion,
+    AxisSmoother, align_depth_to_color, is_bbox_at_edge, patch_median_depth,
+    tool_axis_from_depth, yaw_deg_to_quaternion,
 )
 
 # hand-eye 캘리브레이션(T_gripper2camera.npy)이 이미 카메라 광학 좌표계 기준이라,
@@ -143,6 +146,14 @@ class VisionNode(Node):
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
         self._hand_detection = None  # (payload dict, 수신 시각) - 컨테이너(hand_track_docker_node)가 보낸 최신 검출 결과 캐시
         self._fist_counter = 0  # TRACK_HAND에서 is_fist 연속 참 카운트(디바운스)
+        # realsense2_camera의 align_depth.enable+enable_sync가 이 카메라/드라이버 조합
+        # (FW 5.13.0.50, ROS wrapper v4.57.7)에서 근본적으로 깨져 있어(2026-07-12 확인 -
+        # 켜면 depth 프레임이 요청 fps의 2배로 나오고 aligned_depth_to_color가 0프레임만
+        # 발행 - 해상도/fps를 바꿔도 재현, 카메라 하드웨어 자체는 rs-hello-realsense로 정상
+        # 확인됨), 드라이버 정렬 대신 raw depth(/camera/depth/image_rect_raw)를 받아
+        # grasp_geometry.align_depth_to_color로 직접 컬러 픽셀 격자에 정렬한다.
+        self._depth_intrinsics = None  # (fx,fy,ppx,ppy) - /camera/depth/camera_info 캐시
+        self._depth_to_color = None  # (rotation 3x3, translation 3,) - 뎁스->컬러 TF 캐시(물리적으로 고정값이라 최초 1회만 조회)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
         self.pub_hand_track = self.create_publisher(HandTrack, '/vision/hand_track', 10)  # 서브스크라이버: robot_control(handover_approach 중 직접 구독)
@@ -150,6 +161,18 @@ class VisionNode(Node):
             CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
         self.pub_timing = self.create_publisher(VisionTiming, '/perception/timing', 10)  # 서브스크라이버: 팀 모니터링/tools 분석
+        # 컨테이너(hand_track_docker_node)를 TRACK_HAND 구간에서만 돌리기 위한 게이트.
+        # 컨테이너가 vision_node보다 늦게 떠도 현재 모드를 즉시 알 수 있어야 하므로
+        # transient_local로 마지막 값을 래치한다(구독자도 같은 QoS여야 래치를 받는다).
+        # 컨테이너 이미지에는 handover_interfaces가 없어서 std_msgs 타입만 쓸 수 있다.
+        gate_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.pub_hand_enable = self.create_publisher(
+            Bool, '/vision/hand_track_enable', gate_qos)  # 서브스크라이버: hand_track_docker_node(컨테이너)
+        self._publish_hand_enable(False)  # 기동 직후엔 꺼진 상태로 시작
         self._t = {}                            # 이번 프레임의 구간 타이밍/추적 기록 (콜백마다 리셋)
         self._timing_window = deque(maxlen=100)  # (callback_ms, e2e_ms, infer_ms) rolling 통계용
         self._timing_csv = None                 # timing_csv_path 설정 시 지연 오픈
@@ -174,17 +197,29 @@ class VisionNode(Node):
         self.sub_color = message_filters.Subscriber(
             self, Image, '/camera/color/image_raw',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
+        # aligned_depth_to_color 대신 raw depth를 받는다(위 _depth_to_color 주석 참고) -
+        # 정렬은 align_depth_to_color로 우리가 직접 계산한다(_align_depth_msg).
         self.sub_depth = message_filters.Subscriber(
-            self, Image, '/camera/aligned_depth_to_color/image_raw',
+            self, Image, '/camera/depth/image_rect_raw',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_info = message_filters.Subscriber(
             self, CameraInfo, '/camera/color/camera_info',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_detections = message_filters.Subscriber(
             self, DetectionArray, '/detection/tool_boxes')  # 퍼블리셔: object_detection(팀원3)
+        # depth intrinsics는 프레임마다 안 바뀌는 카메라 고정값이라 sync 그룹에 넣지 않고
+        # 최신값만 캐시한다(_align_depth_msg가 사용).
+        self.create_subscription(
+            CameraInfo, '/camera/depth/camera_info', self._on_depth_info,
+            qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
+        # queue_size는 "카메라 fps x 허용할 최대 검출 지연"으로 잡아야 한다. tool_detection_node는
+        # YOLO 결과에 입력 컬러 프레임의 stamp를 그대로 실어 보내므로, 추론이 오래 걸리면 검출이
+        # 도착했을 때 짝이 맞는 컬러/뎁스 프레임이 큐에 남아 있어야 동기화가 성립한다. 60fps에서
+        # queue_size=10은 166ms 분량뿐이라, 추론이 그보다 느려지는 순간 동기화가 영구히 실패했다
+        # (= tool_track도 debug_image도 아예 안 나감). 120이면 약 2초 분량을 버틴다.
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth, self.sub_info, self.sub_detections],
-            queue_size=10, slop=0.05)
+            queue_size=120, slop=0.05)
         self._sync.registerCallback(self._on_synced_images)
 
     def _checkpoint_event(
@@ -310,10 +345,17 @@ class VisionNode(Node):
                     throttle_duration_sec=5.0)
 
     def _safe_call(self, fn, *args, default=None, **kwargs):
+        """한 프레임에서 fn이 예외를 던져도 vision_node 프로세스 전체가 죽지 않게 막는다.
+        기본 rclpy.spin()은 SingleThreadedExecutor를 쓰는데, 콜백에서 새어나온 예외를
+        스핀 루프가 그대로 재발생시켜 프로세스가 종료된다(런치에 respawn도 없어 그 뒤로
+        모든 퍼블리셔가 영구히 멈춘다 - 2026-07-12, 태스크 반복 중 카메라 송출이 영구히
+        끊기는 증상의 원인). 예전엔 NotImplementedError만 잡아서 사실상 무방비였다."""
         try:
             return fn(*args, **kwargs)
-        except NotImplementedError as exc:
-            self.get_logger().warn(f'{fn.__qualname__} not implemented yet: {exc}')
+        except Exception as exc:
+            self.get_logger().error(
+                f'{fn.__qualname__} 호출 중 예외가 발생해 이번 프레임을 건너뜁니다: '
+                f'{exc!r}', throttle_duration_sec=1.0)
             return default
 
     _SET_MODE_CHECKPOINTS = {
@@ -332,6 +374,10 @@ class VisionNode(Node):
             self.axis_smoother.reset(request.tool_class)  # 이전 사이클의 축 이력도 함께 초기화
         elif request.mode == SetVisionMode.Request.TRACK_HAND:
             self._fist_counter = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
+            self._hand_detection = None  # 게이트가 꺼져 있던 동안의 마지막 검출 잔상을 지운다
+        # 컨테이너는 TRACK_HAND일 때만 mediapipe를 돌린다 - 그 이전 단계(공구 추적/서보)에서
+        # CPU를 YOLO와 나눠 쓰지 않게 해야 검출 지연이 동기화 큐를 넘기지 않는다.
+        self._publish_hand_enable(request.mode == SetVisionMode.Request.TRACK_HAND)
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
         checkpoint = self._SET_MODE_CHECKPOINTS.get(request.mode)
@@ -341,6 +387,12 @@ class VisionNode(Node):
                 phase, checkpoint_id, 'PASS' if response.success else 'FAIL',
                 response.message, {'mode': request.mode, 'tool_class': request.tool_class})
         return response
+
+    def _publish_hand_enable(self, enabled):
+        """컨테이너의 mediapipe 추론 on/off 게이트를 발행한다."""
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.pub_hand_enable.publish(msg)
 
     def _on_hand_track_docker(self, msg):
         """컨테이너(hand_track_docker_node)가 보낸 mediapipe 검출 결과(String/JSON)를
@@ -354,6 +406,62 @@ class VisionNode(Node):
                 throttle_duration_sec=1.0)
             return
         self._hand_detection = (payload, self.get_clock().now())
+
+    def _on_depth_info(self, msg):
+        """뎁스 카메라 intrinsics 캐시(_align_depth_msg가 사용) - 프레임마다 안 바뀌는
+        고정값이라 sync 그룹 없이 최신값만 들고 있는다."""
+        self._depth_intrinsics = (
+            float(msg.k[0]), float(msg.k[4]), float(msg.k[2]), float(msg.k[5]))
+
+    def _get_depth_to_color_extrinsics(self, depth_msg, color_msg):
+        """뎁스->컬러 광학 좌표계 외부파라미터(rotation, translation)를 TF에서 조회해
+        캐싱한다. 카메라 리그에 고정된 물리적 값이라(안 휘는 한 안 변함) 최초 1회만
+        성공하면 이후 프레임은 캐시를 그대로 쓴다 - 매 프레임 TF 버퍼 조회 비용을 아낀다."""
+        if self._depth_to_color is not None:
+            return self._depth_to_color
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                color_msg.header.frame_id, depth_msg.header.frame_id,
+                Time(), timeout=Duration(seconds=0.1))
+        except TransformException as ex:
+            self.get_logger().warn(
+                f'뎁스->컬러 TF 조회에 실패했습니다(정렬 계산 보류): {ex}',
+                throttle_duration_sec=1.0)
+            return None
+        matrix = self._tf_matrix(tf)
+        rotation = np.array([row[:3] for row in matrix[:3]])
+        translation = np.array([row[3] for row in matrix[:3]])
+        self._depth_to_color = (rotation, translation)
+        return self._depth_to_color
+
+    def _align_depth_msg(self, depth_msg, color_msg, info_msg):
+        """raw depth(뎁스 광학 좌표계)를 컬러 픽셀 격자에 정렬해 새 Image msg로 반환한다.
+
+        realsense2_camera의 align_depth.enable+enable_sync가 이 카메라/드라이버 조합에서
+        근본적으로 깨져 있어(__init__ 주석 참고) 드라이버 정렬 대신 여기서 직접 계산한다.
+        TF/depth camera_info가 아직 없으면(기동 직후 한동안) None을 반환해 이번 프레임을
+        건너뛰게 한다 - 한번 확보되면 이후 프레임은 캐시만 쓰므로 계속 None일 일은 없다."""
+        extrinsics = self._get_depth_to_color_extrinsics(depth_msg, color_msg)
+        if extrinsics is None or self._depth_intrinsics is None:
+            self.get_logger().warn(
+                '뎁스 정렬에 필요한 TF/camera_info가 아직 없어 이번 프레임을 건너뜁니다.',
+                throttle_duration_sec=1.0)
+            return None
+        rotation, translation = extrinsics
+        depth_fx, depth_fy, depth_ppx, depth_ppy = self._depth_intrinsics
+        color_fx, color_fy, color_ppx, color_ppy = (
+            float(info_msg.k[0]), float(info_msg.k[4]), float(info_msg.k[2]), float(info_msg.k[5]))
+        raw_depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
+        raw_depth_m = raw_depth.astype(np.float64) / 1000.0  # RealSense depth는 보통 mm(16UC1)
+        aligned_m = align_depth_to_color(
+            raw_depth_m, depth_fx, depth_fy, depth_ppx, depth_ppy,
+            color_fx, color_fy, color_ppx, color_ppy,
+            rotation, translation, (color_msg.height, color_msg.width),
+            dmin=self.min_z_m, dmax=DEPTH_MAX_M)
+        aligned_msg = self._bridge.cv2_to_imgmsg(
+            (aligned_m * 1000.0).astype(np.uint16), encoding='16UC1')
+        aligned_msg.header = color_msg.header
+        return aligned_msg
 
     def _on_synced_images(self, color_msg, depth_msg, info_msg, detection_msg):
         """4개 토픽이 시간적으로 맞춰졌을 때마다(30~60Hz 목표) 호출되는 메인 루프.
@@ -377,18 +485,31 @@ class VisionNode(Node):
             return
 
         if self.mode == SetVisionMode.Request.TRACK_TOOL:
+            aligned_depth_msg = self._safe_call(
+                self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
+            if aligned_depth_msg is None:
+                return
             track = self._safe_call(
-                self._track_tool, color_msg, depth_msg, info_msg, detection_msg,
+                self._track_tool, color_msg, aligned_depth_msg, info_msg, detection_msg,
                 tf_at_stamp, self.tool_class, default=None)
             if track is not None:
                 self.pub_tool_track.publish(track)
             self._publish_timing(color_msg, detection_msg, t_entry, entry_wall_s,
                                  published=track is not None)
         elif self.mode == SetVisionMode.Request.TRACK_HAND:
+            aligned_depth_msg = self._safe_call(
+                self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
+            if aligned_depth_msg is None:
+                return
             hand_track = self._safe_call(
-                self._track_hand, color_msg, depth_msg, info_msg, tf_at_stamp, default=None)
+                self._track_hand, color_msg, aligned_depth_msg, info_msg, tf_at_stamp, default=None)
             if hand_track is not None:
                 self.pub_hand_track.publish(hand_track)
+            # OFF와 동일한 이유로(아래 주석 참고) - TRACK_HAND(핸드오버 접근/대기) 구간
+            # 내내 디버그 영상이 끊기면 GUI가 "카메라 영상이 멈췄습니다"로 표시해 실제
+            # 고장과 구분이 안 된다. 인식 박스 없는 원본 화면만이라도 계속 흘려보낸다.
+            if self.publish_debug_image:
+                self._safe_call(self._publish_debug_image, color_msg, [], None, None, default=None)
         elif self.publish_debug_image:
             # mode == OFF: 추적/서보 목표용 데이터는 발행하지 않지만(ToolTrack/
             # HandTrack), GUI가 카메라 연결 여부를 항상 눈으로 확인할 수 있도록

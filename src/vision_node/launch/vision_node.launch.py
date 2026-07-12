@@ -13,7 +13,18 @@ def generate_launch_description():
         launch_arguments={
             'depth_module.depth_profile': '480x270x60',
             'rgb_camera.color_profile': '424x240x60',
-            'align_depth.enable': 'true',
+            # align_depth.enable(+enable_sync)를 켜서 드라이버가 정렬해주게 했었으나,
+            # 이 카메라/드라이버 조합(FW 5.13.0.50, ROS wrapper v4.57.7)에서 이 조합 자체가
+            # 근본적으로 깨져 있음을 2026-07-12 실기에서 확인했다 - 켜면 depth 프레임이
+            # 요청 fps의 정확히 2배로 나오고 aligned_depth_to_color가 항상 0프레임만
+            # 발행한다(해상도/fps를 바꿔도 재현, rs-hello-realsense로 depth 센서 자체는
+            # 정상임을 별도 확인). GitHub에도 realsense-ros/librealsense에서 enable_sync+
+            # align_depth 조합이 여러 버전에 걸쳐 반복 보고된 알려진 문제. 그래서 드라이버
+            # 정렬은 끄고, vision_node가 raw depth(/camera/depth/image_rect_raw)를 받아
+            # grasp_geometry.align_depth_to_color로 직접 컬러 픽셀 격자에 정렬한다
+            # (vision_node.py의 _align_depth_msg/_get_depth_to_color_extrinsics 참고).
+            'align_depth.enable': 'false',
+            'enable_sync': 'false',
             # realsense2_camera 기본값(camera_namespace='camera')은 노드 이름과 겹쳐
             # 토픽이 /camera/camera/color/image_raw로 발행된다 - vision_node/
             # tool_detection_node는 /camera/color/image_raw(단일)를 구독하므로 비워서 맞춘다
@@ -73,6 +84,11 @@ def generate_launch_description():
         package='vision_node',
         executable='vision_node',
         output='screen',
+        # 마지막 안전망 - _safe_call이 대부분의 프레임 단위 예외를 이제 막아주지만,
+        # 그래도 예측 못한 예외로 프로세스가 죽으면 respawn 없이는 카메라 송출이
+        # 영구히 멈춘다(2026-07-12 확인). 몇 초 뒤 자동 재기동되게 한다.
+        respawn=True,
+        respawn_delay=2.0,
     )
     # object_detection(팀원3) 역할 - YOLO 추론만 하고 /detection/tool_boxes로 발행한다.
     # vision_node와 발행 토픽이 겹치지 않으므로(예전엔 둘 다 /vision/tool_track에 발행해

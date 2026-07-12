@@ -27,8 +27,9 @@
     # 발생 시 이 값을 다시 false로 되돌리는 것이 첫 대응이다.
     servo_pick:
       hardware_ready: true
-    # handover_approach.hardware_ready: true였던 이전 override는 제거했다(2026-07-09) -
-    # movel 기반 단발 이동에서 HandServoLoop 기반 연속 speedl 서보로 완전히
-    # 재구현되어 이전 실기 확인이 새 구현에는 적용되지 않는다. vision_node가
-    # /vision/hand_track(연속 발행 + 주먹 판정)을 실제로 내보내고 이 서보를
-    # 저속으로 검증하기 전까지 handover_servo.hardware_ready는 false(코드 기본값)로 유지한다.
+    # handover_approach.hardware_ready: true였던 2026-07-09 이전 override는 새 HandServoLoop
+    # 구현(movel 단발 -> 연속 speedl) 검증 전이라 제거됐었다. 2026-07-12 E-stop 대기 상태에서
+    # 저속(v_max=0.15m/s) 실기 검증을 시작하기 위해 다시 켠다 - 문제 발생 시 이 값을
+    # false로 되돌리는 것이 첫 대응이다(servo_pick과 동일 원칙).
+    handover_servo:
+      hardware_ready: true

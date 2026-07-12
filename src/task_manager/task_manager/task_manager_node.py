@@ -55,6 +55,10 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         # 오지 않을 때 RECOVERY_REQUIRED를 유지한 채 재시도를 허용할 뿐이다. 실제
         # 환경(네트워크/서비스 응답 지연)에 맞게 조정 가능하다.
         self.declare_parameter('recovery_timeout_s', 5.0)
+        # /vision/set_mode 응답을 무한정 기다리지 않기 위한 순수 통신 타임아웃이다.
+        # 이 응답을 받아야 다음 로봇 goal이 나가므로, 타임아웃이 없으면 vision_node가
+        # 응답하지 않을 때 MOVE_TO_WATCH/APPROACH_HAND에서 어떤 타이머도 없이 영구히 멈춘다.
+        self.declare_parameter('vision_mode_timeout_s', 5.0)
         # 초기 연결 또는 재연결(늦게 연결된 GUI)에서도 다음 주기 안에 현재 상태를
         # 받을 수 있도록 /task/status를 주기적으로 재발행한다. 순수 통신 목적의
         # 값이며, 이 자체가 state/detail을 바꾸지는 않는다 (_on_status_publish_timer).
@@ -102,6 +106,10 @@ class TaskManagerNode(Node, ActionCoordinator, SafetyRecovery, TaskFlow):
         self._goal_result_state = None
         self._cancel_pending_callback = None
         self._vision_generation = 0
+        # /vision/set_mode call_async 이후 응답 대기 타임아웃. _recovery_timeout_timer와
+        # 같은 구조(owner_generation으로 stale 콜백이 새 타이머를 취소하지 못하게)를 쓴다.
+        self._vision_timeout_timer = None
+        self._vision_timeout_owner_generation = None
         # /robot/recover 복구 요청 관련 상태. generation은 새 Fault가 들어오면
         # 증가시켜, 그 이전에 보낸 복구 요청의 지연 응답이 나중에 도착해도
         # 무시하도록 한다 (_on_recover_response 참고).
