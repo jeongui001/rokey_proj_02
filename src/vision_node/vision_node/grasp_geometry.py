@@ -7,6 +7,59 @@ import cv2
 import numpy as np
 
 
+def align_depth_to_color(
+        depth_m, depth_fx, depth_fy, depth_ppx, depth_ppy,
+        color_fx, color_fy, color_ppx, color_ppy,
+        rotation, translation, out_shape, dmin=0.10, dmax=2.0):
+    """뎁스 이미지(뎁스 광학 좌표계, meters)를 컬러 픽셀 격자에 정렬한다.
+
+    realsense2_camera의 enable_sync+align_depth가 이 카메라/드라이버 조합(FW 5.13.0.50,
+    ROS wrapper v4.57.7)에서 근본적으로 깨져 있어(2026-07-12 확인 - 켜면 depth 프레임이
+    요청 fps의 정확히 2배로 나오고 aligned_depth_to_color가 0프레임만 발행, 해상도/fps를
+    바꿔도 재현) 드라이버 정렬에 의존하지 않고 직접 계산한다. 카메라 하드웨어/뎁스 센서
+    자체는 정상임을 rs-hello-realsense(SDK 직접 호출)로 별도 확인함.
+
+    cv2.rgbd.registerDepth(OpenCV contrib rgbd 모듈)로 계산한다 - 뎁스 클라우드 생성 ->
+    (rotation, translation)으로 컬러 광학 좌표계 변환 -> 컬러 intrinsics로 재투영이라는
+    동일 알고리즘을 최적화된 C++로 제공한다. 처음엔 numpy(np.minimum.at 기반 z-buffer
+    스캐터)로 직접 구현했으나 424x240 기준 프레임당 ~10-12ms가 걸려(np.minimum.at이 그중
+    절반 이상) "카메라가 짧게 끊기고 로봇팔 접근이 느려짐"의 원인이 됐다(2026-07-12 실기
+    확인) - cv2.rgbd.registerDepth는 동일 조건에서 ~2.8ms/frame으로 약 4배 빠르고, 기존
+    numpy 구현의 유닛 테스트(항등변환/이동/occlusion z-buffer/전체 무효) 시나리오를 그대로
+    통과시켜 결과가 float32 정밀도(~1e-7) 이내로 동일함을 확인했다.
+
+    주의: cv2.rgbd.registerDepth는 "negative depth 값을 체크하지 않는다"(자체 문서)뿐
+    아니라 **0도 체크하지 않는다** - 우리 코드 전체의 "0=무효" 관례를 모른다. 0을 그대로
+    넣으면 그 픽셀이 z=0인 실제 점처럼 처리되다 재투영식의 1/z에서 NaN이 나고 그 NaN이
+    주변으로 번진다(실측 확인: 항등변환 테스트에서 배경 0이 그대로면 유효 영역까지 NaN으로
+    오염됨). 그래서 dmin/dmax로 무효 판정한 픽셀을 미리 NaN으로 표시해 넣어야
+    correct하게 무효로만 전파되고(실측 확인: occlusion 테스트에서 더 가까운 점만 정확히
+    남음), 출력의 NaN을 다시 0.0으로 되돌려 기존 반환 계약(0=무효, meters, float64)을
+    그대로 지킨다.
+
+    rotation: 3x3 배열형(list 또는 ndarray), translation: 길이 3 배열형 - 둘 다
+    tracking.transform_to_matrix/quaternion_to_rotation_matrix와 동일하게 tf_buffer의
+    TransformStamped(뎁스->컬러)에서 만든다.
+    """
+    out_h, out_w = out_shape
+    depth_in = depth_m.astype(np.float32).copy()
+    invalid = ~((depth_in > dmin) & (depth_in < dmax))
+    depth_in[invalid] = np.nan
+    k_depth = np.array(
+        [[depth_fx, 0.0, depth_ppx], [0.0, depth_fy, depth_ppy], [0.0, 0.0, 1.0]],
+        dtype=np.float64)
+    k_color = np.array(
+        [[color_fx, 0.0, color_ppx], [0.0, color_fy, color_ppy], [0.0, 0.0, 1.0]],
+        dtype=np.float64)
+    dist_coeffs = np.zeros(5, dtype=np.float64)  # RealSense 컬러 이미지는 이미 rectify됨
+    rt = np.eye(4, dtype=np.float64)
+    rt[:3, :3] = np.asarray(rotation, dtype=np.float64)
+    rt[:3, 3] = np.asarray(translation, dtype=np.float64)
+    registered = cv2.rgbd.registerDepth(
+        k_depth, k_color, dist_coeffs, rt, depth_in, (out_w, out_h), depthDilation=False)
+    return np.nan_to_num(registered, nan=0.0).astype(np.float64)
+
+
 def patch_median_depth(depth_m, cx, cy, half=4, dmin=0.10, dmax=2.0):
     """(cx, cy) 주변 (2*half+1)^2 패치의 유효 뎁스 median(m)과 유효 픽셀 비율을 반환.
 

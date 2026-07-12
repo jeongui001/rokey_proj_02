@@ -3,8 +3,8 @@ import numpy as np
 import pytest
 
 from vision_node.grasp_geometry import (
-    AxisSmoother, is_bbox_at_edge, patch_median_depth, posx_to_matrix,
-    tool_axis_from_depth, yaw_deg_to_quaternion, zyz_deg_to_rot,
+    AxisSmoother, align_depth_to_color, is_bbox_at_edge, patch_median_depth,
+    posx_to_matrix, tool_axis_from_depth, yaw_deg_to_quaternion, zyz_deg_to_rot,
 )
 
 
@@ -41,6 +41,75 @@ def _synthetic_tilted_roi(angle_deg, size=120, belt_z=0.31, z_near=0.296, z_far=
     proj_norm = (proj - proj.min()) / max(proj.max() - proj.min(), 1e-6)
     roi[ys_idx, xs_idx] = z_near + proj_norm * (z_far - z_near)
     return roi
+
+
+def test_align_depth_identity_transform_reproduces_input():
+    # 회전 없음 + 이동 없음 + 동일 intrinsics면 각 픽셀이 정확히 자기 자신에게
+    # 재투영돼야 한다(핀홀 역투영 후 재투영이 항등연산으로 상쇄됨) - realsense 드라이버의
+    # align_depth를 대체하는 이 함수의 가장 기본적인 정합성 검증. 내부적으로
+    # cv2.rgbd.registerDepth(float32)를 거치므로 1e-9는 너무 빡빡함 - 실측 오차는
+    # ~5e-8 수준이라 1e-6이면 충분히 여유 있게 float32 라운딩만 허용한다.
+    depth = np.zeros((50, 60), dtype=np.float64)
+    depth[10:20, 15:25] = 0.5
+    depth[30:35, 40:45] = 1.2
+    aligned = align_depth_to_color(
+        depth, depth_fx=600.0, depth_fy=600.0, depth_ppx=30.0, depth_ppy=25.0,
+        color_fx=600.0, color_fy=600.0, color_ppx=30.0, color_ppy=25.0,
+        rotation=np.eye(3), translation=np.zeros(3), out_shape=(50, 60))
+    assert aligned == pytest.approx(depth, abs=1e-6)
+
+
+def test_align_depth_translation_shifts_point():
+    # 뎁스 카메라가 컬러 카메라보다 +x 방향으로 치우쳐 있으면(뎁스->컬러 변환의 translation.x
+    # 가 양수) 재투영된 점은 원래보다 왼쪽(작은 u)으로 이동한다 - 핀홀 재투영 u = x*fx/z+ppx에서
+    # x가 translation만큼 줄어들기 때문. 실제 D435i 스펙(뎁스-컬러 baseline ~15mm)과 부호가
+    # 일치하는지도 함께 확인한다.
+    depth = np.zeros((100, 100), dtype=np.float64)
+    z = 0.5
+    depth[50, 50] = z  # (cx=50, cy=50)가 depth_ppx/ppy와 일치 -> depth 좌표계에서 x=y=0
+    aligned = align_depth_to_color(
+        depth, depth_fx=600.0, depth_fy=600.0, depth_ppx=50.0, depth_ppy=50.0,
+        color_fx=600.0, color_fy=600.0, color_ppx=50.0, color_ppy=50.0,
+        rotation=np.eye(3), translation=np.array([0.015, 0.0, 0.0]),
+        out_shape=(100, 100))
+    expected_u = int(round(0.015 * 600.0 / z)) + 50  # x_color = 0 + 0.015 -> u = x*fx/z + ppx
+    nz_v, nz_u = np.nonzero(aligned)
+    assert len(nz_u) == 1
+    assert nz_u[0] == expected_u
+    assert nz_v[0] == 50
+    assert aligned[50, expected_u] == pytest.approx(z)
+
+
+def test_align_depth_keeps_closer_point_on_occlusion():
+    # 시차 때문에 서로 다른 depth 픽셀 2개가 같은 컬러 픽셀에 겹쳐 투영되는 경우(occlusion),
+    # 더 먼(배경) 점이 아니라 더 가까운(z가 작은) 점이 남아야 한다 - z-buffer 없이 나중에
+    # 쓴 값이 그냥 덮어쓰면 순회 순서에 따라 배경이 전경을 뚫고 나오는 잘못된 결과가 나온다.
+    depth = np.zeros((10, 10), dtype=np.float64)
+    depth[5, 4] = 0.8  # 먼 점 (배경), z=0.8
+    depth[5, 6] = 0.3  # 가까운 점 (전경), z=0.3 - translation 후 먼 점과 같은 컬러 픽셀로 겹친다
+    # translation은 미터 단위라 픽셀 이동량은 z에 반비례(pixel_shift ~ shift/z)하므로,
+    # 두 점의 z가 다르면 같은 shift라도 최종 컬러 픽셀이 다르게 밀린다. 두 점이 정확히
+    # 같은 컬러 픽셀에 겹치는 shift를 x_far/0.8 == x_near/0.3 조건으로 풀면(x는 각각의
+    # 재투영 후 컬러좌표계 x) shift = -0.0016 - 손으로 방정식을 풀어 구한 값.
+    x_far, x_near = (4 - 5) * 0.8 / 600.0, (6 - 5) * 0.3 / 600.0
+    shift = (0.3 * x_far - 0.8 * x_near) / 0.5
+    aligned = align_depth_to_color(
+        depth, depth_fx=600.0, depth_fy=600.0, depth_ppx=5.0, depth_ppy=5.0,
+        color_fx=600.0, color_fy=600.0, color_ppx=5.0, color_ppy=5.0,
+        rotation=np.eye(3), translation=np.array([shift, 0.0, 0.0]),
+        out_shape=(10, 10))
+    nz_v, nz_u = np.nonzero(aligned)
+    assert len(nz_u) == 1  # 두 점이 같은 컬러 픽셀 하나로 겹쳤다
+    assert aligned[nz_v[0], nz_u[0]] == pytest.approx(0.3)  # 더 가까운 점이 남음
+
+
+def test_align_depth_no_valid_pixels_returns_zeros():
+    depth = np.zeros((20, 20), dtype=np.float64)
+    aligned = align_depth_to_color(
+        depth, depth_fx=600.0, depth_fy=600.0, depth_ppx=10.0, depth_ppy=10.0,
+        color_fx=600.0, color_fy=600.0, color_ppx=10.0, color_ppy=10.0,
+        rotation=np.eye(3), translation=np.zeros(3), out_shape=(20, 20))
+    assert np.all(aligned == 0.0)
 
 
 def test_patch_median_ignores_holes():

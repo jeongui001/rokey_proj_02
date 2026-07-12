@@ -19,7 +19,21 @@ def ros_context():
 
 @pytest.fixture
 def node():
+    import numpy as np
+
     n = VisionNode()
+    # _on_synced_images가 TRACK_TOOL/TRACK_HAND에서 이제 _align_depth_msg를 거치는데,
+    # 그게 뎁스->컬러 TF/intrinsics 캐시가 있어야 동작한다(실제로는 TF 조회로 채워짐).
+    # 여기서 항등 변환(rotation=identity, translation=0) + 컬러와 동일한 intrinsics로
+    # 미리 채워 두면 align_depth_to_color가 순수 통과(입력 그대로 반환)가 되어, 이 필드가
+    # 생기기 전 테스트들이 가정하던 "depth_m_img == imgmsg_to_cv2 결과"와 동일하게 유지된다.
+    n._depth_intrinsics = (600.0, 600.0, 320.0, 240.0)  # _make_info_msg()의 컬러 intrinsics와 동일
+    n._depth_to_color = (np.eye(3), np.zeros(3))
+    # _on_synced_images 디스패치만 검증하는 테스트들은 실제 이미지 데이터가 없어(_make_image_msg는
+    # header만 채운 빈 Image) 진짜 _align_depth_msg가 cv_bridge 인코딩 에러로 실패한다 - 그
+    # 테스트들의 관심사는 정렬 자체가 아니라 모드별 디스패치이므로 기본은 항등 통과로 스텁하고,
+    # 정렬 로직 자체를 검증하는 테스트는 이걸 다시 원래 구현으로 되돌려 쓴다.
+    n._align_depth_msg = lambda depth_msg, color_msg, info_msg: depth_msg
     yield n
     n.destroy_node()
 
@@ -196,6 +210,160 @@ def test_synced_images_dispatches_to_track_hand(node):
         _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
 
     assert published == [expected_track]
+
+
+def test_synced_images_track_hand_also_publishes_raw_debug_image(node):
+    # TRACK_HAND(핸드오버 접근/대기) 구간에서도 OFF와 동일한 이유로 디버그 영상은
+    # 계속 흘려보내야 한다 - 안 그러면 이 구간 내내 GUI가 "카메라 영상이 멈췄습니다"로
+    # 표시해 실제 고장과 구분이 안 된다(2026-07-12 확인).
+    node.mode = SetVisionMode.Request.TRACK_HAND
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._track_hand = lambda color, depth, info, tf: None
+
+    calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: calls.append(
+        (detections, chosen_det, axis_debug))
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [([], None, None)]
+
+
+def test_synced_images_track_hand_skips_debug_image_when_disabled(node):
+    node.mode = SetVisionMode.Request.TRACK_HAND
+    node.publish_debug_image = False
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._track_hand = lambda color, depth, info, tf: None
+
+    calls = []
+    node._publish_debug_image = lambda *a, **k: calls.append(1)
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == []
+
+
+def test_on_depth_info_caches_intrinsics(node):
+    node._depth_intrinsics = None
+    info = _make_info_msg()  # k = [600,0,320, 0,600,240, 0,0,1]
+
+    node._on_depth_info(info)
+
+    assert node._depth_intrinsics == (600.0, 600.0, 320.0, 240.0)
+
+
+def test_get_depth_to_color_extrinsics_caches_after_first_lookup(node):
+    """뎁스->컬러 외부파라미터는 카메라 리그에 고정된 물리적 값이라 최초 1회만 TF를
+    조회하고 이후로는 캐시를 그대로 써야 한다(매 프레임 TF 버퍼 조회 비용을 아낌)."""
+    import numpy as np
+
+    node._depth_to_color = None
+    calls = []
+
+    def _lookup(target, source, time, timeout=None):
+        calls.append((target, source))
+        tf = FakeTransform()
+        tf.transform.translation.x = 0.015
+        return tf
+
+    node.tf_buffer.lookup_transform = _lookup
+    depth_msg = _make_image_msg()
+    depth_msg.header.frame_id = 'camera_depth_optical_frame'
+    color_msg = _make_image_msg()
+    color_msg.header.frame_id = 'camera_color_optical_frame'
+
+    first = node._get_depth_to_color_extrinsics(depth_msg, color_msg)
+    second = node._get_depth_to_color_extrinsics(depth_msg, color_msg)
+
+    assert len(calls) == 1  # 두 번째 호출은 TF를 다시 조회하지 않음
+    assert calls[0] == ('camera_color_optical_frame', 'camera_depth_optical_frame')
+    rotation, translation = first
+    assert np.array_equal(rotation, np.eye(3))
+    assert translation[0] == pytest.approx(0.015)
+    assert second is first  # 캐시된 동일 객체
+
+
+def test_get_depth_to_color_extrinsics_returns_none_when_tf_missing(node):
+    from tf2_ros import TransformException
+
+    node._depth_to_color = None
+    node.tf_buffer.lookup_transform = lambda *a, **k: (_ for _ in ()).throw(
+        TransformException('no tf yet'))
+
+    result = node._get_depth_to_color_extrinsics(_make_image_msg(), _make_image_msg())
+
+    assert result is None
+    assert node._depth_to_color is None
+
+
+def test_align_depth_msg_produces_color_grid_aligned_depth(node):
+    """실제 _align_depth_msg(스텁 없이) 구현 검증 - depth intrinsics/TF 캐시를 그대로
+    쓰고 align_depth_to_color 결과를 컬러와 같은 해상도의 Image msg로 되돌려주는지."""
+    import numpy as np
+    del node._align_depth_msg  # fixture의 기본 스텁을 걷어내고 실제 구현을 쓴다
+
+    node._depth_intrinsics = (600.0, 600.0, 50.0, 50.0)
+    node._depth_to_color = (np.eye(3), np.zeros(3))
+
+    raw_depth_mm = np.zeros((100, 100), dtype=np.uint16)
+    raw_depth_mm[50, 50] = 500  # 0.5m, depth_ppx/ppy(50,50)와 일치 -> 자기 자신에게 재투영
+    node._bridge.imgmsg_to_cv2 = lambda msg, desired_encoding=None: raw_depth_mm
+
+    depth_msg = _make_image_msg()
+    color_msg = _make_image_msg()
+    color_msg.height, color_msg.width = 100, 100
+    info_msg = _make_info_msg()
+    info_msg.k = [600.0, 0.0, 50.0, 0.0, 600.0, 50.0, 0.0, 0.0, 1.0]
+
+    aligned_msg = node._align_depth_msg(depth_msg, color_msg, info_msg)
+
+    assert aligned_msg is not None
+    assert aligned_msg.header == color_msg.header
+    decoded = node._bridge.imgmsg_to_cv2(aligned_msg, desired_encoding='passthrough')
+    assert decoded[50, 50] == 500
+
+
+def test_align_depth_msg_returns_none_when_extrinsics_missing(node):
+    from tf2_ros import TransformException
+
+    del node._align_depth_msg
+    node._depth_to_color = None
+    node.tf_buffer.lookup_transform = lambda *a, **k: (_ for _ in ()).throw(
+        TransformException('no tf yet'))
+
+    result = node._align_depth_msg(_make_image_msg(), _make_image_msg(), _make_info_msg())
+
+    assert result is None
+
+
+def test_safe_call_catches_generic_exception_and_logs(node):
+    """예전엔 NotImplementedError만 잡아서 실제 예외(ValueError 등)가 그대로 새어나가
+    vision_node 프로세스 전체를 죽였다(기본 SingleThreadedExecutor가 콜백 예외를 스핀
+    루프에서 재발생시킴, respawn도 없어 카메라 송출이 영구히 멈추는 원인이었다).
+    지금은 모든 Exception을 잡아 이번 프레임만 건너뛰어야 한다."""
+    def _boom():
+        raise ValueError('boom')
+
+    logged = []
+    node.get_logger().error = lambda msg, **k: logged.append(msg)
+
+    result = node._safe_call(_boom, default='fallback')
+
+    assert result == 'fallback'
+    assert len(logged) == 1
+    assert 'boom' in logged[0]
+
+
+def test_safe_call_still_returns_default_on_not_implemented_error(node):
+    def _boom():
+        raise NotImplementedError('not yet')
+
+    node.get_logger().error = lambda msg, **k: None
+    result = node._safe_call(_boom, default='fallback')
+
+    assert result == 'fallback'
 
 
 def _prime_track_hand(node, monkeypatch, detection, fist, depth=(0.5, 1.0)):
