@@ -58,7 +58,8 @@ class ServoLoop:
                  z_close=0.02, diverge_n=5, cov_threshold=0.05,
                  q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
                  n_stable_z=5, diverge_min_delta_m=0.01, descend_accel_m_s2=0.1,
-                 descend_stop_margin_m=0.0, v_grasp_max=0.05, n_stable_v=5):
+                 descend_stop_margin_m=0.0, v_grasp_max=0.05, n_stable_v=5,
+                 v_tool_deadband_m_s=0.03):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
         self.v_max = v_max               # 수평 속도 상한
@@ -102,6 +103,14 @@ class ServoLoop:
         self.cov_threshold = cov_threshold  # 폐합 판정용 속도 공분산 임계
         self.v_grasp_max = v_grasp_max   # 폐합 판정용 공구 속도(xy, m/s) 상한
         self.n_stable_v = n_stable_v     # v_grasp_max 판정에 필요한 연속 안정 주기 수(z_close와 동일 방식)
+        # 정지 물체도 카메라 노이즈만으로 v_tool이 완전히 0은 아니게 추정된다(실측
+        # 노이즈 바닥: 정지 렌치 재생 시 p95=10.6mm/s, max=23.2mm/s). r_xy를 실측치로
+        # 낮춘 뒤 이 노이즈가 w(피드포워드 신뢰도)가 1 근처로 빨리 수렴하는 정지
+        # 상황에서 그대로 vx/vy 명령에 실려 로봇이 떨리는 현상 확인(2026-07-12 실기) -
+        # tool_speed가 이 값 미만이면 피드포워드 기여를 선형으로 줄여 순수 P제어에
+        # 가깝게 만든다. 실제 이동(수십~수백mm/s)에는 영향 없도록 노이즈 바닥보다
+        # 확실히 크게 잡았다.
+        self.v_tool_deadband_m_s = v_tool_deadband_m_s
         # 내부 KalmanXYZV로 그대로 전달되는 필터 노이즈 파라미터 (kalman.py 참고)
         self.q_pos = q_pos
         self.q_vel = q_vel
@@ -217,6 +226,12 @@ class ServoLoop:
         lead_time = self.dt_latency + elapsed_since_track
         p_ref = self._filter.predict_position(lead_time)
         v_tool = self._filter.velocity  # 피드포워드 항(v̂_tool)
+        tool_speed = float(np.hypot(v_tool[0], v_tool[1]))
+        self._last_tool_speed = tool_speed
+        # v_tool_deadband_m_s 미만이면 피드포워드 기여를 선형으로 줄인다(0~1 램프) -
+        # 정지 물체의 노이즈성 v_tool이 그대로 명령에 실려 떨리는 것을 막기 위함.
+        ff_scale = min(tool_speed / self.v_tool_deadband_m_s, 1.0) \
+            if self.v_tool_deadband_m_s > 0 else 1.0
 
         tcp_x, tcp_y, tcp_z = tcp_pose[0], tcp_pose[1], tcp_pose[2]
         e_x = p_ref[0] - tcp_x
@@ -231,9 +246,9 @@ class ServoLoop:
 
         self._last_z_gap = abs(tcp_z - p_ref[2])
 
-        # 핵심 제어식: v_cmd = w·v̂_tool + Kp·e (속도 피드포워드 + P 피드백)
-        vx = self._w * v_tool[0] + self.kp_xy * e_x
-        vy = self._w * v_tool[1] + self.kp_xy * e_y
+        # 핵심 제어식: v_cmd = w·ff_scale·v̂_tool + Kp·e (속도 피드포워드 + P 피드백)
+        vx = self._w * ff_scale * v_tool[0] + self.kp_xy * e_x
+        vy = self._w * ff_scale * v_tool[1] + self.kp_xy * e_y
         speed = float(np.hypot(vx, vy))
         if speed > self.v_max:
             scale = self.v_max / speed
@@ -251,9 +266,8 @@ class ServoLoop:
 
         # 공구 속도(xy 평면) 판정 - z_close와 같은 방식으로 디바운스한다: 필터
         # 속도 추정치는 단발 프레임에서 튈 수 있으므로, n_stable_v주기 연속으로
-        # v_grasp_max 이내여야 "충분히 느림"으로 인정한다.
-        tool_speed = float(np.hypot(v_tool[0], v_tool[1]))
-        self._last_tool_speed = tool_speed
+        # v_grasp_max 이내여야 "충분히 느림"으로 인정한다. (tool_speed는 위에서
+        # ff_scale 계산 시 이미 구했다.)
         if tool_speed < self.v_grasp_max:
             self._v_stable_count += 1
         else:

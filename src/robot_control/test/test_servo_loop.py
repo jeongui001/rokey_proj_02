@@ -42,7 +42,7 @@ def _make_loop(**overrides):
                   dt_latency=0.05, timeout_s=5.0, t_lost_s=0.3,
                   innov_low=0.010, innov_high=0.040, w_alpha=1.0,
                   z_close=0.02, diverge_n=5, cov_threshold=0.5,
-                  v_grasp_max=1.0, n_stable_v=1)
+                  v_grasp_max=1.0, n_stable_v=1, v_tool_deadband_m_s=0.03)
     kwargs.update(overrides)
     return ServoLoop(**kwargs)
 
@@ -329,3 +329,45 @@ def test_should_abort_diverging_when_monotonic_increase_meets_min_delta():
     loop.on_tool_track(FakeToolTrack(0.0, 0.5, 0.0, 0.05))
     loop._error_history = [0.10, 0.12, 0.14, 0.16, 0.20]
     assert loop.should_abort() == 'diverging'
+
+
+def test_feedforward_suppressed_below_tool_speed_deadband():
+    # 정지 물체는 카메라 노이즈만으로도 v_tool이 완전히 0은 아니게 추정된다(실측
+    # 노이즈 바닥 p95=10.6mm/s, max=23.2mm/s). v_tool_deadband_m_s보다 작으면
+    # 피드포워드(w*v_tool) 기여를 억제해 순수 P제어(kp_xy*e)만 남겨야 한다 -
+    # 그렇지 않으면 이 노이즈가 그대로 속도 명령으로 나가 로봇이 떨린다.
+    loop = _make_loop(v_tool_deadband_m_s=0.03)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.80, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.8001, 0.0, 0.05))  # 미세한 움직임(노이즈 수준)
+    tool_speed = float(np.hypot(*loop._filter.velocity[:2]))
+    assert tool_speed < 0.03  # 전제 조건: deadband 아래
+
+    tcp = (0.79, 0.0, 0.05, 0, 0, 0)  # v_max 클리핑을 피하려 p_ref 근처로 둠
+    cmd = loop.step(tcp, loop._last_msg_time)
+
+    p_ref = loop._filter.predict_position(loop.dt_latency)
+    expected_p_only = loop.kp_xy * (p_ref[0] - tcp[0])
+    assert cmd.vx == pytest.approx(expected_p_only, abs=1e-6)
+
+
+def test_feedforward_full_above_tool_speed_deadband():
+    # v_tool_deadband_m_s보다 충분히 빠르면(실제 이동) 기존 제어식(w*v_tool+kp_xy*e)이
+    # 그대로 적용돼야 한다 - deadband가 정상 추적 반응성을 깎으면 안 된다.
+    loop = _make_loop(v_tool_deadband_m_s=0.03)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    x = 0.0
+    for i in range(1, 5):
+        x += 0.002  # 0.1m/s로 등속 이동 - 몇 프레임 누적돼야 필터 속도 추정치가 수렴
+        loop.on_tool_track(FakeToolTrack(0.02 * i, x, 0.0, 0.05))
+    tool_speed = float(np.hypot(*loop._filter.velocity[:2]))
+    assert tool_speed > 0.03  # 전제 조건: deadband 위
+
+    tcp = (0.0, 0.0, 0.05, 0, 0, 0)
+    cmd = loop.step(tcp, loop._last_msg_time)
+
+    p_ref = loop._filter.predict_position(loop.dt_latency)
+    v_tool = loop._filter.velocity
+    expected_vx = loop._w * v_tool[0] + loop.kp_xy * (p_ref[0] - tcp[0])
+    assert cmd.vx == pytest.approx(expected_vx, abs=1e-6)

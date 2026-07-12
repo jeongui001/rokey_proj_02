@@ -758,7 +758,11 @@ class TaskExecutor:
         lift_outcome, lift_detail = self._run_grasp_lift(goal_handle)
         if lift_outcome != 'ARRIVED':
             return self._finish_tracking_result(goal_handle, lift_outcome, lift_detail)
-        self._cleanup_stop_motion()
+        # 들어올림이 실제 속도(lift_speed_m_s)로 움직이던 중이라, 인자 없이 부르면
+        # fault_stop_mode(QUICK/Cat.2, 실제 안전 FAULT 전용)로 급정지되어 외력
+        # 스파이크로 오인되어 FAULT가 뜬다(2026-07-12 실기 확인) - 정상 종료이므로
+        # recoverable_stop_mode를 명시한다.
+        self._cleanup_stop_motion(self.get_parameter('safety.recoverable_stop_mode').value)
         result = self._finish_tracking_result(goal_handle, 'ARRIVED', '')
         result.final_width_mm = width_mm
         result.grip_detected = grip_detected

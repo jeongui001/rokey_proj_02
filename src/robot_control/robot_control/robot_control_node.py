@@ -108,6 +108,7 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.cov_threshold', 0.05)
         self.declare_parameter('servo.v_grasp_max', 0.05)
         self.declare_parameter('servo.n_stable_v', 5)
+        self.declare_parameter('servo.v_tool_deadband_m_s', 0.03)
         # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
         # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
         self.declare_parameter('servo.kalman_q_pos', 1e-4)
@@ -344,6 +345,7 @@ class RobotControlNode(Node, TaskExecutor):
             cov_threshold=self.get_parameter('servo.cov_threshold').value,
             v_grasp_max=self.get_parameter('servo.v_grasp_max').value,
             n_stable_v=self.get_parameter('servo.n_stable_v').value,
+            v_tool_deadband_m_s=self.get_parameter('servo.v_tool_deadband_m_s').value,
             q_pos=self.get_parameter('servo.kalman_q_pos').value,
             q_vel=self.get_parameter('servo.kalman_q_vel').value,
             r_xy=self.get_parameter('servo.kalman_r_xy').value,
