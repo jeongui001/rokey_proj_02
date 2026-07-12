@@ -342,7 +342,12 @@ class TaskExecutor:
                 f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m} '
                 f'z_gap={snap["last_z_gap_m"]} z_stable_count={snap["z_stable_count"]} '
                 f'depth_valid={snap["depth_valid"]} vz={snap["cmd_m_s"]["vz"]} '
-                f'tcp_cache_age_s={cache_age_s:.3f}',
+                f'tcp_cache_age_s={cache_age_s:.3f} '
+                f'e_xy_norm_m={snap["e_xy_norm_m"]} w={snap["w"]} '
+                f'velocity_m_s={snap["velocity_m_s"]} '
+                f'innovation_xy_m={snap["innovation_xy_m"]} '
+                f'position_m={snap["position_m"]} '
+                f'cmd_vx_vy={snap["cmd_m_s"]["vx"]},{snap["cmd_m_s"]["vy"]}',
                 throttle_duration_sec=0.05)
         return command
 
