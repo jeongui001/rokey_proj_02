@@ -3096,3 +3096,20 @@ def test_handover_hold_open_failure_publishes_gripper_opened_on_pull_fail(node, 
     payloads = [json.loads(p.data) for p in published]
     matches = [p for p in payloads if p['checkpoint_id'] == 'gripper_opened_on_pull']
     assert matches[-1]['status'] == 'FAIL'
+
+
+# ---- servo_pick 접촉 감지(DrflContactMonitor) 배선 ----
+
+def test_on_contact_detected_sets_flag(node):
+    assert node._contact_flag is False
+
+    node._on_contact_detected(12.3, 5.0)
+
+    assert node._contact_flag is True
+
+
+def test_suspend_resume_drfl_contact_monitor_noop_without_hardware(node):
+    # hardware_enabled=False(기본 dry_run)에서는 _drfl_contact_monitor가 None이므로
+    # suspend/resume이 예외 없이 조용히 넘어가야 한다.
+    node._resume_drfl_contact_monitor()
+    node._suspend_drfl_contact_monitor()

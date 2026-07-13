@@ -77,7 +77,7 @@
       diverge_n_yaw: 15
       diverge_min_delta_deg: 10.0
       v_max: 0.25               # 수평 속도 상한(m/s), 
-      descend_speed: 0.05       # 하강 속도(m/s)
+      descend_speed: 0.035       # 하강 속도(m/s)
       eps_descend: 1.0       # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기, 1.00은 사실상 기능 제거 (0.04)
       eps_grasp: 1.0         # 폐합 판정 수평 오차 임계(m)
       n_stable: 1              # 폐합 판정에 필요한 연속 안정 주기 수, 일단 끈 상태(1)
@@ -99,7 +99,7 @@
       # tcp z가 추가로 십수 mm 더 내려가는 현상 확인(정확한 메커니즘 미확정 -
       # tcp_pose 캐시 staleness 또는 그리퍼 폐합 반력 추정 중). margin이 z_close에
       # 바짝 붙어 있으면 이 여유를 흡수 못 하므로 z_close도 함께 올려 여유를 키운다.
-      z_close: 0.018 # 언제 도착 판정을 시작할지 결정
+      z_close: 0.023 # 언제 도착 판정을 시작할지 결정
       # 하강 제동 곡선이 표면이 아니라 표면 위 이 마진(m)에서 속도 0을 겨냥하게 해,
       # 락 이후 관성으로도 표면과 이 만큼의 여유를 남긴다 - z_close보다 반드시
       # 작아야 한다(같거나 크면 z_gap이 z_close 밑으로 내려가기 전에 이미 속도가
@@ -110,7 +110,7 @@
       # z_gap은 여전히 z_close보다 커서 z_stable_count가 영원히 0에 머무는
       # 교착(로봇이 더 안 내려가는데 "도착"도 인정 안 됨 - 그리퍼가 절대 안 닫힘)이
       # 실기로 확인됨. z_close보다 확실히 작은 값으로 되돌린다.
-      descend_stop_margin_m: 0.008 # 낮추면 더 아래로 잡음, 높이면 더 위로 잡음 - z_close보다 반드시 작을 것
+      descend_stop_margin_m: 0.015 # 낮추면 더 아래로 잡음, 높이면 더 위로 잡음 - z_close보다 반드시 작을 것
       n_stable_z: 5       # z_close 판정에 필요한 연속 안정 주기 수 - depth 단발 노이즈로 조기 정지되는 걸 막음(n_stable과 같은 방식)
       diverge_n: 15       # 발산 판정에 볼 연속 오차 개수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~8.6개치)
       # diverge_n틱 연속 증가에 더해 요구하는 최소 총 증가폭(m) - 비전 갱신 사이 lead_time
@@ -235,6 +235,19 @@
       # yolo-pose-yaw-nested-lamport.md 참고, 아직 미완료), TCP/그리퍼 offset,
       # SpeedlStream 단위, 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에
       # 있으며 여기서는 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
+      # servo_pick 하강 중 TCP 외력(tool force) Z축 접촉을 vision depth와 무관하게
+      # 독립적으로 감지하는 계층(DrflContactMonitor) - safety.external_torque와
+      # 별개의 DRFL 직접 연결을 쓴다(안전 FAULT용 DrflForceMonitor와는 완전히 분리).
+      contact:
+        drfl_lib_path: '~/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
+        robot_ip: '192.168.1.100'
+        robot_port: 12345
+        poll_hz: 100.0
+        # TODO: 그리퍼/공구 자중 대비 접촉을 확실히 구분할 수 있는 값으로 실기
+        # 재조정 필요 - 이 값은 검증되지 않은 추정값이다.
+        force_threshold_n: 8.0
+        reset_below_count: 20
+        stop_join_timeout_s: 2.0
 
     # handover_safe 도착 후 작업자 손(/vision/hand_track)에 연속 접근 - servo_pick과
     # 동일한 speedl 기반 RT 서보 루프(HandServoLoop)로 구현되어 있다. vision_node가
@@ -245,8 +258,8 @@
       hand_track_frame_id: 'base_link'
       tcp_pose_max_age_s: 0.2
       watchdog_poll_interval_s: 0.05
-      kp_xy: 1.2
-      kp_z: 1.2
+      kp_xy: 1.4
+      kp_z: 1.4
       v_max: 0.15         # 사람에게 접근하는 동작이라 servo_pick(0.25)보다 보수적으로 낮게 둔다
       offset_m: 0.10       # 사용자 확정값 - TCP->손 방향 위, 손 앞 20cm 지점에서 추종을 멈춘다
       t_lost_s: 10.0
