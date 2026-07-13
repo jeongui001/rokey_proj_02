@@ -50,7 +50,32 @@
     # 그대로 두고, 튜닝 시 이 섹션만 고치면 된다.
     servo:
       kp_xy: 1.2               # 수평 P 게인, 클수록 오차에 민감하게 반응
-      kp_yaw: 1.0               # yaw P 게인(현재 yaw=0 고정이라 미사용), 클수록 오차에 민감
+      kp_yaw: 1.0               # yaw P 게인(deg 오차 -> deg/s 명령), 클수록 오차에 민감
+      # yaw_rate 상한(deg/s) - vx/vy/v_max(m/s)와 단위가 달라 별도 파라미터로 분리했다
+      # (섞어 쓰면 yaw_rate가 사실상 0으로 눌리는 버그가 있었음 - _validate_servo_command 참고).
+      # 실기 튜닝 전 보수적인 값으로 시작.
+      yaw_rate_max_deg_s: 30.0
+      eps_yaw_deg: 5.0          # 폐합 판정 각도 오차 임계(deg)
+      n_stable_yaw: 5           # 폐합 판정에 필요한 연속 안정 주기 수(n_stable_z와 동일 방식)
+      # base-frame grip_deg(vision, 0=base_link X축 기준) <-> TCP 방향 사이 부호/오프셋 -
+      # 실기 캘리브레이션 전까지 항등(1.0/0.0). servo_pick.hardware_ready를 true로 켜기
+      # 전 반드시 실기로 확정할 것(부호가 틀리면 그리퍼가 목표와 반대로 돔). 2026-07-13
+      # 실기 과회전 확인 후 raw C(ZYZ 오일러 세 번째 성분, top-down 자세에서 B≈180°
+      # 짐벌락 근방이라 불안정) 직접 사용을 그만두고, 회전행렬을 완전히 조립해 기준
+      # 벡터를 회전시켜 base 평면에 투영하는 방식으로 바꿨다(servo_loop.py
+      # ServoLoop.step 참고, vision측 _grip_deg_to_base_quaternion과 동일 기법) -
+      # yaw_offset_deg는 이제 "TCP 로컬 프레임에서 grip_deg=0에 해당하는 기준 벡터의
+      # 방향(deg)"을 뜻한다(이전엔 raw C에 더하는 각도였음). B=0에서는 수학적으로
+      # 이전 방식과 동치.
+      yaw_sign: 1.0
+      yaw_offset_deg: 0.0
+      # yaw 발산 판정(should_abort, xy의 diverge_n/diverge_min_delta_m과 대칭) - 표현
+      # 방식을 회전행렬 기반으로 고쳐도 캘리브레이션 미확정 등 남은 오차 원인으로
+      # 회전이 계속 커질 수 있어, 물리적 과회전 폭 자체를 여기서 한 번 더 제한하는
+      # 안전망(2026-07-13 실기 과회전 확인 후 추가). 실기 튜닝 대상 - xy와 유사한
+      # 값으로 시작.
+      diverge_n_yaw: 15
+      diverge_min_delta_deg: 10.0
       v_max: 0.25               # 수평 속도 상한(m/s), 
       descend_speed: 0.05       # 하강 속도(m/s)
       eps_descend: 1.0       # 이 수평 오차(m) 이내여야 하강 시작, 너무 일찍 내려간다 싶으면 줄이기, 1.00은 사실상 기능 제거 (0.04)
@@ -80,7 +105,12 @@
       # 작아야 한다(같거나 크면 z_gap이 z_close 밑으로 내려가기 전에 이미 속도가
       # 0에 수렴해 폐합 조건이 영원히 안 걸릴 수 있다). 실측 없이 추정한 값이라
       # 실기에서 그리퍼-테이블 간극에 맞게 튜닝이 필요하다.
-      descend_stop_margin_m: 0.0030 # 낮추면 더 아래로 잡음, 높이면 더 위로 잡음
+      # 2026-07-13 실기: margin(0.030) >= z_close(0.018)로 어긋나 있던 걸 확인 -
+      # z_gap이 margin보다 작아지는 순간 제동 곡선이 이미 vz=0을 겨냥하지만
+      # z_gap은 여전히 z_close보다 커서 z_stable_count가 영원히 0에 머무는
+      # 교착(로봇이 더 안 내려가는데 "도착"도 인정 안 됨 - 그리퍼가 절대 안 닫힘)이
+      # 실기로 확인됨. z_close보다 확실히 작은 값으로 되돌린다.
+      descend_stop_margin_m: 0.008 # 낮추면 더 아래로 잡음, 높이면 더 위로 잡음 - z_close보다 반드시 작을 것
       n_stable_z: 5       # z_close 판정에 필요한 연속 안정 주기 수 - depth 단발 노이즈로 조기 정지되는 걸 막음(n_stable과 같은 방식)
       diverge_n: 15       # 발산 판정에 볼 연속 오차 개수 (control_period_s 기준 틱 수 - 실측 비전 주기 16.8~18ms 대비 실관측 ~8.6개치)
       # diverge_n틱 연속 증가에 더해 요구하는 최소 총 증가폭(m) - 비전 갱신 사이 lead_time
@@ -200,9 +230,11 @@
       # 무한 루프에 빠지지 않도록 하는 안전 타임아웃(s).
       lift_timeout_s: 5.0
       # hardware_ready는 다음이 모두 확인되기 전까지 반드시 false로 유지한다:
-      # ToolTrack.orientation 의미, TCP/그리퍼 offset, SpeedlStream 단위,
-      # 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에 있으며 여기서는
-      # 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
+      # ToolTrack.orientation 의미(2026-07-13: yaw_rate가 SpeedlStream으로 배선됨 -
+      # servo.yaw_sign/yaw_offset_deg 실기 캘리브레이션 절차는
+      # yolo-pose-yaw-nested-lamport.md 참고, 아직 미완료), TCP/그리퍼 offset,
+      # SpeedlStream 단위, 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에
+      # 있으며 여기서는 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
 
     # handover_safe 도착 후 작업자 손(/vision/hand_track)에 연속 접근 - servo_pick과
     # 동일한 speedl 기반 RT 서보 루프(HandServoLoop)로 구현되어 있다. vision_node가

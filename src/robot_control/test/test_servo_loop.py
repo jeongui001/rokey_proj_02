@@ -24,16 +24,30 @@ class FakePosition:
         self.z = z
 
 
+class FakeQuaternion:
+    def __init__(self, x=0.0, y=0.0, z=0.0, w=1.0):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.w = w
+
+
 class FakePose:
-    def __init__(self, x, y, z):
+    def __init__(self, x, y, z, yaw_deg=None):
         self.position = FakePosition(x, y, z)
+        if yaw_deg is None:
+            self.orientation = FakeQuaternion()  # identity
+        else:
+            half = math.radians(yaw_deg) / 2.0
+            self.orientation = FakeQuaternion(z=math.sin(half), w=math.cos(half))
 
 
 class FakeToolTrack:
-    def __init__(self, t, x, y, z, depth_valid=True):
+    def __init__(self, t, x, y, z, depth_valid=True, yaw_deg=None):
         self.header = FakeHeader(t)
-        self.pose = FakePose(x, y, z)
+        self.pose = FakePose(x, y, z, yaw_deg=yaw_deg)
         self.depth_valid = depth_valid
+        self.yaw_valid = yaw_deg is not None
 
 
 def _make_loop(**overrides):
@@ -279,6 +293,19 @@ def test_descend_vz_is_zero_when_z_gap_within_margin():
     assert cmd.vz == 0.0
 
 
+def test_debug_snapshot_flags_margin_close_invariant():
+    # descend_stop_margin_m >= z_close면 z_gap이 z_close 밑으로 내려가기도 전에
+    # 제동 곡선이 이미 vz=0을 겨냥해 z_stable_count가 영원히 0에 머무는 교착이
+    # 생긴다(2026-07-13 실기 확인 - 그리퍼가 절대 안 닫힘). 생성자에서 막지는
+    # 않되(제동 곡선만 격리해서 보는 위 두 테스트처럼 일부러 이 조합을 쓰는
+    # 정상적인 용법이 있음), debug_snapshot()에서 바로 눈에 띄어야 한다.
+    ok_loop = _make_loop(z_close=0.02, descend_stop_margin_m=0.005)
+    assert ok_loop.debug_snapshot()['z_close_margin_ok'] is True
+
+    bad_loop = _make_loop(z_close=0.018, descend_stop_margin_m=0.030)
+    assert bad_loop.debug_snapshot()['z_close_margin_ok'] is False
+
+
 def test_descend_vz_equals_descend_speed_when_far_from_target():
     # z_gap이 커서 정지 가능 속도가 descend_speed보다 크면, 예전처럼 descend_speed
     # 그대로 상한이 걸려야 한다(원거리 하강 속도는 그대로 유지).
@@ -371,3 +398,134 @@ def test_feedforward_full_above_tool_speed_deadband():
     v_tool = loop._filter.velocity
     expected_vx = loop._w * v_tool[0] + loop.kp_xy * (p_ref[0] - tcp[0])
     assert cmd.vx == pytest.approx(expected_vx, abs=1e-6)
+
+
+def test_yaw_target_updates_from_valid_track_and_feeds_into_step_yaw_rate():
+    # 탐지된 시점부터(첫 ToolTrack부터) yaw P 제어가 즉시 반영되는지 확인 -
+    # "완전히 내려간 뒤 6축을 돌리는" 대신 서보잉과 동시에 회전 명령이 나가야 한다.
+    loop = _make_loop(kp_yaw=2.0, yaw_rate_max_deg_s=1000.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=30.0))
+    cmd = loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
+    # current_grip_deg=0(tcp rz=0), target=30 -> error=30 -> yaw_rate=kp_yaw*30
+    assert cmd.yaw_rate == pytest.approx(60.0, abs=1e-6)
+
+
+def test_yaw_rate_clipped_to_yaw_rate_max_deg_s():
+    loop = _make_loop(kp_yaw=10.0, yaw_rate_max_deg_s=15.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=40.0))
+    cmd = loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
+    # raw = kp_yaw * error = 10 * 40 = 400 -> clip 상한(15)에 걸려야 함
+    assert cmd.yaw_rate == pytest.approx(15.0, abs=1e-6)
+
+
+def test_yaw_valid_false_holds_previous_target():
+    loop = _make_loop()
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=50.0))
+    assert loop._yaw_target_deg == pytest.approx(50.0)
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))  # yaw_deg=None -> yaw_valid False
+    assert loop._yaw_target_deg == pytest.approx(50.0)  # hold, identity로 덮어쓰지 않음
+
+
+def test_yaw_sign_and_offset_applied_to_current_grip_angle():
+    # yaw_offset_deg는 "TCP 로컬 프레임에서 grip_deg=0에 해당하는 기준 벡터의 방향(deg)" -
+    # B=0일 때 rot=Rz(C)이므로 기준벡터([cos(offset),sin(offset),0])가 C만큼 더 회전한
+    # 뒤 yaw_sign이 곱해진다: current_grip_deg = (yaw_sign * (offset + C)) % 180.
+    loop = _make_loop(kp_yaw=1.0, yaw_rate_max_deg_s=1000.0, yaw_sign=-1.0, yaw_offset_deg=10.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=0.0))
+    # current_grip_deg = (-1*(10+20)) % 180 = -30 % 180 = 150, target=0 -> 최단경로 오차
+    # = ((0-150+90)%180)-90 = 30
+    cmd = loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 20.0), time.monotonic())
+    assert cmd.yaw_rate == pytest.approx(30.0, abs=1e-6)
+
+
+def test_current_grip_angle_matches_raw_c_when_b_zero_and_offset_zero():
+    # yaw_offset_deg=0(기본값)이면 B=0일 때 회전행렬 기반 계산이 raw C를 그대로 쓰던
+    # 이전 구현과 수치적으로 동치여야 한다(Ry(0)=단위행렬) - 회귀 보증.
+    loop = _make_loop(kp_yaw=1.0, yaw_rate_max_deg_s=1000.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=50.0))
+    cmd = loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 50.0), time.monotonic())
+    assert cmd.yaw_rate == pytest.approx(0.0, abs=1e-6)  # 이미 목표(50)와 일치
+
+
+def test_current_grip_angle_agrees_across_degenerate_zyz_decompositions_at_gimbal_lock():
+    # top-down 파지 자세는 B≈180도(ZYZ 짐벌락 특이점) 근방에서 동작한다(named_poses.watch
+    # 참고). B=180에서는 ZYZ 오일러 분해가 퇴화한다 - (A,C) 개별 값이 아니라 (A-C)만
+    # 물리적 회전을 결정하므로, (A=10,C=20)과 (A=40,C=50)은 서로 다른 raw C(20 vs 50,
+    # 30도 차이)를 갖고도 완전히 동일한 물리적 회전이다(수치로 확인:
+    # zyz_deg_to_rot(10,180,20) == zyz_deg_to_rot(40,180,50)). raw C를 그대로 "현재
+    # 손목 각도"로 쓰면 이 두 경우가 30도나 다른 값으로 읽혀 존재하지도 않는 오차를
+    # 좇아 과회전하게 된다(2026-07-13 실기 원인으로 추정) - 회전행렬 투영 방식은 두
+    # 경우 모두 같은 current_grip_deg를 내야 한다.
+    loop1 = _make_loop(kp_yaw=1.0, yaw_rate_max_deg_s=1000.0)
+    loop1.start('spanner', 30.0, 20.0)
+    loop1.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=0.0))
+    cmd1 = loop1.step((0.0, 0.0, 0.05, 10.0, 180.0, 20.0), time.monotonic())
+
+    loop2 = _make_loop(kp_yaw=1.0, yaw_rate_max_deg_s=1000.0)
+    loop2.start('spanner', 30.0, 20.0)
+    loop2.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=0.0))
+    cmd2 = loop2.step((0.0, 0.0, 0.05, 40.0, 180.0, 50.0), time.monotonic())
+
+    assert cmd1.yaw_rate == pytest.approx(cmd2.yaw_rate, abs=1e-6)
+
+
+def test_yaw_diverging_triggers_should_abort_when_error_keeps_growing():
+    loop = _make_loop(diverge_n_yaw=4, diverge_min_delta_deg=5.0, kp_yaw=0.0,
+                       yaw_rate_max_deg_s=1000.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=0.0))
+    # kp_yaw=0이라 yaw_rate가 항상 0(로봇이 안 움직이는 시나리오) - tcp rz만 인위적으로
+    # 계속 벌려서 |오차|가 단조 증가하는 상황을 재현한다.
+    for c in (10.0, 20.0, 30.0, 40.0):
+        loop.step((0.0, 0.0, 0.05, 0.0, 0.0, c), time.monotonic())
+    assert loop.should_abort() == 'yaw_diverging'
+
+
+def test_yaw_diverging_does_not_trigger_when_error_converges():
+    loop = _make_loop(diverge_n_yaw=4, diverge_min_delta_deg=5.0, kp_yaw=1.0,
+                       yaw_rate_max_deg_s=1000.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=30.0))
+    # tcp rz가 target(30)에 점점 가까워지는 정상 수렴 상황
+    for c in (0.0, 10.0, 20.0, 28.0):
+        loop.step((0.0, 0.0, 0.05, 0.0, 0.0, c), time.monotonic())
+    assert loop.should_abort() != 'yaw_diverging'
+
+
+def test_should_close_blocked_until_yaw_settles_then_passes():
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2,
+                       cov_threshold=2.5, eps_yaw_deg=2.0, n_stable_yaw=3,
+                       kp_yaw=1.0, yaw_rate_max_deg_s=1000.0)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05, yaw_deg=30.0))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05, yaw_deg=30.0))
+
+    # 손목이 아직 목표(30deg)에서 먼 상태(tcp rz=0) - xy/z/속도 조건은 만족해도 폐합 보류
+    for _ in range(3):
+        loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
+    assert loop.should_close() is False
+
+    # 손목이 목표 각도에 도달(tcp rz=30) - n_stable_yaw주기 연속 후에만 폐합 허용
+    cmd = None
+    for _ in range(3):
+        cmd = loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 30.0), time.monotonic())
+    assert cmd.yaw_rate == pytest.approx(0.0, abs=1e-6)
+    assert loop.should_close() is True
+
+
+def test_should_close_ignores_yaw_gate_when_no_yaw_target_ever_observed():
+    # 비전 yaw가 아예 실패해도(_yaw_target_deg가 한 번도 안 채워짐) 파지 자체는 막지 않는다.
+    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.05, n_stable_z=2,
+                       cov_threshold=2.5, n_stable_yaw=3)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
+    assert loop._yaw_target_deg is None
+    for _ in range(3):
+        loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
+    assert loop.should_close() is True

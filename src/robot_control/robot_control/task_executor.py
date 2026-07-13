@@ -320,19 +320,21 @@ class TaskExecutor:
             request.grasp_width_mm, request.grasp_force_n, goal_handle=goal_handle)
 
     def _servo_pick_step(self):
-        """칼만 ServoLoop.step(tcp_pose, now)에 필요한 현재 TCP 위치를 캐시에서
+        """칼만 ServoLoop.step(tcp_pose, now)에 필요한 현재 TCP pose를 캐시에서
         읽어 넘긴다. 캐시가 아직 없거나 오래됐으면(_get_current_tcp_posx가 None을
         반환) 이번 틱은 명령을 계산하지 않고 건너뛴다 - 임의의 기본 좌표로
-        제어식을 계산하지 않기 위함이다. _get_current_tcp_posx()는 mm 단위이므로
-        ServoLoop(m 단위, ToolTrack과 동일)에 맞게 변환한다."""
+        제어식을 계산하지 않기 위함이다. _get_current_tcp_posx()는 posx 6-vector
+        [x,y,z,A,B,C](mm/deg)이므로 위치(x,y,z)만 ServoLoop 단위(m)로 변환하고
+        회전(A,B,C)은 deg 그대로 이어붙여 넘긴다 - yaw 제어가 tcp_pose[5](C각)를
+        현재 손목 각도로 읽는다(ServoLoop.step 참고)."""
         tcp_pose_mm = self._get_current_tcp_posx()
         if tcp_pose_mm is None:
             self.get_logger().warn(
                 'TCP 위치 캐시가 없거나 오래되어 이번 servo tick을 건너뜁니다.',
                 throttle_duration_sec=1.0)
             return None
-        tcp_pose_m = [value / 1000.0 for value in tcp_pose_mm[:3]]
-        command = self.servo_loop.step(tcp_pose_m, time.monotonic())
+        tcp_pose = [value / 1000.0 for value in tcp_pose_mm[:3]] + list(tcp_pose_mm[3:6])
+        command = self.servo_loop.step(tcp_pose, time.monotonic())
         if bool(self.get_parameter('debug.log_servo_decisions').value):
             snap = self.servo_loop.debug_snapshot()
             # 2026-07-11 실기: 락(vz=0) 이후에도 tcp z가 추가로 내려가는 현상의 원인
@@ -341,8 +343,9 @@ class TaskExecutor:
             # 끝나면 원래 값(0.5s, age_s 없이)으로 되돌려도 된다.
             cache_age_s = time.monotonic() - self._tcp_pose_cache['received_at']
             self.get_logger().info(
-                f'servo_pick 속도 명령 계산: tcp_pose_m={tcp_pose_m} '
+                f'servo_pick 속도 명령 계산: tcp_pose={tcp_pose} '
                 f'z_gap={snap["last_z_gap_m"]} z_stable_count={snap["z_stable_count"]} '
+                f'z_close_margin_ok={snap["z_close_margin_ok"]} '
                 f'tool_speed_m_s={snap["tool_speed_m_s"]} v_stable_count={snap["v_stable_count"]} '
                 f'depth_valid={snap["depth_valid"]} vz={snap["cmd_m_s"]["vz"]} '
                 f'tcp_cache_age_s={cache_age_s:.3f} '
@@ -350,7 +353,9 @@ class TaskExecutor:
                 f'velocity_m_s={snap["velocity_m_s"]} '
                 f'innovation_xy_m={snap["innovation_xy_m"]} '
                 f'position_m={snap["position_m"]} '
-                f'cmd_vx_vy={snap["cmd_m_s"]["vx"]},{snap["cmd_m_s"]["vy"]}',
+                f'cmd_vx_vy={snap["cmd_m_s"]["vx"]},{snap["cmd_m_s"]["vy"]} '
+                f'yaw_target_deg={snap["yaw_target_deg"]} yaw_error_deg={snap["yaw_error_deg"]} '
+                f'yaw_stable_count={snap["yaw_stable_count"]} yaw_rate={snap["cmd_m_s"]["yaw_rate"]}',
                 throttle_duration_sec=0.05)
         return command
 
@@ -411,10 +416,18 @@ class TaskExecutor:
         tol = self.get_parameter('servo.command_validate_tolerance').value
         v_max = abs(self.get_parameter('servo.v_max').value)
         descend_speed = abs(self.get_parameter('servo.descend_speed').value)
-        if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol or abs(cmd.yaw_rate) > v_max + tol:
+        # yaw_rate는 deg/s, v_max/vx/vy는 m/s - 단위가 다르므로 별도 파라미터로
+        # 검증한다(이전에는 v_max를 그대로 재사용해 yaw_rate가 사실상 항상 0으로
+        # 고정됐던 동안 드러나지 않은 버그였다).
+        yaw_rate_max = abs(self.get_parameter('servo.yaw_rate_max_deg_s').value)
+        if abs(cmd.vx) > v_max + tol or abs(cmd.vy) > v_max + tol:
             self.get_logger().error(
-                f'서보 속도 명령이 v_max({v_max}) 제한을 넘었습니다: '
-                f'vx={cmd.vx}, vy={cmd.vy}, yaw_rate={cmd.yaw_rate}')
+                f'서보 속도 명령이 v_max({v_max}) 제한을 넘었습니다: vx={cmd.vx}, vy={cmd.vy}')
+            return False
+        if abs(cmd.yaw_rate) > yaw_rate_max + tol:
+            self.get_logger().error(
+                f'서보 yaw_rate 명령이 yaw_rate_max_deg_s({yaw_rate_max}) 제한을 '
+                f'넘었습니다: yaw_rate={cmd.yaw_rate}')
             return False
         if abs(cmd.vz) > descend_speed + tol:
             self.get_logger().error(
@@ -433,9 +446,15 @@ class TaskExecutor:
             return False
         tol = self.get_parameter('servo.command_validate_tolerance').value
         lift_speed_m_s = abs(self.get_parameter('servo_pick.lift_speed_m_s').value)
+        yaw_rate_max = abs(self.get_parameter('servo.yaw_rate_max_deg_s').value)
         if abs(cmd.vz) > lift_speed_m_s + tol:
             self.get_logger().error(
                 f'들어올림 속도 명령이 lift_speed_m_s({lift_speed_m_s}) 제한을 넘었습니다: vz={cmd.vz}')
+            return False
+        if abs(cmd.yaw_rate) > yaw_rate_max + tol:
+            self.get_logger().error(
+                f'들어올림 yaw_rate 명령이 yaw_rate_max_deg_s({yaw_rate_max}) 제한을 '
+                f'넘었습니다: yaw_rate={cmd.yaw_rate}')
             return False
         return True
 

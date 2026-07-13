@@ -147,6 +147,58 @@ def test_synced_images_skips_publish_when_track_tool_returns_none(node):
     assert published == []
 
 
+def test_synced_images_track_tool_align_failure_still_publishes_debug_image(node):
+    """_align_depth_msg 실패(TF/camera_info 미비, cv2.rgbd 예외 등)는 3D 추적만 못 하는
+    부분 열화여야 한다 - 524955d 회귀 전에는 여기서 곧장 return해 _track_tool 내부에서만
+    이뤄지는 디버그 영상 발행까지 함께 끊겨 GUI가 "카메라 꺼짐"으로 보였다(팀원 실기 확인:
+    태스크 시작 순간 카메라 화면 정지)."""
+    node.mode = SetVisionMode.Request.TRACK_TOOL
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._align_depth_msg = lambda *a, **k: None
+
+    track_tool_calls = []
+    node._track_tool = lambda *a, **k: track_tool_calls.append(1)
+
+    debug_calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: debug_calls.append(
+        (detections, chosen_det, axis_debug))
+
+    detection = Detection2D()
+    detection_msg = _make_detection_msg([detection])
+    node._on_synced_images(_make_image_msg(), _make_image_msg(), _make_info_msg(), detection_msg)
+
+    assert track_tool_calls == []  # depth 정렬 없이 3D 추적은 시도하지 않음
+    assert debug_calls == [([detection], None, None)]  # 화면은 계속 흘려보냄
+
+
+def test_synced_images_track_hand_align_failure_still_calls_track_hand(node):
+    """TRACK_HAND도 같은 이유로 _align_depth_msg 실패 시 프레임을 드롭하지 않고, depth_msg=None
+    으로 _track_hand를 그대로 호출해 매 프레임 HandTrack을 발행해야 한다 - 안 그러면
+    /vision/hand_track이 조용히 멈춰 robot_control의 HandServoLoop가 "손 유실"과
+    "vision_node 응답 없음"을 구분할 수 없다."""
+    node.mode = SetVisionMode.Request.TRACK_HAND
+    node.tf_buffer.lookup_transform = lambda *a, **k: 'fake_tf'
+    node._align_depth_msg = lambda *a, **k: None
+
+    calls = []
+
+    def _track_hand(color, depth, info, tf):
+        calls.append(depth)
+        track = HandTrack()
+        track.detected = False
+        return track
+
+    node._track_hand = _track_hand
+    published = []
+    node.pub_hand_track.publish = published.append
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [None]  # depth 정렬 실패가 그대로 전달됨
+    assert len(published) == 1
+
+
 def test_synced_images_skips_when_tf_lookup_fails(node):
     from tf2_ros import TransformException
 
@@ -163,6 +215,86 @@ def test_synced_images_skips_when_tf_lookup_fails(node):
         _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
 
     assert called == []
+
+
+def test_synced_images_off_mode_publishes_debug_image_when_tf_lookup_fails(node):
+    """camera->base TF는 _track_tool/_track_hand의 3D 변환에만 필요하다 - 조회 실패로
+    프레임 전체를 드롭하면 OFF 모드조차 디버그 영상을 못 내보낸다(524955d 이후 회귀,
+    2026-07-13 실기: 태스크 시작 직후 로봇이 처음 움직이는 전이 구간에서 재현). 모드
+    분기 자체에는 도달해야 한다."""
+    from tf2_ros import TransformException
+
+    def _raise(*a, **k):
+        raise TransformException('no tf yet')
+
+    node.mode = SetVisionMode.Request.OFF
+    node.tf_buffer.lookup_transform = _raise
+
+    calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: calls.append(
+        (detections, chosen_det, axis_debug))
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [([], None, None)]
+
+
+def test_synced_images_track_tool_publishes_debug_image_when_tf_lookup_fails(node):
+    """TRACK_TOOL에서도 TF 실패는 3D 추적만 못 하는 부분 열화여야 한다 - _align_depth_msg
+    호출조차 시도하지 않고(tf_at_stamp 없이는 결과를 못 쓰므로) 곧장 디버그 영상 폴백으로
+    간다."""
+    from tf2_ros import TransformException
+
+    def _raise(*a, **k):
+        raise TransformException('no tf yet')
+
+    node.mode = SetVisionMode.Request.TRACK_TOOL
+    node.tf_buffer.lookup_transform = _raise
+
+    align_calls = []
+    node._align_depth_msg = lambda *a, **k: align_calls.append(1)
+
+    debug_calls = []
+    node._publish_debug_image = lambda color_msg, detections, chosen_det, axis_debug: debug_calls.append(
+        (detections, chosen_det, axis_debug))
+
+    detection = Detection2D()
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg([detection]))
+
+    assert align_calls == []  # tf_at_stamp 없이는 정렬 결과를 쓸 수 없으므로 시도조차 안 함
+    assert debug_calls == [([detection], None, None)]
+
+
+def test_synced_images_track_hand_dispatches_when_tf_lookup_fails(node):
+    """TRACK_HAND도 TF 실패 시 모드 분기 자체에는 도달해야 한다 - _track_hand는
+    depth_msg=None으로 호출돼 detected=False로 발행하고, 디버그 영상도 계속 나간다."""
+    from tf2_ros import TransformException
+
+    def _raise(*a, **k):
+        raise TransformException('no tf yet')
+
+    node.mode = SetVisionMode.Request.TRACK_HAND
+    node.tf_buffer.lookup_transform = _raise
+
+    calls = []
+
+    def _track_hand(color, depth, info, tf):
+        calls.append((depth, tf))
+        track = HandTrack()
+        track.detected = False
+        return track
+
+    node._track_hand = _track_hand
+    published = []
+    node.pub_hand_track.publish = published.append
+
+    node._on_synced_images(
+        _make_image_msg(), _make_image_msg(), _make_info_msg(), _make_detection_msg())
+
+    assert calls == [(None, None)]
+    assert len(published) == 1
 
 
 def test_synced_images_off_mode_still_publishes_raw_debug_image(node):
@@ -433,6 +565,23 @@ def test_track_hand_invalid_depth_keeps_fist_but_not_detected(node, monkeypatch)
     assert track.fist is True
 
 
+def test_track_hand_none_depth_msg_keeps_fist_but_not_detected(node, monkeypatch):
+    """_align_depth_msg가 실패해 depth_msg=None으로 넘어와도(524955d 회귀 - TF/camera_info
+    미비, cv2.rgbd 예외 등) 3D 위치만 못 쓸 뿐 2D 검출/주먹 판정은 이미 끝난 상태이므로
+    그대로 반영해 발행해야 한다(_track_hand는 절대 None을 반환하지 않는 설계)."""
+    detection = ((212, 120), [(0.5, 0.5)] * 21, 0.9)
+    _prime_track_hand(node, monkeypatch, detection=detection, fist=True)
+    node.fist_confirm_frames = 1
+    node._fist_counter = 0
+
+    track = node._track_hand(
+        _make_image_msg(), None, _make_info_msg(), 'fake_tf')
+
+    assert track.detected is False
+    assert track.fist is True
+    assert track.confidence == pytest.approx(0.9)
+
+
 def test_on_hand_track_docker_caches_payload(node):
     import json as _json
     from std_msgs.msg import String
@@ -542,6 +691,7 @@ def test_track_tool_fills_grip_yaw_orientation_from_depth_axis(node):
     # 장축 0도(이미지 x축) -> 그립 90도 -> (identity TF라 base에서도 90도) 쿼터니언
     assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
     assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
+    assert track.yaw_valid is True
 
 
 def test_track_tool_orientation_identity_when_axis_unavailable(node):
@@ -584,6 +734,9 @@ def test_track_tool_orientation_identity_when_axis_unavailable(node):
     assert track.depth_valid is False
     assert track.pose.orientation.w == pytest.approx(1.0)
     assert track.pose.orientation.z == pytest.approx(0.0)
+    # identity로 남은 이유가 "yaw=0으로 측정됨"이 아니라 "측정 실패"임을 구독측이
+    # 구분할 수 있어야 한다 - robot_control.ServoLoop이 이 플래그로 hold 처리한다.
+    assert track.yaw_valid is False
 
 
 def test_track_tool_returns_none_on_first_frame_with_fully_invalid_depth(node):
