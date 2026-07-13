@@ -11,8 +11,8 @@ def generate_launch_description():
             FindPackageShare('realsense2_camera'), '/launch/rs_launch.py'
         ]),
         launch_arguments={
-            'depth_module.depth_profile': '424x240x60',
-            'rgb_camera.color_profile': '424x240x60',
+            'depth_module.depth_profile': '424x240x30',
+            'rgb_camera.color_profile': '424x240x30',
             # align_depth.enable(+enable_sync)를 켜서 드라이버가 정렬해주게 했었으나,
             # 이 카메라/드라이버 조합(FW 5.13.0.50, ROS wrapper v4.57.7)에서 이 조합 자체가
             # 근본적으로 깨져 있음을 2026-07-12 실기에서 확인했다 - 켜면 depth 프레임이
