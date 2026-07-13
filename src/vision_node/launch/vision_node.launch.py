@@ -96,6 +96,11 @@ def generate_launch_description():
     tool_detection_node = Node(
         package='vision_node',
         executable='tool_detection_node',
+        # vision_node와 동일한 이유(위 respawn 주석 참고) - 이 노드가 죽으면 /detection/tool_boxes가
+        # 끊기고, vision_node의 4토픽 동기화 콜백도 다시는 안 돌아 디버그 영상까지 함께 영구히
+        # 멈춘다(2026-07-13, _on_color에 예외 처리 추가와 함께 respawn도 같이 건다).
+        respawn=True,
+        respawn_delay=2.0,
     )
     return LaunchDescription(
         [realsense_launch, gripper_tcp_tf, static_tf, vision_node, tool_detection_node])

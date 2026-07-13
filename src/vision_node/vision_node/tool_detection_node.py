@@ -71,10 +71,21 @@ class ToolDetectionNode(Node):
             Image, '/camera/color/image_raw', self._on_color, qos_profile_sensor_data)
 
     def _on_color(self, msg):
-        frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-        t0 = time.perf_counter()
-        result = self.model.predict(source=frame, conf=self.conf, verbose=False)[0]
-        infer_ms = (time.perf_counter() - t0) * 1000.0
+        try:
+            frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            t0 = time.perf_counter()
+            result = self.model.predict(source=frame, conf=self.conf, verbose=False)[0]
+            infer_ms = (time.perf_counter() - t0) * 1000.0
+        except Exception as exc:
+            # 기본 rclpy.spin()은 SingleThreadedExecutor를 쓰는데, 콜백에서 새어나온 예외를
+            # 스핀 루프가 그대로 재발생시켜 프로세스가 종료된다(vision_node.py의 _safe_call과
+            # 동일한 이유 - respawn도 없어 그러면 /detection/tool_boxes가 영구히 끊기고,
+            # vision_node의 4토픽 동기화 콜백도 다시는 안 돌아 디버그 영상까지 함께 멈춘다).
+            # 이번 프레임만 건너뛰고 프로세스는 계속 살려둔다.
+            self.get_logger().error(
+                f'YOLO 추론 중 예외가 발생해 이번 프레임을 건너뜁니다: {exc!r}',
+                throttle_duration_sec=1.0)
+            return
 
         det_msg = DetectionArray()
         # color 프레임과 동일 stamp (전체 계획.md 4.2절 계약) - vision_node의

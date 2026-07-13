@@ -441,10 +441,17 @@ class VisionNode(Node):
         근본적으로 깨져 있어(__init__ 주석 참고) 드라이버 정렬 대신 여기서 직접 계산한다.
         TF/depth camera_info가 아직 없으면(기동 직후 한동안) None을 반환해 이번 프레임을
         건너뛰게 한다 - 한번 확보되면 이후 프레임은 캐시만 쓰므로 계속 None일 일은 없다."""
+        # 실패 사유를 구분해서 로깅한다 - TF 없음/intrinsics 없음/정렬 계산 자체의 예외(cv2.rgbd
+        # 미존재 등, _safe_call이 별도로 잡아 error 로그를 남김)를 뭉뚱그리면 실기에서 원인을
+        # 특정하는 데 오래 걸린다(2026-07-13, 팀원 실기에서 태스크 시작 시 카메라 화면이 계속
+        # 멈추는 증상을 조사하며 확인).
         extrinsics = self._get_depth_to_color_extrinsics(depth_msg, color_msg)
-        if extrinsics is None or self._depth_intrinsics is None:
+        if extrinsics is None:
+            return None  # 사유는 _get_depth_to_color_extrinsics가 이미 로깅함
+        if self._depth_intrinsics is None:
             self.get_logger().warn(
-                '뎁스 정렬에 필요한 TF/camera_info가 아직 없어 이번 프레임을 건너뜁니다.',
+                '뎁스 camera_info(intrinsics)를 아직 받지 못해 이번 프레임 정렬을 건너뜁니다 '
+                '(/camera/depth/camera_info가 발행되고 있는지 확인하세요).',
                 throttle_duration_sec=1.0)
             return None
         rotation, translation = extrinsics
@@ -469,38 +476,64 @@ class VisionNode(Node):
         t_entry = time.perf_counter()
         entry_wall_s = self.get_clock().now().nanoseconds * 1e-9
         self._t = {}  # 이번 프레임 타이밍 기록 시작 (_track_tool의 구간들이 여기 쌓인다)
+        # camera->base TF는 _track_tool/_track_hand의 3D 변환에만 필요하다 - _publish_debug_image
+        # (GUI로 나가는 카메라 화면의 유일한 통로)는 카메라 픽셀 좌표계만 쓰므로 이 TF와 무관하다.
+        # 예전엔 조회 실패 시 여기서 곧장 return해 모드/디버그영상과 무관하게 프레임 전체가
+        # 드롭됐다 - 로봇이 정지 상태에서 처음 움직이기 시작하는 순간(태스크 시작 직후
+        # move_named('watch'))처럼 joint_states/TF 방송이 흔들리기 쉬운 전이 구간에서 실패하면
+        # 그 순간부터 카메라 화면 전체가 멈춰 보였다(2026-07-13, "태스크 지시 순간 카메라가
+        # 죽는다" 실기 확인 - _align_depth_msg 게이팅 수정은 이 상류 지점을 못 건드려 재발했다).
+        # 이제 조회가 실패해도 tf_at_stamp=None으로 두고 계속 진행 - 3D 변환(_track_tool/
+        # _track_hand)만 이번 프레임에 건너뛰고, 디버그 영상은 그대로 발행한다.
+        t0 = time.perf_counter()
         try:
             # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
             # color_msg.header.frame_id(RealSense가 붙이는 camera_color_optical_frame)가
             # 아니라 CAMERA_OPTICAL_CALIB_FRAME을 조회한다 - 캘리브레이션 회전 중복 적용 방지.
-            t0 = time.perf_counter()
             tf_at_stamp = self.tf_buffer.lookup_transform(
                 'base_link', CAMERA_OPTICAL_CALIB_FRAME, color_msg.header.stamp,
                 timeout=Duration(seconds=0.1))
-            self._t['tf_ms'] = (time.perf_counter() - t0) * 1000.0
         except TransformException as ex:
             self.get_logger().warn(
-                f'이미지 시각의 camera->base TF 조회에 실패했습니다: {ex}',
+                f'이미지 시각의 camera->base TF 조회에 실패했습니다(이번 프레임 3D 변환만 '
+                f'건너뜁니다): {ex}',
                 throttle_duration_sec=1.0)
-            return
+            tf_at_stamp = None
+        self._t['tf_ms'] = (time.perf_counter() - t0) * 1000.0
 
         if self.mode == SetVisionMode.Request.TRACK_TOOL:
-            aligned_depth_msg = self._safe_call(
-                self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
-            if aligned_depth_msg is None:
-                return
-            track = self._safe_call(
-                self._track_tool, color_msg, aligned_depth_msg, info_msg, detection_msg,
-                tf_at_stamp, self.tool_class, default=None)
-            if track is not None:
-                self.pub_tool_track.publish(track)
+            # _align_depth_msg 실패(TF/camera_info 미비, cv2.rgbd 예외 등)는 depth 3D 복원만
+            # 못 하는 부분 열화여야지, 프레임 전체를 드롭하면 안 된다 - 예전엔 실패 시 여기서
+            # 곧장 return해 _track_tool 자체가 안 불렸고, 그 안에서만 이뤄지는 디버그 영상
+            # 발행(아래 _track_tool의 591/633줄)까지 함께 끊겨 GUI가 "카메라 꺼짐"으로 보였다
+            # (팀원 실기 확인: 태스크 시작 순간 카메라 화면 정지 + 툴 트래킹 불가).
+            aligned_depth_msg = None
+            if tf_at_stamp is not None:
+                aligned_depth_msg = self._safe_call(
+                    self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
+            track = None
+            if aligned_depth_msg is not None:
+                track = self._safe_call(
+                    self._track_tool, color_msg, aligned_depth_msg, info_msg, detection_msg,
+                    tf_at_stamp, self.tool_class, default=None)
+                if track is not None:
+                    self.pub_tool_track.publish(track)
+            elif self.publish_debug_image:
+                self._safe_call(
+                    self._publish_debug_image, color_msg, detection_msg.detections, None, None,
+                    default=None)
             self._publish_timing(color_msg, detection_msg, t_entry, entry_wall_s,
                                  published=track is not None)
         elif self.mode == SetVisionMode.Request.TRACK_HAND:
-            aligned_depth_msg = self._safe_call(
-                self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
-            if aligned_depth_msg is None:
-                return
+            # TRACK_TOOL과 같은 이유로 depth 정렬 실패를 전체 프레임 드롭이 아니라 부분
+            # 열화로 다룬다 - _track_hand는 depth_msg가 없으면 detected=False로 발행하는
+            # 것으로 처리한다(아래 _track_hand 참고). 정렬 실패로 이 토픽이 조용히 멈추면
+            # robot_control의 HandServoLoop가 "손 유실"과 "vision_node 응답 없음"을 구분할
+            # 수 없다 - _track_hand는 원래 절대 None을 반환하지 않는 설계다.
+            aligned_depth_msg = None
+            if tf_at_stamp is not None:
+                aligned_depth_msg = self._safe_call(
+                    self._align_depth_msg, depth_msg, color_msg, info_msg, default=None)
             hand_track = self._safe_call(
                 self._track_hand, color_msg, aligned_depth_msg, info_msg, tf_at_stamp, default=None)
             if hand_track is not None:
@@ -880,6 +913,17 @@ class VisionNode(Node):
         self._fist_counter = self._fist_counter + 1 if raw_fist else 0
         confirmed_fist = self._fist_counter >= self.fist_confirm_frames
         track.fist = confirmed_fist
+
+        if depth_msg is None:
+            # _align_depth_msg가 이번 프레임 실패(TF/camera_info 미비, cv2.rgbd 예외 등) -
+            # 3D 위치만 계산 못 할 뿐 2D 검출/주먹 판정은 이미 유효하므로 그대로 반영해
+            # 발행한다(위 docstring의 "절대 None 아님" 불변식 유지 - HandServoLoop가 이
+            # 토픽의 수신 여부로 손 유실을 판정한다).
+            self.get_logger().warn(
+                '뎁스 정렬 결과가 없어 손 3D 위치를 계산할 수 없습니다.',
+                throttle_duration_sec=1.0)
+            track.detected = False
+            return track
 
         depth_image = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
         depth_m_img = depth_image.astype(np.float64) / 1000.0
