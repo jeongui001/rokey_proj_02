@@ -327,6 +327,14 @@ class TaskExecutor:
         [x,y,z,A,B,C](mm/deg)이므로 위치(x,y,z)만 ServoLoop 단위(m)로 변환하고
         회전(A,B,C)은 deg 그대로 이어붙여 넘긴다 - yaw 제어가 tcp_pose[5](C각)를
         현재 손목 각도로 읽는다(ServoLoop.step 참고)."""
+        if self._contact_flag:
+            # DrflContactMonitor의 백그라운드 쓰레드가 세팅한 플래그 - 실제 z
+            # 고정은 여기(메인 RT 루프)에서만 적용한다(speedl 명령의 유일한
+            # 소유자를 유지하기 위해 콜백에서 직접 적용하지 않음).
+            self._contact_flag = False
+            self.servo_loop.on_contact_detected()
+            if bool(self.get_parameter('debug.log_servo_decisions').value):
+                self.get_logger().info('servo_pick: 접촉 감지로 z를 즉시 고정합니다.')
         tcp_pose_mm = self._get_current_tcp_posx()
         if tcp_pose_mm is None:
             self.get_logger().warn(
@@ -730,19 +738,24 @@ class TaskExecutor:
         # 새지 않게 한다.
         self._servo_pick_close_thread = None
         self._servo_pick_close_success = None
-        outcome, detail = self._run_rt_tracking(
-            goal_handle,
-            name='servo_pick',
-            message_type=ToolTrack,
-            topic='/vision/tool_track',
-            callback=self._on_tool_track_during_servo,
-            servo=self.servo_loop,
-            step=self._servo_pick_step,
-            tick=lambda: self._servo_pick_tick_with_grasp_lock(goal_handle, request),
-            validate_command=self._validate_servo_command,
-            ready_parameter='servo_pick.hardware_ready',
-            period_parameter='servo_pick.control_period_s',
-            accel_param_prefix='servo_pick')
+        self._contact_flag = False
+        self._resume_drfl_contact_monitor()
+        try:
+            outcome, detail = self._run_rt_tracking(
+                goal_handle,
+                name='servo_pick',
+                message_type=ToolTrack,
+                topic='/vision/tool_track',
+                callback=self._on_tool_track_during_servo,
+                servo=self.servo_loop,
+                step=self._servo_pick_step,
+                tick=lambda: self._servo_pick_tick_with_grasp_lock(goal_handle, request),
+                validate_command=self._validate_servo_command,
+                ready_parameter='servo_pick.hardware_ready',
+                period_parameter='servo_pick.control_period_s',
+                accel_param_prefix='servo_pick')
+        finally:
+            self._suspend_drfl_contact_monitor()
         # _run_rt_tracking이 어떤 경로(정상 CLOSE/취소/중단/예외)로 빠져나왔든, RG2
         # close 스레드가 떠 있는 채로 이 함수를 반환하면 안 되므로 항상 join한다.
         # 스레드 내부의 rg2_client.close()도 goal_handle.is_cancel_requested/

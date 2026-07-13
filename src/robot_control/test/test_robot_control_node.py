@@ -52,6 +52,21 @@ class FakeGoalHandle:
         self.feedback_msgs.append(fb)
 
 
+class FakeToolTrackForNode:
+    """test_servo_pick_step_consumes_contact_flag_and_locks_z 전용 - ToolTrack의
+    header.stamp/pose.position만 필요하므로 test_servo_loop.py의 FakeToolTrack과
+    별개로 최소 형태만 둔다(두 테스트 파일 간 임포트 결합을 피하기 위함)."""
+
+    def __init__(self, t, x, y, z):
+        self.header = type('H', (), {'stamp': type('S', (), {
+            'sec': int(t), 'nanosec': int((t - int(t)) * 1e9)})()})()
+        self.pose = type('P', (), {
+            'position': type('Pos', (), {'x': x, 'y': y, 'z': z})(),
+            'orientation': type('O', (), {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0})()})()
+        self.depth_valid = True
+        self.yaw_valid = False
+
+
 def _goal(task_type, named_target=''):
     g = RobotTask.Goal()
     g.task_type = task_type
@@ -3113,3 +3128,44 @@ def test_suspend_resume_drfl_contact_monitor_noop_without_hardware(node):
     # suspend/resume이 예외 없이 조용히 넘어가야 한다.
     node._resume_drfl_contact_monitor()
     node._suspend_drfl_contact_monitor()
+
+
+def test_servo_pick_step_consumes_contact_flag_and_locks_z(node):
+    node._get_current_tcp_posx = lambda: [0.0, 0.0, 200.0, 0.0, 0.0, 0.0]  # mm
+    node.servo_loop.start('spanner', 30.0, 20.0)
+    node.servo_loop.on_tool_track(FakeToolTrackForNode(0.0, 0.0, 0.0, 0.05))
+    node.servo_loop.on_tool_track(FakeToolTrackForNode(0.02, 0.0, 0.0, 0.05))
+    node._contact_flag = True
+
+    node._servo_pick_step()
+
+    assert node._contact_flag is False
+    assert node.servo_loop._z_locked is True
+
+
+def test_execute_servo_pick_resumes_and_suspends_contact_monitor(node, monkeypatch):
+    import time as time_module
+    monkeypatch.setattr(time_module, 'sleep', lambda s: None)
+
+    resume_calls = []
+    suspend_calls = []
+    node._resume_drfl_contact_monitor = lambda: resume_calls.append(True)
+    node._suspend_drfl_contact_monitor = lambda: suspend_calls.append(True)
+
+    ticks = iter(['CONTINUE', 'CONTINUE', 'CLOSE'])
+    node._servo_pick_tick = lambda: (next(ticks), None)
+    node.servo_loop.step = lambda *a, **k: None
+    node.servo_loop.get_state = lambda: 'tracking'
+    node.servo_loop.start = lambda *a, **k: None
+    node.rg2_client.close = lambda width, force, goal_handle=None: True
+    node.rg2_client.get_state = lambda: (29.4, True)
+
+    gh = FakeGoalHandle(_goal('servo_pick'))
+    gh.request.tool_class = 'spanner'
+    gh.request.grasp_width_mm = 30.0
+    gh.request.grasp_force_n = 20.0
+
+    node._execute_servo_pick(gh)
+
+    assert resume_calls == [True]
+    assert suspend_calls == [True]
