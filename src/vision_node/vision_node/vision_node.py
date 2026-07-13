@@ -689,11 +689,13 @@ class VisionNode(Node):
         if yaw_quat is not None:
             (track.pose.orientation.x, track.pose.orientation.y,
              track.pose.orientation.z, track.pose.orientation.w) = yaw_quat
+            track.yaw_valid = True
         else:
             self.get_logger().warn(
                 f"'{tool_class}' 공구 yaw 축 계산이 불가능해 identity orientation을 사용합니다.",
                 throttle_duration_sec=1.0)
-            track.pose.orientation.w = 1.0  # 축 미확정 프레임 - identity (구독측은 depth_valid와 별개로 처리)
+            track.pose.orientation.w = 1.0  # 축 미확정 프레임 - identity (구독측은 yaw_valid로 구분)
+            track.yaw_valid = False
         track.depth_valid = bool(depth_valid)
         track.approaching = bool(is_approaching(
             (position[0], position[1]), velocity, self.approach_ref_xy))

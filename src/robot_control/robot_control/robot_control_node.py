@@ -109,6 +109,25 @@ class RobotControlNode(Node, TaskExecutor):
         self.declare_parameter('servo.v_grasp_max', 0.05)
         self.declare_parameter('servo.n_stable_v', 5)
         self.declare_parameter('servo.v_tool_deadband_m_s', 0.03)
+        # yaw 제어(그립 각도) 파라미터 - kp_yaw는 위에서 이미 선언됨. yaw_rate_max_deg_s는
+        # vx/vy/v_max(m/s)와 단위가 다른(deg/s) 별도 상한이라 반드시 분리한다
+        # (_validate_servo_command가 예전에 v_max를 그대로 재사용하던 버그 수정과 짝).
+        self.declare_parameter('servo.yaw_rate_max_deg_s', 30.0)
+        self.declare_parameter('servo.eps_yaw_deg', 5.0)
+        self.declare_parameter('servo.n_stable_yaw', 5)
+        # base-frame grip_deg(vision) <-> TCP 방향 사이 부호/오프셋 - 실기 캘리브레이션
+        # 전까지 항등(1.0/0.0). hardware_ready를 열기 전 반드시 확정할 것. yaw_offset_deg는
+        # "TCP 로컬 프레임에서 grip_deg=0에 해당하는 기준 벡터의 방향(deg)"을 뜻한다
+        # (servo_loop.py ServoLoop.step 참고 - 2026-07-13 실기 과회전 확인 후 raw C
+        # 오일러 성분 대신 회전행렬 투영 방식으로 바뀌면서 의미도 함께 바뀜).
+        self.declare_parameter('servo.yaw_sign', 1.0)
+        self.declare_parameter('servo.yaw_offset_deg', 0.0)
+        # yaw 발산 판정(should_abort) - xy의 diverge_n/diverge_min_delta_m과 대칭.
+        # 짐벌락 근방 raw C 불안정성으로 인한 과회전을 실기에서 확인한 뒤(2026-07-13)
+        # 추가한 안전망 - 표현 방식을 회전행렬 기반으로 고쳐도 캘리브레이션 미확정 등
+        # 남은 오차 원인으로 회전이 계속 커질 가능성을 물리적으로 제한한다.
+        self.declare_parameter('servo.diverge_n_yaw', 15)
+        self.declare_parameter('servo.diverge_min_delta_deg', 10.0)
         # ServoLoop 내부 KalmanXYZV(kalman.py)로 그대로 전달되는 필터 노이즈
         # 파라미터 - 위와 같은 이유로 코드 상수에서 ROS 파라미터로 승격했다.
         self.declare_parameter('servo.kalman_q_pos', 1e-4)
@@ -346,6 +365,13 @@ class RobotControlNode(Node, TaskExecutor):
             v_grasp_max=self.get_parameter('servo.v_grasp_max').value,
             n_stable_v=self.get_parameter('servo.n_stable_v').value,
             v_tool_deadband_m_s=self.get_parameter('servo.v_tool_deadband_m_s').value,
+            yaw_rate_max_deg_s=self.get_parameter('servo.yaw_rate_max_deg_s').value,
+            eps_yaw_deg=self.get_parameter('servo.eps_yaw_deg').value,
+            n_stable_yaw=self.get_parameter('servo.n_stable_yaw').value,
+            yaw_sign=self.get_parameter('servo.yaw_sign').value,
+            yaw_offset_deg=self.get_parameter('servo.yaw_offset_deg').value,
+            diverge_n_yaw=self.get_parameter('servo.diverge_n_yaw').value,
+            diverge_min_delta_deg=self.get_parameter('servo.diverge_min_delta_deg').value,
             q_pos=self.get_parameter('servo.kalman_q_pos').value,
             q_vel=self.get_parameter('servo.kalman_q_vel').value,
             r_xy=self.get_parameter('servo.kalman_r_xy').value,

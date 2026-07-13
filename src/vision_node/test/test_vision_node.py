@@ -691,6 +691,7 @@ def test_track_tool_fills_grip_yaw_orientation_from_depth_axis(node):
     # 장축 0도(이미지 x축) -> 그립 90도 -> (identity TF라 base에서도 90도) 쿼터니언
     assert track.pose.orientation.z == pytest.approx(np.sin(np.pi / 4), abs=0.05)
     assert track.pose.orientation.w == pytest.approx(np.cos(np.pi / 4), abs=0.05)
+    assert track.yaw_valid is True
 
 
 def test_track_tool_orientation_identity_when_axis_unavailable(node):
@@ -733,6 +734,9 @@ def test_track_tool_orientation_identity_when_axis_unavailable(node):
     assert track.depth_valid is False
     assert track.pose.orientation.w == pytest.approx(1.0)
     assert track.pose.orientation.z == pytest.approx(0.0)
+    # identity로 남은 이유가 "yaw=0으로 측정됨"이 아니라 "측정 실패"임을 구독측이
+    # 구분할 수 있어야 한다 - robot_control.ServoLoop이 이 플래그로 hold 처리한다.
+    assert track.yaw_valid is False
 
 
 def test_track_tool_returns_none_on_first_frame_with_fully_invalid_depth(node):

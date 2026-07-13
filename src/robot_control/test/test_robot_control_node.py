@@ -608,6 +608,26 @@ def test_get_current_tcp_posx_rejects_stale_cache(node, monkeypatch):
     assert node._get_current_tcp_posx() is None
 
 
+# ---- servo_pick 서보 명령 계산 (_servo_pick_step) ----
+
+def test_servo_pick_step_passes_full_posx_including_rotation_to_servo_loop_step(node):
+    # yaw 제어(ServoLoop.step)가 tcp_pose[5](C각, deg)로 현재 손목 각도를 읽으므로,
+    # 위치(x,y,z)만 자르지 않고 회전(A,B,C)까지 그대로 이어붙여 넘겨야 한다 - 예전에는
+    # tcp_pose_mm[:3]만 넘겨 yaw_rate가 항상 0으로 나올 수밖에 없었다.
+    node.hardware_enabled = True
+    node._tcp_pose_cache = {
+        'pos6': [100.0, 200.0, 300.0, 1.0, 2.0, 3.0],
+        'received_at': time.monotonic(),
+    }
+    captured = {}
+    node.servo_loop.step = lambda tcp_pose, now: captured.setdefault('tcp_pose', tcp_pose)
+    node.set_parameters([Parameter('debug.log_servo_decisions', value=False)])
+
+    node._servo_pick_step()
+
+    assert captured['tcp_pose'] == [0.1, 0.2, 0.3, 1.0, 2.0, 3.0]
+
+
 # ---- TCP 위치 캐시 갱신 (_on_tf_broadcast_timer에 병합됨, 2026-07-08) ----
 # 과거에는 _on_tcp_pose_refresh_timer가 별도로 GetCurrentPosx를 폴링했으나, TF
 # 방송 폴링과 같은 서비스를 이중 호출해 스레드 고갈을 유발했다(실기 확인) - 이제
@@ -1175,9 +1195,19 @@ def test_validate_servo_command_rejects_over_descend_speed(node):
 def test_validate_servo_command_accepts_within_limits(node):
     v_max = node.get_parameter('servo.v_max').value
     descend_speed = node.get_parameter('servo.descend_speed').value
-    cmd = ServoCommand(vx=v_max * 0.5, vy=-v_max * 0.5, vz=-descend_speed, yaw_rate=v_max * 0.5)
+    yaw_rate_max = node.get_parameter('servo.yaw_rate_max_deg_s').value
+    cmd = ServoCommand(
+        vx=v_max * 0.5, vy=-v_max * 0.5, vz=-descend_speed, yaw_rate=yaw_rate_max * 0.5)
 
     assert node._validate_servo_command(cmd) is True
+
+
+def test_validate_servo_command_rejects_over_yaw_rate_max(node):
+    # yaw_rate(deg/s)는 v_max(m/s)와 단위가 달라 별도 한도로 검증돼야 한다 - 예전에는
+    # v_max를 그대로 재사용해 이 케이스가 걸러지지 않았다(yaw_rate가 항상 0이라 드러나지
+    # 않던 버그, servo_loop.py의 kp_yaw 활성화와 함께 수정됨).
+    yaw_rate_max = node.get_parameter('servo.yaw_rate_max_deg_s').value
+    assert node._validate_servo_command(ServoCommand(yaw_rate=yaw_rate_max * 10)) is False
 
 
 def test_servo_loop_wires_innovation_and_kalman_params_from_ros_params(node):
@@ -1199,6 +1229,12 @@ def test_servo_loop_wires_innovation_and_kalman_params_from_ros_params(node):
     assert node.servo_loop._filter.r_z == node.get_parameter('servo.kalman_r_z').value
     assert (node.servo_loop._filter.p0_vel_reset
             == node.get_parameter('servo.kalman_p0_vel_reset').value)
+    assert (node.servo_loop.yaw_rate_max_deg_s
+            == node.get_parameter('servo.yaw_rate_max_deg_s').value)
+    assert node.servo_loop.eps_yaw_deg == node.get_parameter('servo.eps_yaw_deg').value
+    assert node.servo_loop.n_stable_yaw == node.get_parameter('servo.n_stable_yaw').value
+    assert node.servo_loop.yaw_sign == node.get_parameter('servo.yaw_sign').value
+    assert node.servo_loop.yaw_offset_deg == node.get_parameter('servo.yaw_offset_deg').value
 
 
 # ---- servo_pick ----

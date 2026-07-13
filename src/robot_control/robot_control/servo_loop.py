@@ -40,6 +40,26 @@ def _yaw_from_quaternion(orientation) -> float:
     return math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
+def _wrap_yaw_error_deg(target_deg, current_deg):
+    """대칭 2-핑거 그리퍼(180도 주기) 기준 최단 경로 각도 오차(deg, [-90,90])를 구한다."""
+    return ((target_deg - current_deg + 90.0) % 180.0) - 90.0
+
+
+def _zyz_deg_to_rot(a_deg, b_deg, c_deg):
+    """Doosan posx의 ZYZ 오일러 각(deg) -> 3x3 회전행렬. R = Rz(A) @ Ry(B) @ Rz(C).
+
+    grasp_geometry.zyz_deg_to_rot와 동일 컨벤션이지만 여기 로컬로 복제한다 -
+    robot_control이 vision_node 패키지를 import하지 않는 기존 경계를 유지하기
+    위함(_yaw_from_quaternion처럼 이 파일이 이미 쓰는 "작은 순수-수학 헬퍼는
+    패키지 경계를 넘기지 않고 로컬 복제" 패턴)."""
+    a, b, c = np.deg2rad([a_deg, b_deg, c_deg])
+    ca, sa, cb, sb, cc, sc = np.cos(a), np.sin(a), np.cos(b), np.sin(b), np.cos(c), np.sin(c)
+    rz_a = np.array([[ca, -sa, 0], [sa, ca, 0], [0, 0, 1]])
+    ry_b = np.array([[cb, 0, sb], [0, 1, 0], [-sb, 0, cb]])
+    rz_c = np.array([[cc, -sc, 0], [sc, cc, 0], [0, 0, 1]])
+    return rz_a @ ry_b @ rz_c
+
+
 class ServoLoop:
     """robot_control 내부 PBVS 서보 루프 + calculate 모듈 (전체 계획.md 2절).
 
@@ -59,10 +79,24 @@ class ServoLoop:
                  q_pos=1e-4, q_vel=1e-2, r_xy=1e-4, r_z=1e-4, p0_vel_reset=1.0,
                  n_stable_z=5, diverge_min_delta_m=0.01, descend_accel_m_s2=0.1,
                  descend_stop_margin_m=0.0, v_grasp_max=0.05, n_stable_v=5,
-                 v_tool_deadband_m_s=0.03):
+                 v_tool_deadband_m_s=0.03, yaw_rate_max_deg_s=30.0,
+                 eps_yaw_deg=5.0, n_stable_yaw=5, yaw_sign=1.0, yaw_offset_deg=0.0,
+                 diverge_n_yaw=15, diverge_min_delta_deg=10.0):
         self.kp_xy = kp_xy               # 수평 P 게인
-        self.kp_yaw = kp_yaw             # yaw P 게인 (현재 yaw=0 고정이라 미사용)
+        self.kp_yaw = kp_yaw             # yaw P 게인 - deg 오차 -> deg/s 명령
         self.v_max = v_max               # 수평 속도 상한
+        self.yaw_rate_max_deg_s = yaw_rate_max_deg_s  # 회전 속도 상한(v_max와 별개 단위)
+        self.eps_yaw_deg = eps_yaw_deg   # 폐합 판정 각도 오차 임계(deg)
+        self.n_stable_yaw = n_stable_yaw  # 폐합 판정에 필요한 연속 안정 주기 수(z_close와 동일 방식)
+        # 카메라 base-frame grip_deg(0=base_link X축 기준) <-> TCP posx C각(ZYZ, deg)
+        # 사이의 부호/오프셋 - 실기 캘리브레이션 전까지는 항등(1.0/0.0)이며 이 관계가
+        # 실제로 맞는지는 hardware_ready 게이트를 열기 전 반드시 검증해야 한다.
+        self.yaw_sign = yaw_sign
+        self.yaw_offset_deg = yaw_offset_deg
+        self.diverge_n_yaw = diverge_n_yaw  # yaw 발산 판정에 볼 연속 오차 개수(xy의 diverge_n과 대칭)
+        # diverge_n_yaw틱 연속 증가에 더해 요구하는 최소 총 증가폭(deg) - xy의
+        # diverge_min_delta_m과 같은 이유(노이즈성 연속 증가 걸러내기).
+        self.diverge_min_delta_deg = diverge_min_delta_deg
         self.descend_speed = descend_speed  # 하강 속도
         # speedl에 실제로 걸리는 가속도 제한(servo_pick.speedl_acc_trans_mm_s2와 동일
         # 값, m/s² 단위) - vz=0을 명령해도 로봇이 이 가속도로만 감속하므로(2026-07-10
@@ -140,6 +174,10 @@ class ServoLoop:
         self._last_w_target = None       # DEBUG_LOG: 최근 feed-forward 목표 가중치
         self._last_depth_valid = None    # DEBUG_LOG: 최근 ToolTrack depth_valid
         self._last_tool_speed = None     # DEBUG_LOG: 최근 공구 xy 속력(m/s)
+        self._yaw_target_deg = None      # 최근 유효 grip yaw 목표(deg, mod 180) - yaw_valid=False 프레임은 hold
+        self._yaw_stable_count = 0       # eps_yaw_deg 이내로 연속 몇 주기째인지
+        self._last_yaw_error_deg = None  # DEBUG_LOG: 최근 yaw 오차(deg)
+        self._yaw_error_history = []     # 최근 |yaw 오차| 기록(발산 판정용)
 
     def start(self, tool_class, grasp_width_mm, grasp_force_n):
         """servo_pick goal 수신 시 1회 호출 - 모든 내부 상태를 초기화한다."""
@@ -167,6 +205,10 @@ class ServoLoop:
         self._last_w_target = None
         self._last_depth_valid = None
         self._last_tool_speed = None
+        self._yaw_target_deg = None
+        self._yaw_stable_count = 0
+        self._last_yaw_error_deg = None
+        self._yaw_error_history = []
 
     def on_tool_track(self, msg):
         """/vision/tool_track 수신마다 호출 - 칼만 필터를 갱신하고 innovation으로
@@ -174,6 +216,12 @@ class ServoLoop:
         now = time.monotonic()
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         pos = msg.pose.position
+
+        # yaw는 위치 필터 초기화 여부와 무관하게 탐지된 첫 프레임부터 즉시 목표를
+        # 갱신한다 - "완전히 내려간 뒤 6축을 돌리는" 대신 서보잉과 동시에 각도를
+        # 맞춰가기 위함(yaw_valid=False인 프레임은 직전 목표를 그대로 유지=hold).
+        if bool(getattr(msg, 'yaw_valid', False)):
+            self._yaw_target_deg = math.degrees(_yaw_from_quaternion(msg.pose.orientation)) % 180.0
 
         if not self._filter._initialized:
             # 이번 서보 사이클의 첫 관측 - 필터 초기화만 하고 넘어간다(예측할 이전 상태가 없음)
@@ -213,11 +261,54 @@ class ServoLoop:
 
     def step(self, tcp_pose, now):
         """RT 명령 주기마다 호출 - PBVS 제어식(2.3절)으로 다음 속도 명령을 계산한다.
-        tcp_pose: 현재 TCP pose(base_link 기준 x,y,z,rx,ry,rz). now: time.monotonic() 값."""
+        tcp_pose: 현재 TCP pose(base_link 기준 x,y,z(m),rx,ry,rz(deg) - posx 6-vector 그대로).
+        now: time.monotonic() 값."""
         if not self._filter._initialized:
             # 아직 ToolTrack을 한 번도 못 받았으면 정지 명령
             self._last_command = ServoCommand()
             return self._last_command
+
+        # yaw 제어는 ServoState(TRACKING/DESCENDING)와 무관하게 매 틱 독립적으로
+        # 돈다 - "완전히 내려간 뒤 6축을 돌리는" 대신 xy/z 서보잉과 같은 speedl
+        # 틱에 실어 보낸다(추가 루프/통신 왕복 없음). tcp_pose[3:6] = posx (A,B,C)
+        # ZYZ 오일러(deg).
+        #
+        # "현재 그립 각도"를 C 성분 그대로 읽지 않는다 - 이 파이프라인의 top-down
+        # 파지 자세는 named_poses.watch 주석의 base 좌표 참고값(B≈178.53°)에서 보듯
+        # ZYZ 오일러의 짐벌락(B=180°) 특이점 바로 근처에서 동작하는데, 그 근방에서는
+        # 손목의 미세한 실제 회전이 C 성분에는 거대한 값 요동으로 나타날 수 있다
+        # (오일러각 분해 자체의 수치적 불안정성). 2026-07-13 실기에서 이 raw C 값을
+        # 그대로 P제어 피드백에 썼을 때 필요한 것보다 훨씬 큰 회전(과회전)이 확인돼,
+        # 회전행렬을 완전히 조립한 뒤 기준 벡터를 그 행렬로 회전시켜 base 평면에
+        # 투영하는 방식으로 바꿨다 - vision측 _grip_deg_to_base_quaternion과 동일한
+        # 기법이라 짐벌락 근방에서도 연속적이다. B=0일 때는 수학적으로 기존 raw-C
+        # 방식과 완전히 동치(Ry(0)=단위행렬)이므로 named pose가 B=0에 가까운
+        # 환경에서는 동작이 그대로 유지된다.
+        if self._yaw_target_deg is not None and len(tcp_pose) >= 6:
+            rot = _zyz_deg_to_rot(tcp_pose[3], tcp_pose[4], tcp_pose[5])
+            offset_rad = np.deg2rad(self.yaw_offset_deg)
+            ref = np.array([np.cos(offset_rad), np.sin(offset_rad), 0.0])
+            axis_base = rot @ ref
+            current_grip_deg = (self.yaw_sign
+                                 * np.degrees(np.arctan2(axis_base[1], axis_base[0]))) % 180.0
+            yaw_error_deg = _wrap_yaw_error_deg(self._yaw_target_deg, current_grip_deg)
+            self._last_yaw_error_deg = yaw_error_deg
+            yaw_rate = _clip(self.kp_yaw * yaw_error_deg, self.yaw_rate_max_deg_s)
+            if abs(yaw_error_deg) < self.eps_yaw_deg:
+                self._yaw_stable_count += 1
+            else:
+                self._yaw_stable_count = 0
+            # yaw 발산 판정용 오차 이력(절댓값) - xy의 _error_history와 대칭 패턴.
+            # 부호 있는 값이 아니라 절댓값을 쌓는다 - yaw 오차는 wrap 경계를 넘으며
+            # 부호가 바뀔 수 있어 xy처럼 부호 있는 값의 단조 증가를 보면 오탐/누락이
+            # 생긴다.
+            self._yaw_error_history.append(abs(yaw_error_deg))
+            if len(self._yaw_error_history) > self.diverge_n_yaw:
+                self._yaw_error_history.pop(0)
+        else:
+            yaw_rate = 0.0
+            self._last_yaw_error_deg = None
+            self._yaw_stable_count = 0
 
         # p_ref = 필터 추정 위치를 (Δt_lat + 마지막 ToolTrack 이후 실제 경과시간)만큼
         # 앞으로 외삽한 "지금 목표로 삼아야 할 위치". 비전 갱신이 뜸해질수록 더 멀리
@@ -310,7 +401,7 @@ class ServoLoop:
         else:
             self._stable_count = 0
 
-        self._last_command = ServoCommand(vx=vx, vy=vy, vz=vz, yaw_rate=0.0)
+        self._last_command = ServoCommand(vx=vx, vy=vy, vz=vz, yaw_rate=yaw_rate)
         return self._last_command
 
     def get_state(self):
@@ -318,14 +409,18 @@ class ServoLoop:
         return self._state
 
     def should_close(self):
-        """그리퍼 폐합 판정(2.6절) - 네 조건 모두 만족해야 True:
+        """그리퍼 폐합 판정(2.6절) - 다음 조건 모두 만족해야 True:
         오차가 n_stable주기 연속 충분히 작고, z까지 충분히 가깝고, 필터가 수렴했고,
-        공구 속도가 n_stable_v주기 연속 충분히 느릴 것."""
+        공구 속도가 n_stable_v주기 연속 충분히 느리고, yaw 목표가 있다면 그마저도
+        n_stable_yaw주기 연속 충분히 정렬됐을 것(목표가 한 번도 없었으면 이 조건은
+        건너뛴다 - 비전 yaw가 아예 실패해도 파지 자체는 막지 않기 위함)."""
         if self._stable_count < self.n_stable:
             return False
         if self._last_z_gap is None or self._z_stable_count < self.n_stable_z:
             return False
         if self._filter.velocity_covariance_trace >= self.cov_threshold:
+            return False
+        if self._yaw_target_deg is not None and self._yaw_stable_count < self.n_stable_yaw:
             return False
         if self._v_stable_count < self.n_stable_v:
             return False
@@ -347,6 +442,18 @@ class ServoLoop:
                 and self._error_history[-1] - self._error_history[0]
                 >= self.diverge_min_delta_m):
             return 'diverging'
+        # yaw 발산 판정 - xy와 대칭 패턴이지만 절댓값 기준 단조 증가를 본다(_yaw_error_history는
+        # step()에서 이미 절댓값으로 쌓임 - wrap 경계를 넘으며 부호가 바뀌는 것과 무관하게
+        # 판정하기 위함). raw C 오일러 성분을 회전행렬 기반 계산으로 바꿔 짐벌락 근방
+        # 불안정성은 줄였지만, 캘리브레이션 미확정(yaw_sign/yaw_offset_deg) 등 남은 오차
+        # 원인으로도 회전이 계속 커질 수 있어 물리적 과회전 폭 자체를 여기서 한 번 더
+        # 제한한다(2026-07-13 실기 과회전 확인 후 추가).
+        if (len(self._yaw_error_history) == self.diverge_n_yaw and all(
+                self._yaw_error_history[i] < self._yaw_error_history[i + 1]
+                for i in range(len(self._yaw_error_history) - 1))
+                and self._yaw_error_history[-1] - self._yaw_error_history[0]
+                >= self.diverge_min_delta_deg):
+            return 'yaw_diverging'
         # 참고: "공구가 방향 전환하여 시야 이탈 예상"(2.8절)은 판정 기준이 모호해
         # 과설계 우려가 있으므로 1차 구현 범위에서 제외했다. 실측 후 필요하면 추가한다.
         return None
@@ -368,6 +475,12 @@ class ServoLoop:
             'stable_count': self._stable_count,
             'last_z_gap_m': self._last_z_gap,
             'z_stable_count': self._z_stable_count,
+            # descend_stop_margin_m이 z_close보다 크거나 같으면 z_gap이 z_close 밑으로
+            # 내려가기도 전에 제동 곡선이 이미 vz=0을 겨냥해 z_stable_count가 영원히
+            # 0에 머무는 교착이 생긴다(2026-07-13 실기 확인 - 그리퍼가 절대 안 닫힘).
+            # 매 틱 계산이라기보다 파라미터 조합 자체의 정적 점검이지만, 로그에서
+            # z_stable_count=0이 반복될 때 원인을 바로 알 수 있도록 여기 같이 남긴다.
+            'z_close_margin_ok': self.descend_stop_margin_m < self.z_close,
             'tool_speed_m_s': self._last_tool_speed,
             'v_stable_count': self._v_stable_count,
             'velocity_covariance_trace': float(self._filter.velocity_covariance_trace),
@@ -375,6 +488,10 @@ class ServoLoop:
             'depth_valid': self._last_depth_valid,
             'position_m': position,
             'velocity_m_s': velocity,
+            'yaw_target_deg': self._yaw_target_deg,
+            'yaw_error_deg': self._last_yaw_error_deg,
+            'yaw_stable_count': self._yaw_stable_count,
+            'yaw_error_history_deg': [float(v) for v in self._yaw_error_history],
             'cmd_m_s': {
                 'vx': float(self._last_command.vx),
                 'vy': float(self._last_command.vy),
