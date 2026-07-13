@@ -2,7 +2,7 @@ import time
 
 import numpy as np
 
-from robot_control.servo_loop import ServoCommand, _clip
+from robot_control.servo_loop import ServoCommand
 
 
 class HandServoState:
@@ -75,9 +75,19 @@ class HandServoLoop:
         self._last_target = target
 
         e = target - tcp
-        vx = _clip(self.kp_xy * e[0], self.v_max)
-        vy = _clip(self.kp_xy * e[1], self.v_max)
-        vz = _clip(self.kp_z * e[2], self.v_max)
+        vx = self.kp_xy * e[0]
+        vy = self.kp_xy * e[1]
+        vz = self.kp_z * e[2]
+        # 축별로 따로 클리핑하면 한 축만 먼저 포화될 때 명령 벡터 방향이 실제
+        # 목표 방향에서 벗어나 로봇이 손으로 곧장 오지 않고 휘어서 접근한다 -
+        # servo_pick(ServoLoop.step)처럼 벡터 크기 하나로 묶어 클리핑해 방향을
+        # 보존한다.
+        speed = float(np.linalg.norm([vx, vy, vz]))
+        if speed > self.v_max:
+            scale = self.v_max / speed
+            vx *= scale
+            vy *= scale
+            vz *= scale
 
         self._state = (
             HandServoState.STOPPING if self._fist else HandServoState.FOLLOWING)
