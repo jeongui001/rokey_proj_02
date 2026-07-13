@@ -117,9 +117,35 @@ def _px_reconstruct(cx, cy, bw, bh):
     return (cx / 1000.0, cy / 1000.0, 0.5, True)
 
 
-def test_tracker_single_kpt_falls_back_to_bbox():
-    """한쪽 kpt만 신뢰돼도(0개든 1개든 동일 취급) 정확한 파지점을 확정할 수 없으니
-    bbox 중심으로 방향만 따라간다 - 두 kpt가 다 신뢰되는 프레임에서만 파지점을 확정한다."""
+def test_tracker_single_kpt_uses_learned_offset():
+    """근접 시 p1이 화면 밖으로 잘려 conf가 0으로 떨어져도(라이브런 실측 시나리오),
+    두 kpt가 보이던 프레임에서 학습한 오프셋으로 파지점을 유지해야 한다 -
+    잘린 bbox 중심으로 폴백하면 위치가 위로 편향된다(수정 전 버그)."""
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    # 1프레임: 두 kpt 유효 - mid=(150,120) -> (0.15,0.12), p0->mid 오프셋 학습
+    tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
+    # 2프레임: p1 잘림(conf~0), bbox도 하단으로 부풀어 중심이 어긋난 상태
+    d = _kpt_det(bbox=(100, 100, 200, 240), p1=(190.0, 110.0, 0.002))
+    position, _, _, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.1)
+    # p0(110,130) -> (0.11,0.13) + 오프셋(0.04,-0.01) = 원래 파지점 (0.15,0.12)
+    assert position[0] == pytest.approx(0.15, abs=1e-6)
+    assert position[1] == pytest.approx(0.12, abs=1e-6)
+
+
+def test_tracker_single_kpt_p1_only_uses_negated_offset():
+    """반대로 p0(머리)가 잘린 경우 - 파지점은 중점이므로 p1 기준 오프셋은 부호 반전."""
+    tracker = ToolTracker(alpha=1.0, beta=1.0)
+    tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
+    d = _kpt_det(p0=(110.0, 130.0, 0.003))
+    position, _, _, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.1)
+    # p1(190,110) -> (0.19,0.11) - 오프셋(0.04,-0.01) = (0.15,0.12)
+    assert position[0] == pytest.approx(0.15, abs=1e-6)
+    assert position[1] == pytest.approx(0.12, abs=1e-6)
+
+
+def test_tracker_single_kpt_without_history_falls_back_to_bbox():
+    """오프셋 이력이 없으면(두 kpt로 본 적 없음) 저신뢰 kpt xy는 오염 가능성이 있어
+    쓰지 않고 기존 bbox 중심 폴백을 유지한다."""
     tracker = ToolTracker(alpha=1.0, beta=1.0)
     d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
     position, _, _, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
@@ -127,23 +153,15 @@ def test_tracker_single_kpt_falls_back_to_bbox():
     assert position[0] == pytest.approx(0.2, abs=1e-6)
 
 
-def test_tracker_single_kpt_p0_only_also_falls_back_to_bbox():
-    """반대로 p1만 잘려도(p0만 신뢰) 마찬가지로 bbox 중심 폴백이어야 한다."""
-    tracker = ToolTracker(alpha=1.0, beta=1.0)
-    d = _kpt_det(bbox=(100, 100, 300, 140), p0=(110.0, 130.0, 0.003))
-    position, _, _, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
-    assert position[0] == pytest.approx(0.2, abs=1e-6)
-
-
-def test_tracker_bbox_mode_freezes_z_at_last_mid_value():
-    """mid가 아니면(한쪽 kpt만 신뢰되거나 둘 다 저신뢰) raw z를 신뢰하지 않고 마지막
-    mid z에 고정해야 한다(2026-07-11) - bbox 모드의 raw z는 파지점이 아닌 bbox 중심
-    depth라 노이즈가 커서(실기: 이동 물체 픽에서 bbox 구간 5초 동안 raw z가
-    1.6~12.3mm로 흔들리며 그 위로도 벗어난 값에 정착 - 허공을 잡음) 스무딩만으로는
-    못 거른다. 컨베이어 평면 가정상 z는 접근 중 안 변해야 하므로 mid에서 확정한
-    값을 계속 믿는 게 재측정보다 낫다."""
+def test_tracker_p0_mode_freezes_z_at_last_mid_value():
+    """mid가 아닌 모드(p0/p1/bbox)의 raw z는 신뢰하지 않고 마지막 mid z에 고정해야
+    한다(2026-07-11) - p0/p1/bbox의 raw z는 파지점이 아닌 kpt/bbox 중심 depth라
+    노이즈가 커서(실기: 이동 물체 픽에서 p0 구간 5초 동안 raw z가 1.6~12.3mm로
+    흔들리며 그 위로도 벗어난 값에 정착 - 허공을 잡음) 스무딩만으로는 못 거른다.
+    컨베이어 평면 가정상 z는 접근 중 안 변해야 하므로 mid에서 확정한 값을 계속
+    믿는 게 재측정보다 낫다."""
     def reconstruct(cx, cy, bw, bh):
-        z = 0.55 if (cx, cy) == (200.0, 120.0) and calls['n'] > 0 else 0.40
+        z = 0.55 if (cx, cy) == (110.0, 130.0) and calls['n'] > 0 else 0.40
         return (cx / 1000.0, cy / 1000.0, z, True)
 
     calls = {'n': 0}
@@ -152,17 +170,17 @@ def test_tracker_bbox_mode_freezes_z_at_last_mid_value():
     assert tracker.position[2] == pytest.approx(0.40, abs=1e-6)
 
     calls['n'] = 1
-    d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
+    d = _kpt_det(bbox=(100, 100, 200, 240), p1=(190.0, 110.0, 0.002))
     position, _, depth_valid, _ = tracker.update([d], 'spanner', reconstruct, stamp=0.1)
-    assert tracker.last_mode == 'bbox'
+    assert tracker.last_mode == 'p0'
     # raw z=0.55이지만 mid가 아니므로 무시되고 마지막 mid z(0.40)에 고정돼야 한다
     assert position[2] == pytest.approx(0.40, abs=1e-6)
     assert depth_valid is False
 
 
 def test_tracker_uses_raw_z_when_no_mid_ever_seen():
-    """mid를 한 번도 못 거친 채로 시작부터 bbox면(얼릴 last_mid_z가 없음) 어쩔 수
-    없이 raw z를 alpha_z_offset_mode로 스무딩해 쓴다."""
+    """mid를 한 번도 못 거친 채로 시작부터 p0/p1/bbox면(얼릴 last_mid_z가 없음)
+    어쩔 수 없이 raw z를 alpha_z_offset_mode로 스무딩해 쓴다."""
     tracker = ToolTracker(alpha=1.0, beta=1.0, alpha_z_offset_mode=0.1)
     d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
     position, _, depth_valid, _ = tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
@@ -177,28 +195,29 @@ def test_tracker_last_mode_is_mid_when_both_kpts_confident():
     assert tracker.last_mode == 'mid'
 
 
-def test_tracker_last_mode_falls_back_to_bbox_without_both_kpts():
+def test_tracker_last_mode_falls_back_to_bbox_without_offset_history():
     tracker = ToolTracker(alpha=1.0, beta=1.0)
     d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
     tracker.update([d], 'spanner', _px_reconstruct, stamp=0.0)
     assert tracker.last_mode == 'bbox'
 
 
-def test_tracker_last_mode_falls_back_to_bbox_even_after_mid_seen():
-    """직전 프레임에 두 kpt가 다 보였더라도, 이번 프레임에 한쪽만 신뢰되면
-    학습된 오프셋 없이 그냥 bbox로 폴백한다(오프셋 학습 기능은 없앰)."""
+def test_tracker_last_mode_is_p0_when_offset_learned_and_p1_lost():
     tracker = ToolTracker(alpha=1.0, beta=1.0)
     tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
     d = _kpt_det(bbox=(100, 100, 200, 240), p1=(190.0, 110.0, 0.002))
     tracker.update([d], 'spanner', _px_reconstruct, stamp=0.1)
-    assert tracker.last_mode == 'bbox'
+    assert tracker.last_mode == 'p0'
 
 
-def test_tracker_reset_clears_state():
+def test_tracker_reset_clears_learned_offset():
+    """set_mode 재진입(reset) 후에는 이전 도구의 오프셋이 새 도구에 새어들면 안 된다."""
     tracker = ToolTracker(alpha=1.0, beta=1.0)
     tracker.update([_kpt_det()], 'spanner', _px_reconstruct, stamp=0.0)
+    assert tracker.kpt_offset is not None
     assert tracker.last_mid_z is not None
     tracker.reset()
+    assert tracker.kpt_offset is None
     assert tracker.last_mode is None
     assert tracker.last_mid_z is None
     d = _kpt_det(bbox=(100, 100, 300, 140), p1=(190.0, 110.0, 0.002))
