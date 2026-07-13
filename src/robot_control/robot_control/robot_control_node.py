@@ -536,6 +536,17 @@ class RobotControlNode(Node, TaskExecutor):
                 f'DRFL 직접 외력 감지 초기화 실패 - 이 보조 레이어만 비활성화됩니다: {exc}')
             self._drfl_force_monitor = None
 
+    def _suspend_drfl_force_monitor(self):
+        """handover_hold의 컴플라이언스 구간처럼 사람의 접촉력이 기대되는 동안
+        DrflForceMonitor의 FAULT 선언을 일시 정지한다 - 이 구간의 안전 판단은
+        handover_hold 자신의 당김 감지(_is_pull_detected)가 대신한다."""
+        if getattr(self, '_drfl_force_monitor', None) is not None:
+            self._drfl_force_monitor.suspend()
+
+    def _resume_drfl_force_monitor(self):
+        if getattr(self, '_drfl_force_monitor', None) is not None:
+            self._drfl_force_monitor.resume()
+
     def _on_drfl_force_triggered(self, joint_index, value, threshold):
         """DrflForceMonitor의 백그라운드 쓰레드에서 직접 호출된다 (ROS2 executor
         쓰레드가 아니다). declare_fault/publish 호출은 doosan_driver의 다른 동기

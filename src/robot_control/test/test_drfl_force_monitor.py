@@ -125,3 +125,22 @@ def test_stop_closes_connection(monitor):
 
     assert monitor._ctrl is None
     assert monitor._lib.close_connection_calls == [1234]
+
+
+def test_process_sample_does_not_trigger_while_suspended(monitor):
+    monitor.suspend()
+    monitor.process_sample([0.0, 0.0, 0.0, 0.0, 0.0, 20.0])  # J6=20.0 > 1.5
+
+    assert monitor.triggered_calls == []
+
+
+def test_process_sample_triggers_normally_after_resume(monitor):
+    monitor.suspend()
+    monitor.process_sample([0.0, 0.0, 0.0, 0.0, 0.0, 20.0])  # 억제됨 - 콜백 없음
+    monitor.process_sample([0.0] * 6)  # 미만 1회
+    monitor.process_sample([0.0] * 6)  # 미만 2회
+    monitor.process_sample([0.0] * 6)  # 미만 3회 연속 -> latch 해제(reset_below_count=3)
+    monitor.resume()
+    monitor.process_sample([0.0, 0.0, 0.0, 0.0, 0.0, 20.0])  # 재개 후 초과 -> 정상 발행
+
+    assert monitor.triggered_calls == [(5, 20.0, 1.5)]

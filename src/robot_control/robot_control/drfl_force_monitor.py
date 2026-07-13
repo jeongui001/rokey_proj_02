@@ -38,6 +38,7 @@ class DrflForceMonitor:
         self._stop_event = threading.Event()
         self._thread = None
         self._ctrl = None
+        self._suspended = False
 
         lib = ctypes.CDLL(lib_path)
         lib._CreateRobotControl.restype = ctypes.c_void_p
@@ -75,6 +76,15 @@ class DrflForceMonitor:
                 pass
             self._ctrl = None
 
+    def suspend(self):
+        """handover_hold의 컴플라이언스 구간처럼 사람의 접촉력이 기대되는 동안
+        on_triggered 호출을 일시적으로 막는다. 임계값 판정/히스테리시스 상태는
+        평소대로 갱신되므로, resume() 이후에도 리셋 조건은 그대로 적용된다."""
+        self._suspended = True
+
+    def resume(self):
+        self._suspended = False
+
     def _poll_loop(self):
         self._triggered = False
         self._below_count = 0
@@ -108,11 +118,12 @@ class DrflForceMonitor:
             self._below_count = 0
             if not self._triggered:
                 self._triggered = True
-                index, value, threshold = exceeded
-                try:
-                    self._on_triggered(index, value, threshold)
-                except Exception:
-                    pass
+                if not self._suspended:
+                    index, value, threshold = exceeded
+                    try:
+                        self._on_triggered(index, value, threshold)
+                    except Exception:
+                        pass
         elif self._triggered:
             self._below_count += 1
             if self._below_count >= self._reset_below_count:

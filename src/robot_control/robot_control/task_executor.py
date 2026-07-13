@@ -965,6 +965,11 @@ class TaskExecutor:
         try:
             self._enable_compliance()
             compliance_on = True
+            # 이 구간은 사람의 접촉력이 기대되는 상태(당김 감지는 아래 wait_for_pull이
+            # 전담)이므로, 관절 토크 기준 범용 충돌 FAULT(DrflForceMonitor)는 일시
+            # 정지한다 - 안 그러면 당김/접촉이 두산 관절 토크 임계값을 먼저 넘겨
+            # wait_for_pull이 확정되기 전에 FAULT로 중단되어 버린다.
+            self._suspend_drfl_force_monitor()
             self._checkpoint_event(
                 'I', 'compliance_mode_active', 'PASS', '컴플라이언스 모드가 가동되었습니다.')
             outcome = self.safety_monitor.wait_for_pull(
@@ -1026,5 +1031,6 @@ class TaskExecutor:
             return self._finish_tracking_result(
                 goal_handle, outcome, f'handover_hold exception: {exc}')
         finally:
+            self._resume_drfl_force_monitor()
             if compliance_on:
                 self._cleanup_disable_compliance()

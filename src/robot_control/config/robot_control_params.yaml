@@ -39,10 +39,10 @@
       # 감시 자세 - MOVE_TO_WATCH 단계(vision TRACK_TOOL 전환과 함께 사용).
       # base 좌표 기준(참고용, 실제로는 위 관절각이 사용됨):
       # [446.3, -215.69, 291.05, 52.87, 178.53, 51.69] (x,y,z mm / rx,ry,rz deg)
-      watch: [4.37, 25.40, 23.53, 0.05, 129.71, -84.79]
+      watch: [4.37, 25.40, 23.53, 0.05, 129.71, 95.21]
       # 실기에서 확인한 값으로 교체됨 - 이전 값(base 좌표 참고: [400.5, 27.12,
       # 305.78, 4.82, 141, -23.12])은 작업대 전체가 안 보이는 프레이밍이었다.
-      handover_safe: [-0.74, 2.30, 96.21, 10.31, 29.68, -90.00]
+      handover_safe: [-0.74, 2.30, 96.21, 10.31, 29.68, 90.00]
 
     # 칼만 ServoLoop(servo_loop.py) 게인/판정 임계값 - kp_xy 등은 원래부터 ROS
     # 파라미터였고, innov_*/kalman_* 는 코드 상수였다가 같은 이유(실기 튜닝
@@ -74,7 +74,7 @@
       # tcp z가 추가로 십수 mm 더 내려가는 현상 확인(정확한 메커니즘 미확정 -
       # tcp_pose 캐시 staleness 또는 그리퍼 폐합 반력 추정 중). margin이 z_close에
       # 바짝 붙어 있으면 이 여유를 흡수 못 하므로 z_close도 함께 올려 여유를 키운다.
-      z_close: 0.015 # 언제 도착 판정을 시작할지 결정
+      z_close: 0.018 # 언제 도착 판정을 시작할지 결정
       # 하강 제동 곡선이 표면이 아니라 표면 위 이 마진(m)에서 속도 0을 겨냥하게 해,
       # 락 이후 관성으로도 표면과 이 만큼의 여유를 남긴다 - z_close보다 반드시
       # 작아야 한다(같거나 크면 z_gap이 z_close 밑으로 내려가기 전에 이미 속도가
@@ -216,8 +216,8 @@
       kp_xy: 1.2
       kp_z: 1.2
       v_max: 0.15         # 사람에게 접근하는 동작이라 servo_pick(0.25)보다 보수적으로 낮게 둔다
-      offset_m: 0.20       # 사용자 확정값 - TCP->손 방향 위, 손 앞 20cm 지점에서 추종을 멈춘다
-      t_lost_s: 0.3
+      offset_m: 0.10       # 사용자 확정값 - TCP->손 방향 위, 손 앞 20cm 지점에서 추종을 멈춘다
+      t_lost_s: 10.0
       timeout_s: 60.0      # 사용자는 "주먹까지 계속 추종"을 원하므로 넉넉히 잡는다(0이면 비활성)
       command_validate_tolerance: 1.0e-6
       # hardware_ready는 vision_node의 hand_track 연속 발행/주먹 판정이 구현·검증되기
@@ -227,9 +227,9 @@
     handover_hold:
       # TODO(캘리브레이션 필요): 실제 그리퍼-TCP 장착 방향에 따라 결정해야 한다.
       # 미설정(-1)이면 당김 감지가 항상 비활성화된다(오탐 방지가 기본값).
-      pull_axis_index: -1     # 0=x,1=y,2=z,3=rx,4=ry,5=rz (tool_force 기준)
+      pull_axis_index: 1    # 0=x,1=y,2=z,3=rx,4=ry,5=rz (tool_force 기준)
       pull_direction_sign: 1  # 1 또는 -1
-      pull_force_threshold_n: 15.0  # 이 값(N)을 넘으면 당김으로 판정 - 실기 튜닝 대상
+      pull_force_threshold_n: 2.0 # 이 값(N)을 넘으면 당김으로 판정 - 실기 튜닝 대상
 
     safety:
       # 외력 감지는 dsr_msgs2 ROS 서비스가 아니라 DRFL 라이브러리(libdsr_hardware2.so)에

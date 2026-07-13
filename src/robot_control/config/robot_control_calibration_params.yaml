@@ -12,15 +12,19 @@
   ros__parameters:
     # 실측 로그: 가만히 있을 때 fx는 항상 2.3 이하, 당길 때는 대부분 4~12로 뛰었다
     # (fy/fz는 부호가 일정하지 않고 baseline과 겹쳐 fx보다 신뢰도가 낮았음).
+    #
+    # 2026-07-13: confirm_samples=1 + threshold=4.0N 조합이 handover_approach
+    # 정지(MoveStop)/compliance 진입 직후의 순간적 힘 스파이크 단 1개 샘플만으로도
+    # PULLED로 오판되어, 실제 사람이 당기지 않았는데도 그리퍼가 즉시 열리는 문제가
+    # 확인됐다(threshold가 실측 당김 범위 4~12N의 최하단과 거의 겹쳐 여유가 없었음).
+    # threshold를 6.0N으로 올리고(당김 범위 하단보다 위, baseline과는 충분한 여유 -
+    # 추정치이며 실기 재검증 필요) confirm_samples를 코드 기본값(3)으로 복원해
+    # 연속 샘플 조건으로 순간 스파이크를 걸러낸다.
     handover_hold:
-      pull_axis_index: 0        # fx
+      pull_axis_index: 1      
       pull_direction_sign: 1
-      pull_force_threshold_n: 4.0
-      # 기본값(3)이면 fx가 threshold를 3번 연속(~0.2~0.3초) 넘겨야 당김이 확정된다 -
-      # 그만큼 오래 당겨야 해서 관절 토크(외력 감지 FAULT)가 쌓일 시간도 늘어난다.
-      # threshold는 그대로 두고(가만히 있을 때 노이즈 대비 여유 유지) 확인 샘플만
-      # 1로 낮춰 첫 순간 바로 확정되게 한다.
-      pull_confirm_samples: 1
+      pull_force_threshold_n: 2.0
+      pull_confirm_samples: 3
 
     # 2026-07-08 실기 테스트(E-stop 대기 상태) 전제로 활성화. 좌표 변환 자체의
     # 코드상 결함은 없는 것으로 확인했으나 실기 검증 이력이 없으므로, 문제
