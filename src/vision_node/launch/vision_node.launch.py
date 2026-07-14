@@ -1,11 +1,29 @@
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    # 기본값은 tool_detection_node.py의 _default_resource()와 동일 경로(설치된 share/resource)로
+    # 맞춰뒀다 - 평소엔 아무 영향 없이 기존 .pt를 그대로 쓰고, TensorRT .engine으로 로컬 실험할
+    # 때만 `model_path:=/path/to/tool_detector_best.engine`로 오버라이드한다(팀 공유 기본값은 불변).
+    model_path_arg = DeclareLaunchArgument(
+        'model_path',
+        default_value=PathJoinSubstitution(
+            [FindPackageShare('vision_node'), 'resource', 'tool_detector_best.pt']),
+        description='YOLO 가중치 경로(.pt 기본값 - TensorRT .engine으로 로컬 오버라이드 가능)',
+    )
+    # 중복 박스(NMS 억제 부족) 실기 튜닝용 - 코드 수정 없이 conf 올리고 iou 낮춰 바로 시험 가능.
+    # 기본값은 tool_detection_node.py의 기존 declare_parameter 기본값과 동일하게 맞춰뒀다.
+    conf_arg = DeclareLaunchArgument(
+        'conf', default_value='0.25', description='YOLO confidence threshold')
+    iou_arg = DeclareLaunchArgument(
+        'iou', default_value='0.7',
+        description='NMS IoU threshold - 낮출수록 겹치는 박스를 더 적극적으로 억제')
     realsense_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             FindPackageShare('realsense2_camera'), '/launch/rs_launch.py'
@@ -96,6 +114,11 @@ def generate_launch_description():
     tool_detection_node = Node(
         package='vision_node',
         executable='tool_detection_node',
+        parameters=[{
+            'model_path': LaunchConfiguration('model_path'),
+            'conf': ParameterValue(LaunchConfiguration('conf'), value_type=float),
+            'iou': ParameterValue(LaunchConfiguration('iou'), value_type=float),
+        }],
         # vision_node와 동일한 이유(위 respawn 주석 참고) - 이 노드가 죽으면 /detection/tool_boxes가
         # 끊기고, vision_node의 4토픽 동기화 콜백도 다시는 안 돌아 디버그 영상까지 함께 영구히
         # 멈춘다(2026-07-13, _on_color에 예외 처리 추가와 함께 respawn도 같이 건다).
@@ -103,4 +126,5 @@ def generate_launch_description():
         respawn_delay=2.0,
     )
     return LaunchDescription(
-        [realsense_launch, gripper_tcp_tf, static_tf, vision_node, tool_detection_node])
+        [model_path_arg, conf_arg, iou_arg, realsense_launch, gripper_tcp_tf, static_tf,
+         vision_node, tool_detection_node])
