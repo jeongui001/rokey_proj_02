@@ -103,6 +103,9 @@ class RobotControlNode(Node, TaskExecutor):
         # 겨냥하게 해, 락 이후 관성으로도 표면과 이 만큼의 여유를 남긴다.
         self.declare_parameter('servo.descend_stop_margin_m', 0.01)
         self.declare_parameter('servo.n_stable_z', 5)
+        # z_gap 계산 목표를 순간 칼만 z가 아니라 최근 depth_valid 트랙 raw z의
+        # 중앙값으로 안정화하는 창 크기 - servo_loop.ServoLoop.__init__ 주석 참고.
+        self.declare_parameter('servo.z_stabilize_window', 5)
         self.declare_parameter('servo.diverge_n', 15)
         self.declare_parameter('servo.diverge_min_delta_m', 0.01)
         self.declare_parameter('servo.cov_threshold', 0.05)
@@ -359,6 +362,7 @@ class RobotControlNode(Node, TaskExecutor):
             w_alpha=self.get_parameter('servo.w_alpha').value,
             z_close=self.get_parameter('servo.z_close').value,
             n_stable_z=self.get_parameter('servo.n_stable_z').value,
+            z_stabilize_window=self.get_parameter('servo.z_stabilize_window').value,
             diverge_n=self.get_parameter('servo.diverge_n').value,
             diverge_min_delta_m=self.get_parameter('servo.diverge_min_delta_m').value,
             cov_threshold=self.get_parameter('servo.cov_threshold').value,

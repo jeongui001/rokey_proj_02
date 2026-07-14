@@ -529,3 +529,46 @@ def test_should_close_ignores_yaw_gate_when_no_yaw_target_ever_observed():
     for _ in range(3):
         loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
     assert loop.should_close() is True
+
+
+def test_z_gap_uses_median_of_recent_depth_valid_tracks():
+    # depth_valid 트랙 5개(z_stabilize_window=5)가 전부 0.50이면, z_gap은
+    # 그 중앙값(0.50) 기준으로 계산돼야 한다.
+    loop = _make_loop(z_stabilize_window=5)
+    loop.start('spanner', 30.0, 20.0)
+    for i in range(5):
+        loop.on_tool_track(FakeToolTrack(float(i) * 0.02, 0.0, 0.0, 0.50))
+    loop.step((0.0, 0.0, 0.50, 0, 0, 0), time.monotonic())
+    assert loop._last_z_gap == pytest.approx(0.0, abs=1e-6)
+
+
+def test_single_noisy_depth_frame_does_not_corrupt_z_target():
+    # 안정적으로 0.50을 관측하다가 단 한 프레임만 depth 글리치(0.10)가 끼어도,
+    # 최근 5개의 중앙값은 여전히 0.50 근처라 목표가 크게 흔들리면 안 된다.
+    loop = _make_loop(z_stabilize_window=5)
+    loop.start('spanner', 30.0, 20.0)
+    for i in range(4):
+        loop.on_tool_track(FakeToolTrack(float(i) * 0.02, 0.0, 0.0, 0.50))
+    loop.on_tool_track(FakeToolTrack(0.08, 0.0, 0.0, 0.10))  # 단발 depth 글리치
+    loop.step((0.0, 0.0, 0.50, 0, 0, 0), time.monotonic())
+    assert loop._last_z_gap < 0.05  # 0.50 근처 유지 - 글리치 하나로 목표가 0.10 쪽으로 안 끌려감
+
+
+def test_z_history_respects_window_size():
+    # window(3)보다 오래된 관측은 버려지므로, 최근 3개(0.30 x3)의 중앙값만 반영된다.
+    loop = _make_loop(z_stabilize_window=3)
+    loop.start('spanner', 30.0, 20.0)
+    for i in range(3):
+        loop.on_tool_track(FakeToolTrack(float(i) * 0.02, 0.0, 0.0, 0.50))
+    for i in range(3, 6):
+        loop.on_tool_track(FakeToolTrack(float(i) * 0.02, 0.0, 0.0, 0.30))
+    loop.step((0.0, 0.0, 0.30, 0, 0, 0), time.monotonic())
+    assert loop._last_z_gap == pytest.approx(0.0, abs=1e-6)
+
+
+def test_z_history_ignores_depth_invalid_tracks():
+    loop = _make_loop(z_stabilize_window=5)
+    loop.start('spanner', 30.0, 20.0)
+    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.50, depth_valid=True))
+    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 999.0, depth_valid=False))
+    assert loop._z_history == [0.50]

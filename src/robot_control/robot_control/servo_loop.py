@@ -81,7 +81,7 @@ class ServoLoop:
                  descend_stop_margin_m=0.0, v_grasp_max=0.05, n_stable_v=5,
                  v_tool_deadband_m_s=0.03, yaw_rate_max_deg_s=30.0,
                  eps_yaw_deg=5.0, n_stable_yaw=5, yaw_sign=1.0, yaw_offset_deg=0.0,
-                 diverge_n_yaw=15, diverge_min_delta_deg=10.0):
+                 diverge_n_yaw=15, diverge_min_delta_deg=10.0, z_stabilize_window=5):
         self.kp_xy = kp_xy               # 수평 P 게인
         self.kp_yaw = kp_yaw             # yaw P 게인 - deg 오차 -> deg/s 명령
         self.v_max = v_max               # 수평 속도 상한
@@ -126,6 +126,13 @@ class ServoLoop:
         self.innov_high = innov_high     # 이 잔차 이상 -> w=0 + 속도 공분산 리셋
         self.w_alpha = w_alpha           # w의 저역통과 스무딩 계수
         self.z_close = z_close           # 폐합 판정 z_gap 임계
+        # z_gap 계산에 쓸 목표 z를 depth_valid 트랙 raw z의 최근 N개 중앙값으로
+        # 안정화한다 - 칼만 z는 측정 노이즈(r_z) 신뢰도가 높아 단일 프레임 depth
+        # 글리치(반사면 등)에도 거의 그대로 끌려가는데, 그 상태로 z_close/lock
+        # 판정을 하면 락 시점의 실제 높이가 그 순간 우연히 낀 노이즈에 좌우된다
+        # (실습마다 파지 높이가 달라지던 근본 원인). 중앙값은 평균과 달리 단발
+        # 이상치 하나에 흔들리지 않아 목표 자체를 흔드는 프레임을 걸러낸다.
+        self.z_stabilize_window = int(z_stabilize_window)
         self.diverge_n = diverge_n       # 발산 판정에 볼 연속 오차 개수
         # diverge_n틱 연속 증가만으로는 부족하고, 그 구간 총 증가폭도 이 값(m) 이상이어야
         # 발산으로 본다 - RT 루프(100Hz)가 비전(~55~60Hz)보다 빨라 비전 갱신 사이에는
@@ -166,6 +173,7 @@ class ServoLoop:
         self._v_stable_count = 0         # v_grasp_max 이내로 연속 몇 주기째인지
         self._error_history = []         # 최근 e_xy 기록(발산 판정용)
         self._last_z_gap = None          # 마지막으로 계산한 |tcp_z - 목표 z|
+        self._z_history = []             # depth_valid 트랙 raw z 최근 기록(중앙값 계산용)
         self._grasp_locked = False       # should_close() 만족 이후 z를 영구 고정할지
         self._z_locked = False           # z_stable_count가 n_stable_z 도달 이후 z를 영구 고정할지
         self._last_e_xy_norm = None      # DEBUG_LOG: 최근 xy 오차(m)
@@ -197,6 +205,7 @@ class ServoLoop:
         self._v_stable_count = 0
         self._error_history = []
         self._last_z_gap = None
+        self._z_history = []
         self._grasp_locked = False
         self._z_locked = False
         self._last_e_xy_norm = None
@@ -209,6 +218,13 @@ class ServoLoop:
         self._yaw_stable_count = 0
         self._last_yaw_error_deg = None
         self._yaw_error_history = []
+
+    def _record_z_history(self, z):
+        """depth_valid 트랙의 raw z를 최근 z_stabilize_window개만 유지하며 기록한다
+        (step()이 이 기록의 중앙값을 z_gap 계산 목표로 쓴다)."""
+        self._z_history.append(z)
+        if len(self._z_history) > self.z_stabilize_window:
+            self._z_history.pop(0)
 
     def on_tool_track(self, msg):
         """/vision/tool_track 수신마다 호출 - 칼만 필터를 갱신하고 innovation으로
@@ -229,6 +245,8 @@ class ServoLoop:
             self._last_track_time = stamp
             self._last_msg_time = now
             self._last_depth_valid = bool(msg.depth_valid)
+            if msg.depth_valid:
+                self._record_z_history(pos.z)
             return
 
         dt = max(stamp - self._last_track_time, 1e-3)
@@ -237,6 +255,7 @@ class ServoLoop:
         # depth_valid 여부에 따라 z까지 갱신할지, x·y만 갱신할지 결정 (2.7절)
         if msg.depth_valid:
             innov_xy = self._filter.update_xyz([pos.x, pos.y, pos.z])
+            self._record_z_history(pos.z)
         else:
             innov_xy = self._filter.update_xy_only([pos.x, pos.y])
         self._last_innovation_xy = float(innov_xy)
@@ -335,7 +354,12 @@ class ServoLoop:
         if len(self._error_history) > self.diverge_n:
             self._error_history.pop(0)
 
-        self._last_z_gap = abs(tcp_z - p_ref[2])
+        # z_gap의 목표는 순간 칼만 z(p_ref[2])가 아니라 최근 depth_valid 트랙의
+        # 중앙값을 쓴다 - 단일 프레임 depth 노이즈가 그대로 lock 목표를 흔드는
+        # 것을 막기 위함(_record_z_history 주석 참고). 아직 기록이 없으면(첫
+        # 프레임이 depth_valid=False였던 경우) p_ref[2]로 그대로 폴백한다.
+        z_target = float(np.median(self._z_history)) if self._z_history else p_ref[2]
+        self._last_z_gap = abs(tcp_z - z_target)
 
         # 핵심 제어식: v_cmd = w·ff_scale·v̂_tool + Kp·e (속도 피드포워드 + P 피드백)
         vx = self._w * ff_scale * v_tool[0] + self.kp_xy * e_x
