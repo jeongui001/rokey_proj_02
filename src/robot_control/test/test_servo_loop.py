@@ -529,33 +529,3 @@ def test_should_close_ignores_yaw_gate_when_no_yaw_target_ever_observed():
     for _ in range(3):
         loop.step((0.0, 0.0, 0.05, 0.0, 0.0, 0.0), time.monotonic())
     assert loop.should_close() is True
-
-
-def test_on_contact_detected_satisfies_z_condition_immediately():
-    # z_close를 아주 작게 잡고 tcp_z를 목표(0.05)에서 멀리 둬서, z_gap 기반
-    # 판정은 정상적으로 절대 통과하지 못하는 상황을 만든다.
-    loop = _make_loop(eps_grasp=0.01, n_stable=2, z_close=0.001, n_stable_z=2, cov_threshold=2.5)
-    loop.start('spanner', 30.0, 20.0)
-    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
-    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
-    for _ in range(3):
-        loop.step((0.0, 0.0, 0.20, 0, 0, 0), time.monotonic())  # tcp_z=0.20 vs 목표 0.05
-    assert loop.should_close() is False  # 접촉 감지 전에는 z_gap 조건 불충족
-
-    loop.on_contact_detected()
-
-    assert loop.should_close() is True
-    assert loop.get_state() == ServoState.CLOSING
-
-
-def test_on_contact_detected_locks_vz_zero_even_with_large_z_gap():
-    loop = _make_loop()
-    loop.start('spanner', 30.0, 20.0)
-    loop.on_tool_track(FakeToolTrack(0.0, 0.0, 0.0, 0.05))
-    loop.on_tool_track(FakeToolTrack(0.02, 0.0, 0.0, 0.05))
-    loop.step((0.0, 0.0, 0.20, 0, 0, 0), time.monotonic())
-
-    loop.on_contact_detected()
-    cmd = loop.step((0.0, 0.0, 0.20, 0, 0, 0), time.monotonic())
-
-    assert cmd.vz == 0.0

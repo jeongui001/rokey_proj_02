@@ -235,19 +235,6 @@
       # yolo-pose-yaw-nested-lamport.md 참고, 아직 미완료), TCP/그리퍼 offset,
       # SpeedlStream 단위, 실제 M0609 저속 검증. (기본값은 코드의 declare_parameter에
       # 있으며 여기서는 실수로 true를 채워 넣지 않기 위해 일부러 다시 적지 않는다.)
-      # servo_pick 하강 중 TCP 외력(tool force) Z축 접촉을 vision depth와 무관하게
-      # 독립적으로 감지하는 계층(DrflContactMonitor) - safety.external_torque와
-      # 별개의 DRFL 직접 연결을 쓴다(안전 FAULT용 DrflForceMonitor와는 완전히 분리).
-      contact:
-        drfl_lib_path: '~/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so'
-        robot_ip: '192.168.1.100'
-        robot_port: 12345
-        poll_hz: 100.0
-        # TODO: 그리퍼/공구 자중 대비 접촉을 확실히 구분할 수 있는 값으로 실기
-        # 재조정 필요 - 이 값은 검증되지 않은 추정값이다.
-        force_threshold_n: 8.0
-        reset_below_count: 20
-        stop_join_timeout_s: 2.0
 
     # handover_safe 도착 후 작업자 손(/vision/hand_track)에 연속 접근 - servo_pick과
     # 동일한 speedl 기반 RT 서보 루프(HandServoLoop)로 구현되어 있다. vision_node가

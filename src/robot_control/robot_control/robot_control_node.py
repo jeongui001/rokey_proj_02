@@ -16,7 +16,6 @@ from handover_interfaces.action import RobotTask
 from handover_interfaces.msg import GripperState
 
 from robot_control.doosan_driver import DoosanDriver, DoosanRobotControl
-from robot_control.drfl_contact_monitor import DrflContactMonitor
 from robot_control.drfl_force_monitor import DrflForceMonitor
 from robot_control.rg2_client import RG2Client, RG2Status
 from robot_control.safety_monitor import (
@@ -292,22 +291,6 @@ class RobotControlNode(Node, TaskExecutor):
         # 못하는 이상 상황에서 들어올림 단계가 무한 루프에 빠지지 않도록 하는
         # 안전 타임아웃 - RG2 command_timeout_s/ServoLoop.timeout_s와 같은 성격.
         self.declare_parameter('servo_pick.lift_timeout_s', 5.0)
-        # servo_pick 하강 중 TCP 외력(tool force) 접촉을 vision depth와 무관하게
-        # 독립적으로 감지하는 계층 - DrflContactMonitor(drfl_contact_monitor.py)
-        # 참고. safety.external_torque와 마찬가지로 ROS2 서비스를 거치지 않고
-        # libdsr_hardware2.so에 ctypes로 직접 연결한다(별도 연결 - 안전 FAULT용
-        # DrflForceMonitor와는 완전히 분리).
-        self.declare_parameter(
-            'servo_pick.contact.drfl_lib_path',
-            '/home/youngjin/cobot_ws/install/dsr_hardware2/lib/libdsr_hardware2.so')
-        self.declare_parameter('servo_pick.contact.robot_ip', '192.168.1.100')
-        self.declare_parameter('servo_pick.contact.robot_port', 12345)
-        self.declare_parameter('servo_pick.contact.poll_hz', 100.0)
-        # TODO(실기 캘리브레이션 필요): 그리퍼/공구 자중 대비 접촉을 확실히
-        # 구분할 수 있는 값으로 재조정해야 한다 - 이 값은 검증되지 않은 추정값이다.
-        self.declare_parameter('servo_pick.contact.force_threshold_n', 8.0)
-        self.declare_parameter('servo_pick.contact.reset_below_count', 20)
-        self.declare_parameter('servo_pick.contact.stop_join_timeout_s', 2.0)
 
         # handover_servo: handover_safe 도착 후 /vision/hand_track(작업자 손 위치, 연속
         # 스트림)을 따라 TCP->손 방향 위 offset_m 지점을 계속 추종하다 주먹이 확정되면
@@ -539,8 +522,6 @@ class RobotControlNode(Node, TaskExecutor):
         """
         self._doosan = None
         self._drfl_force_monitor = None
-        self._drfl_contact_monitor = None
-        self._contact_flag = False
         if not self.hardware_enabled:
             return
         try:
@@ -553,7 +534,6 @@ class RobotControlNode(Node, TaskExecutor):
             self.pub_fault.publish(fault_msg)
             return
         self._init_drfl_force_monitor()
-        self._init_drfl_contact_monitor()
 
     def _init_drfl_force_monitor(self):
         """MOVING 중에도 동작하는 보조 외력 감지 레이어를 시작한다 (drfl_force_monitor
@@ -604,56 +584,9 @@ class RobotControlNode(Node, TaskExecutor):
         self.get_logger().error(reason)
         self.safety_monitor.declare_fault(reason)
 
-    def _init_drfl_contact_monitor(self):
-        """servo_pick 하강 중 접촉 감지 전용 보조 레이어를 시작한다
-        (drfl_contact_monitor 참고). 이 레이어도 DrflForceMonitor처럼 "있으면
-        더 좋은" 보조 수단이라 연결 실패해도 FAULT를 선언하지 않는다 - 실패하면
-        servo_pick은 기존 vision depth 기반 z_close 판정만으로 동작한다."""
-        try:
-            self._drfl_contact_monitor = DrflContactMonitor(
-                lib_path=os.path.expanduser(
-                    self.get_parameter('servo_pick.contact.drfl_lib_path').value),
-                robot_ip=self.get_parameter('servo_pick.contact.robot_ip').value,
-                robot_port=int(self.get_parameter('servo_pick.contact.robot_port').value),
-                force_threshold_n=self.get_parameter(
-                    'servo_pick.contact.force_threshold_n').value,
-                on_contact=self._on_contact_detected,
-                poll_hz=self.get_parameter('servo_pick.contact.poll_hz').value,
-                reset_below_count=self.get_parameter(
-                    'servo_pick.contact.reset_below_count').value,
-                stop_join_timeout_s=self.get_parameter(
-                    'servo_pick.contact.stop_join_timeout_s').value,
-            )
-            self._drfl_contact_monitor.start()
-        except Exception as exc:
-            self.get_logger().error(
-                f'DRFL 접촉 감지 초기화 실패 - 이 보조 레이어만 비활성화됩니다: {exc}')
-            self._drfl_contact_monitor = None
-
-    def _resume_drfl_contact_monitor(self):
-        """servo_pick의 RT 추적 구간(_run_rt_tracking) 동안만 접촉 감지를 켠다."""
-        if getattr(self, '_drfl_contact_monitor', None) is not None:
-            self._drfl_contact_monitor.resume()
-
-    def _suspend_drfl_contact_monitor(self):
-        if getattr(self, '_drfl_contact_monitor', None) is not None:
-            self._drfl_contact_monitor.suspend()
-
-    def _on_contact_detected(self, value, threshold):
-        """DrflContactMonitor의 백그라운드 쓰레드에서 직접 호출된다(ROS2
-        executor 쓰레드가 아니다). 여기서는 플래그만 세팅한다 - 실제 z 고정은
-        task_executor._servo_pick_step()이 다음 RT 틱에서 ServoLoop를 통해
-        적용한다(speedl 스트리밍의 유일한 명령 소유자를 유지하기 위함 - 이
-        콜백에서 직접 모션 명령을 내리지 않는다)."""
-        self.get_logger().info(
-            f'servo_pick 접촉 감지: 힘={value:.1f} N, 기준={threshold:.1f} N.')
-        self._contact_flag = True
-
     def destroy_node(self):
         if getattr(self, '_drfl_force_monitor', None) is not None:
             self._drfl_force_monitor.stop()
-        if getattr(self, '_drfl_contact_monitor', None) is not None:
-            self._drfl_contact_monitor.stop()
         super().destroy_node()
 
     # ---- goal 수락/취소 ----

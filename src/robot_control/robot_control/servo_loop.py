@@ -408,17 +408,6 @@ class ServoLoop:
         """RobotTask Feedback.state로 그대로 노출되는 현재 서보 상태."""
         return self._state
 
-    def on_contact_detected(self):
-        """접촉 감지(DrflContactMonitor)로 z 도착을 확정한다 - z_gap 기반 판정을
-        우회하고 즉시 z_locked 상태로 전이한다. 실제 접촉이라는 물리적 사실이
-        vision depth 노이즈보다 신뢰도가 높으므로, 지금까지의 z_stable_count
-        누적과 무관하게 즉시 만족시킨다. xy/yaw/공구속도 조건은 그대로 두어
-        (should_close()가 별도로 계속 확인) 접촉만으로 xy가 어긋난 채 그리퍼가
-        닫히지 않게 한다."""
-        self._last_z_gap = 0.0
-        self._z_stable_count = self.n_stable_z
-        self._z_locked = True
-
     def should_close(self):
         """그리퍼 폐합 판정(2.6절) - 다음 조건 모두 만족해야 True:
         오차가 n_stable주기 연속 충분히 작고, z까지 충분히 가깝고, 필터가 수렴했고,
