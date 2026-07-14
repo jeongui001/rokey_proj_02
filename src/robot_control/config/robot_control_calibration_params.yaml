@@ -1,39 +1,21 @@
-# robot_control 실측 캘리브레이션 파라미터 (robot_control_params.yaml 위에 override).
+# robot_control 실측 캘리브레이션 파라미터 (robot_control_params.yaml 위에 override) - 하드웨어 종속 실측값만 담는다.
 #
-# 목적: handover_hold 당김 감지 값은 실제 로봇 자세/장착 방향에 따라 달라지는
-# 하드웨어 종속 값이라 코드 기본값(fail-closed)으로 넣지 않는다. 이 파일은
-# 2026-07-07 실기 tool_force 로그 실측 기반 값만 override한다.
-#
-# 사용법: launch 시 params_file 인자로 robot_control_params.yaml과 함께 넘기거나,
-# 명령행에서 개별 -p 오버라이드로 사용한다:
+# 사용법: launch 시 params_file 인자로 robot_control_params.yaml과 함께 넘기거나, 명령행 -p 오버라이드로 사용:
 #   ros2 launch robot_control robot_control.launch.py \
 #     params_file:=<share>/robot_control/config/robot_control_calibration_params.yaml
 /**:
   ros__parameters:
-    # 실측 로그: 가만히 있을 때 fx는 항상 2.3 이하, 당길 때는 대부분 4~12로 뛰었다
-    # (fy/fz는 부호가 일정하지 않고 baseline과 겹쳐 fx보다 신뢰도가 낮았음).
-    #
-    # 2026-07-13: confirm_samples=1 + threshold=4.0N 조합이 handover_approach
-    # 정지(MoveStop)/compliance 진입 직후의 순간적 힘 스파이크 단 1개 샘플만으로도
-    # PULLED로 오판되어, 실제 사람이 당기지 않았는데도 그리퍼가 즉시 열리는 문제가
-    # 확인됐다(threshold가 실측 당김 범위 4~12N의 최하단과 거의 겹쳐 여유가 없었음).
-    # threshold를 6.0N으로 올리고(당김 범위 하단보다 위, baseline과는 충분한 여유 -
-    # 추정치이며 실기 재검증 필요) confirm_samples를 코드 기본값(3)으로 복원해
-    # 연속 샘플 조건으로 순간 스파이크를 걸러낸다.
+    # 실측: 정지 시 fx<=2.3, 당김 시 4~12로 상승(fy/fz는 baseline과 겹쳐 신뢰도 낮음)
+    # confirm_samples로 순간 힘 스파이크에 의한 오탐(PULLED 오판)을 방지 - threshold/samples는 실기 재검증 필요
     handover_hold:
       pull_axis_index: 1      
       pull_direction_sign: 1
       pull_force_threshold_n: 2.0
       pull_confirm_samples: 3
 
-    # 2026-07-08 실기 테스트(E-stop 대기 상태) 전제로 활성화. 좌표 변환 자체의
-    # 코드상 결함은 없는 것으로 확인했으나 실기 검증 이력이 없으므로, 문제
-    # 발생 시 이 값을 다시 false로 되돌리는 것이 첫 대응이다.
+    # 좌표 변환 자체는 결함 없음 확인됨, 실기 검증 이력 없음 - 문제 발생 시 false로 되돌리는 것이 첫 대응
     servo_pick:
       hardware_ready: true
-    # handover_approach.hardware_ready: true였던 2026-07-09 이전 override는 새 HandServoLoop
-    # 구현(movel 단발 -> 연속 speedl) 검증 전이라 제거됐었다. 2026-07-12 E-stop 대기 상태에서
-    # 저속(v_max=0.15m/s) 실기 검증을 시작하기 위해 다시 켠다 - 문제 발생 시 이 값을
-    # false로 되돌리는 것이 첫 대응이다(servo_pick과 동일 원칙).
+    # 저속(v_max=0.15m/s) 실기 검증용 - 문제 발생 시 false로 되돌리는 것이 첫 대응(servo_pick과 동일 원칙)
     handover_servo:
       hardware_ready: true

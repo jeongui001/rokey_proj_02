@@ -12,15 +12,8 @@ from task_manager.task_models import (
 )
 
 
-# 재개(resume) 가능 상태 분류. 그리퍼가 이미 검증된 물체를 쥐고 있다는 게 확실한
-# 구간(_RESUME_CONTINUE_STATES)은 하던 goal을 그대로 이어서 보낸다. 반대로 지금
-# 그리퍼가 정확히 어떤 상태인지 확신할 수 없는 구간(_RESUME_RETRY_PICK_STATES,
-# 접근~하강~닫기 도중이거나 방금 닫혀 검증이 안 끝난 상태)은 절대 그대로 이어가지
-# 않고, release_and_retry와 동일하게 그리퍼를 강제로 열고 watch로 돌아가
-# DETECT_TRACK부터 다시 시작한다(_verify_grasp_retries에 포함되어, 반복되면
-# 결국 수동 확인을 요구한다). 나머지 상태(IDLE/MOVE_TO_WATCH/DETECT_TRACK/HOME/
-# MANUAL_MOVE/CANCELLING)는 재개 개념 자체가 없다 - 물체를 안 쥐고 있거나
-# 사용자가 직접 제어 중이거나 전환 중이라, 그냥 원래 하던 명령을 다시 보내면 된다.
+# CONTINUE_STATES는 그리퍼가 검증된 물체를 쥐고 있어 goal을 그대로 이어가고,
+# RETRY_PICK_STATES는 그리퍼 상태가 불확실해 강제로 열고 DETECT_TRACK부터 재시작한다.
 _RESUME_CONTINUE_STATES = (State.MOVE_SAFE, State.APPROACH_HAND, State.WAIT_PULL)
 _RESUME_RETRY_PICK_STATES = (State.SERVO_PICK, State.VERIFY_GRASP)
 
@@ -29,8 +22,7 @@ class TaskFlow:
     """MANUAL 이동과 AUTO 공구 전달 순서를 관리하는 mixin."""
 
     def _capture_resume_snapshot(self):
-        """FAULT 진입 직전(아직 self.state가 바뀌기 전) 호출된다 - _enter_fault와
-        _handle_action_future_exception 양쪽에서 공유한다."""
+        """FAULT 진입 직전(state 변경 전) 호출 - _enter_fault와 _handle_action_future_exception이 공유."""
         if self.state in _RESUME_CONTINUE_STATES:
             self._resume_kind = 'continue'
             self._resume_state = self.state
@@ -48,9 +40,7 @@ class TaskFlow:
             self._resume_grasp_spec = None
 
     def _handle_resume(self):
-        """"재개" 명령(/user_command/text) 처리. 안전상태 NORMAL + state IDLE +
-        저장된 재개 스냅샷이 있을 때만 진행한다 - 그 외에는 명확한 사유를 GUI에
-        보고하고 아무 것도 하지 않는다(자동 재시작 금지)."""
+        """안전상태 NORMAL + state IDLE + 재개 스냅샷 존재 시에만 진행한다(자동 재시작 금지)."""
         if self.safety_state != Safety.NORMAL:
             self._publish_status(detail='재개 불가 - 안전상태가 NORMAL이 아닙니다.')
             return
@@ -88,10 +78,8 @@ class TaskFlow:
                 self._send_robot_goal('handover_hold')
             return
 
-        # kind == 'retry_pick': SERVO_PICK/VERIFY_GRASP 중단 - 그리퍼 상태가
-        # 불확실하므로 release_and_retry와 동일하게 안전하게 열고 watch로 돌아가
-        # DETECT_TRACK부터 다시 시작한다. 기존 verify_grasp 재시도 횟수에 포함시켜,
-        # 반복되면 결국 수동 확인을 요구한다(_handle_servo_pick_result와 동일 정책).
+        # retry_pick: 그리퍼 상태 불확실 - release_and_retry로 안전하게 열고 재시도
+        # (verify_grasp 재시도 횟수에 포함 - _handle_servo_pick_result와 동일 정책).
         self._verify_grasp_retries += 1
         max_retries = self.get_parameter('verify_grasp_max_retries').value
         if self._verify_grasp_retries > max_retries:
@@ -120,15 +108,7 @@ class TaskFlow:
         self._set_state(State.IDLE, detail=f'{mode} 모드로 전환')
 
     def _handle_stop(self):
-        """"일시정지" 명령. 취소가 아니라 일시정지다 - 진행 중이던 동작을 그
-        자리에서 멈추되(robot_control이 action cancel 시 실제로 move_stop을
-        호출해 그 자리에서 서게 한다 - 이동 목표까지 다 가고 나서 멈추는 게
-        아니다) 재개 가능한 스냅샷을 남긴다. self.state가 아직 바뀌기 전에
-        캡처해야 하므로 _set_state(CANCELLING)보다 먼저 호출한다
-        (_enter_fault와 동일한 패턴, _capture_resume_snapshot 참고). 재개할 수
-        없는 상태(IDLE/MOVE_TO_WATCH/DETECT_TRACK 등)에서는 스냅샷이 비어
-        일반 취소와 동일하게 동작한다. "리셋"을 누르면 이 스냅샷을 지우고 완전히
-        취소한다(_handle_reset 참고)."""
+        """취소가 아닌 일시정지 - 재개 가능한 스냅샷을 남기므로 state 변경 전(_set_state 이전)에 캡처한다."""
         if self._cancel_pending_callback is not None:
             # 이미 취소 처리 중 - 기존 콜백을 덮어쓰지 않는다.
             self._publish_status(detail='이미 취소 처리 중입니다.')
@@ -152,12 +132,8 @@ class TaskFlow:
         self._send_robot_goal('move_named', named_target=named_target)
 
     def _handle_fetch_tool(self, tool):
-        # AUTO/MANUAL 모드 구분 없이 공구 이름이 인식되면(음성/GUI 텍스트 동일 경로)
-        # 전체 자동 픽업+전달 시퀀스를 시작한다 - MANUAL은 개별 이동 명령을 추가로
-        # 더 허용할 뿐, fetch_tool 자체를 막지 않는다.
+        # MANUAL 모드도 fetch_tool을 허용한다 - 개별 이동 명령이 추가될 뿐 막지 않는다.
         if not bool(self.get_parameter('auto.config_ready').value):
-            # AUTO 모드 전환 자체는 허용하되, 실기에서 미합의 trigger/grasp spec
-            # 값으로 추측 동작하지 않도록 실제 goal 송신은 막는다.
             self._publish_status(
                 detail='AUTO 설정값 미확정(auto.config_ready=false) - '
                        '물체 가져오기 명령을 실행하지 않습니다.')
@@ -219,18 +195,15 @@ class TaskFlow:
         self._vision_timeout_owner_generation = None
 
     def _stop_vision_timeout_timer_if_owned_by(self, generation):
-        """현재 살아있는 타이머가 정확히 이 generation 소유일 때만 정리한다 - 늦게 도착한
-        이전 세대의 응답이 새 요청의 타이머를 실수로 취소하지 못하게 한다."""
+        """이 generation 소유 타이머일 때만 정리 - 지연 응답이 새 타이머를 취소하지 못하게 한다."""
         if self._vision_timeout_owner_generation == generation:
             self._stop_vision_timeout_timer()
 
     def _on_vision_mode_timeout(self, generation):
         if generation != self._vision_generation:
-            return  # 이미 새 요청/취소 등으로 세대가 바뀜
+            return
         self._stop_vision_timeout_timer_if_owned_by(generation)
-        # 세대를 올려, 타임아웃 이후 뒤늦게 도착한 응답이 로봇 goal을 시작하지 못하게 한다
-        # (_enter_fault -> _request_cancel도 OFF 요청으로 세대를 올리지만, 그 부수효과에
-        # 기대지 않고 여기서 명시적으로 무효화한다).
+        # 세대 증가 - 타임아웃 후 뒤늦은 응답이 로봇 goal을 시작하지 못하게 한다.
         self._vision_generation += 1
         self._enter_fault('/vision/set_mode 응답 타임아웃 - vision_node가 응답하지 않습니다.')
 
@@ -266,10 +239,7 @@ class TaskFlow:
             self._enter_fault(result.message)
 
     def _check_trigger(self, tool_track_msg) -> bool:
-        """DETECT_TRACK 중 수신한 ToolTrack이 servo_pick 트리거 조건을 만족하는지
-        판정한다. 조건은 모두 ROS 파라미터로 관리하며(trigger.*), 미합의 값은
-        sentinel(-1/빈 문자열)로 두어 항상 False(트리거 안 됨)를 반환하게 한다
-        (config_ready=false와 별개의 방어선)."""
+        """trigger.* 파라미터가 미설정(sentinel -1/빈 문자열)이면 항상 False를 반환한다(fail-closed)."""
         def reject(reason, message, data=None):
             self.get_logger().warn(f'{reason}: {message}', throttle_duration_sec=1.0)
             return False
@@ -348,10 +318,7 @@ class TaskFlow:
         return True
 
     def _get_grasp_spec(self, tool_class: str):
-        """등록된 공구별 grasp spec(GraspSpec)을 파라미터(tools.<tool_class>.*)에서
-        읽어 반환한다. 값이 미설정(sentinel -1)이거나 앞뒤가 맞지 않으면(min>max 등)
-        None을 반환한다 - 호출측은 이 경우 (0.0, 0.0) 같은 값으로 조용히 servo_pick을
-        보내지 않아야 한다."""
+        """값이 미설정(sentinel -1)이거나 min>max 등 모순되면 None - 호출측은 servo_pick을 보내지 않는다."""
         if tool_class not in SUPPORTED_TOOL_CLASSES:
             self._checkpoint_event(
                 'C', 'servo_pick_triggered', 'FAIL',
@@ -370,7 +337,7 @@ class TaskFlow:
                 'C', 'servo_pick_triggered', 'FAIL',
                 'grasp spec에 NaN/Inf가 포함되어 있습니다.',
                 {'tool_class': tool_class}, throttle_s=1.0)
-            return None  # NaN/Inf가 하나라도 있으면 신뢰할 수 없다
+            return None
 
         if width_mm <= 0.0 or force_n <= 0.0:
             self._checkpoint_event(
@@ -378,7 +345,7 @@ class TaskFlow:
                 'width_mm 또는 force_n이 미설정/무효입니다.',
                 {'tool_class': tool_class, 'width_mm': width_mm, 'force_n': force_n},
                 throttle_s=1.0)
-            return None  # 미설정 - 추측값으로 servo_pick을 보내지 않는다
+            return None
         if verify_min_width_mm < 0.0 or verify_max_width_mm <= 0.0:
             self._checkpoint_event(
                 'C', 'servo_pick_triggered', 'FAIL',
@@ -400,7 +367,7 @@ class TaskFlow:
                     'verify_max_width_mm': verify_max_width_mm,
                 },
                 throttle_s=1.0)
-            return None  # 설정 오류
+            return None
 
         return GraspSpec(
             width_mm=width_mm, force_n=force_n,
@@ -415,8 +382,7 @@ class TaskFlow:
         self._cancel_detect_track_timer()
         spec = self._get_grasp_spec(self.current_tool)
         if spec is None:
-            # grasp spec이 없거나 잘못됨 - RG2/RobotTask goal을 보내지 않고, 명확한
-            # IDLE 복귀 정책을 적용한다(그리퍼를 자동으로 움직이지 않는다).
+            # spec 없음 - 그리퍼를 자동으로 움직이지 않고 IDLE로 복귀한다.
             tool = self.current_tool
             self._active_grasp_spec = None
             self._set_vision_mode(SetVisionMode.Request.OFF)
@@ -425,8 +391,7 @@ class TaskFlow:
                 State.IDLE,
                 detail=f'grasp spec 미설정/유효하지 않음(tool={tool}) - servo_pick을 보내지 않습니다.')
             return
-        # 이 servo_pick에 사용한 spec을 저장해 두어, 결과가 왔을 때 같은 설정으로
-        # 검증한다 (_verify_grasp 참고).
+        # 결과 검증 시(_verify_grasp) 동일 spec을 재사용하기 위해 저장한다.
         self._active_grasp_spec = spec
         self._set_state(State.SERVO_PICK)
         self._send_robot_goal(
@@ -434,11 +399,7 @@ class TaskFlow:
             grasp_width_mm=spec.width_mm, grasp_force_n=spec.force_n)
 
     def _verify_grasp(self, result) -> bool:
-        """grip_detected와 final_width_mm로 파지 성공 여부를 검증한다.
-
-        servo_pick을 보낼 때 사용한 grasp spec(self._active_grasp_spec)을 그대로
-        재사용한다 - spec이 없으면(예: 재시작 등으로 유실) 검증을 성공으로 간주하지
-        않는다."""
+        """servo_pick 전송 시 spec(self._active_grasp_spec)이 없으면 검증 실패로 간주한다."""
         if not result.success:
             return False
         if not result.grip_detected:
@@ -448,7 +409,7 @@ class TaskFlow:
 
         spec = self._active_grasp_spec
         if spec is None:
-            return False  # 검증 기준(spec) 자체가 없다 - 성공으로 간주하지 않는다
+            return False
 
         if not (spec.verify_min_width_mm <= result.final_width_mm <= spec.verify_max_width_mm):
             return False
@@ -497,8 +458,7 @@ class TaskFlow:
         self._verify_grasp_retries += 1
         max_retries = self.get_parameter('verify_grasp_max_retries').value
         if self._verify_grasp_retries > max_retries:
-            # 파지 여부가 불확실한 채로 재시도를 모두 소진했다. 물체를 놓치지 않도록
-            # 그리퍼를 자동으로 열거나 다른 goal을 보내지 않고, 안전 정지로 보고한다.
+            # 재시도 소진 - 그리퍼를 자동으로 열지 않고 안전 정지로 보고한다.
             self._enter_fault(
                 '파지 검증 실패 - 재시도 초과. 그리퍼를 자동으로 열지 않았습니다. '
                 '수동 점검이 필요합니다.')
@@ -514,11 +474,7 @@ class TaskFlow:
 
     def _handle_move_safe_result(self, result):
         if result.success:
-            # handover_safe 도착 - 작업대가 보이는 자세에서 YOLO로 손을 찾아 접근한다
-            # (robot_control의 handover_approach - HandServoLoop 기반 연속 speedl
-            # 서보로 구현됨, /vision/hand_track을 계속 따라가다 주먹이 확정되면 멈춘다.
-            # vision_node의 손 추적이 아직 hand_track을 채워 보내지 않으면
-            # handover_servo.hardware_ready=false 게이트에 막혀 실패한다).
+            # vision_node가 아직 hand_track을 채우지 않으면 hardware_ready=false 게이트에 막혀 실패한다.
             self._set_state(State.APPROACH_HAND, detail='작업자를 찾는 중')
             self._start_after_vision_mode(
                 SetVisionMode.Request.TRACK_HAND,
@@ -538,15 +494,8 @@ class TaskFlow:
             self._enter_fault(result.message)
 
     def _on_wait_pull_timeout(self):
-        """wait_pull_timeout_s가 지나도 사람이 도구를 가져가지 않은 경우.
-
-        handover_hold를 취소하거나 place_down으로 옮기지 않는다 - 로봇은 그
-        자리에서 계속 들고 대기하고, 대신 GUI에 반복 안내만 보낸다
-        (wait_pull_reminder_interval_s 간격). 실제로 가져가면(pull 확정) 기존
-        _handle_wait_pull_result 성공 경로가 그대로 HOME으로 전이시킨다.
-        TODO(추후 구현): TTS 등 음성 안내는 아직 만들지 않았다 - 지금은
-        /task/status.detail을 통해 GUI에 텍스트로만 표시한다.
-        """
+        """handover_hold를 취소하지 않고 계속 들고 대기하며 GUI에 반복 안내만 보낸다.
+        TODO: 음성 안내(TTS) 미구현 - 현재는 /task/status.detail 텍스트만."""
         self._wait_pull_timeout_timer.cancel()
         self._wait_pull_timeout_timer = None
         if self.state != State.WAIT_PULL:
@@ -557,11 +506,8 @@ class TaskFlow:
             reminder_interval_s, self._on_wait_pull_reminder)
 
     def _on_wait_pull_reminder(self):
-        """_on_wait_pull_timeout 이후 반복 호출되는 안내 타이머(주기적)."""
         if self.state != State.WAIT_PULL:
-            # pull이 확정되어 이미 다른 상태로 전이했다면 타이머를 정리한다
-            # (일반적으로는 _handle_wait_pull_result가 먼저 취소하지만, 방어적으로
-            # 한 번 더 확인한다).
+            # 방어적 정리 - 보통 _handle_wait_pull_result가 먼저 취소한다.
             if self._wait_pull_timeout_timer is not None:
                 self._wait_pull_timeout_timer.cancel()
                 self._wait_pull_timeout_timer = None
@@ -584,8 +530,7 @@ class TaskFlow:
             detail = f'DONE tool={self.current_tool}'
             self.current_tool = None
             self._active_grasp_spec = None
-            # 정상적으로 한 사이클을 완주했다 - 남아있을 수 있는 오래된 재개
-            # 스냅샷(예: 이번 사이클 이전의 FAULT 기록)을 정리한다.
+            # 정상 완주 - 오래된 재개 스냅샷을 정리한다.
             self._clear_resume_snapshot()
             self._set_state(State.IDLE, detail=detail)
         else:

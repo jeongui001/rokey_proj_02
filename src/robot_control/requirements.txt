@@ -1,4 +1,10 @@
-# hardware_enabled=true일 때만 실제로 사용되는 pip 의존성.
+# kalman.py/servo_loop.py/hand_servo_loop.py가 모듈 최상단에서 import하므로
+# hardware_enabled과 무관하게 항상 필요하다. numpy<2 고정 이유는
+# vision_node/requirements.txt와 동일 - 시스템 apt cv2/scipy가 numpy 1.x ABI로
+# 빌드돼 있어 numpy 2.x가 깔리면 ImportError가 난다.
+numpy<2
+
+# 아래 둘은 hardware_enabled=true일 때만 실제로 사용되는 pip 의존성.
 # dry_run(hardware_enabled=false, 기본값)에서는 두 라이브러리가 없어도
 # robot_control_node가 정상적으로 기동된다 (지연 임포트 - RG2Client._ensure_connected,
 # RobotControlNode._pose_stamped_to_posx 참고).

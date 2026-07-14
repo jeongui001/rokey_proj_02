@@ -30,32 +30,25 @@ from vision_node.grasp_geometry import (
     tool_axis_from_depth, yaw_deg_to_quaternion,
 )
 
-# hand-eye 캘리브레이션(T_gripper2camera.npy)이 이미 카메라 광학 좌표계 기준이라,
-# RealSense가 내부적으로 발행하는 camera_link->camera_color_optical_frame 회전을 또
-# 거치면(=color_msg.header.frame_id로 조회하면) 회전이 두 번 걸려 축이 섞인다(x<->z 결합).
-# vision_node.launch.py의 static_transform_publisher가 이 이름으로 link_6->(광학좌표계)를
-# 직접 발행하므로, 캘리브레이션을 한 번만 적용하려면 이 프레임을 직접 조회해야 한다.
+# 캘리브레이션이 이미 광학좌표계 기준이라 color_msg.header.frame_id로 조회하면 회전이
+# 중복 적용된다(x<->z 섞임) - link_6->광학좌표계를 직접 발행하는 이 프레임을 조회한다.
 CAMERA_OPTICAL_CALIB_FRAME = 'camera_optical_calib'
 
-# 뎁스/축 계산 상수 - tool_detection_node(프로토타입 계열)에서 실기 검증된 값 그대로.
-DEPTH_MAX_M = 2.0        # 이보다 먼 뎁스는 무효(배경/노이즈)
-PATCH_HALF = 2           # patch_median_depth 반경 -> (2*4+1)^2 = 9x9 패치
-YAW_MIN_MASK_PX = 50     # 공구 윗면 마스크 최소 픽셀 수 - 미달이면 축 계산 포기
-FOV_MARGIN_PX = 8        # bbox가 화면 가장자리에 이만큼 가까우면 잘림 의심 플래그
-# 장단축비(길이/폭)가 이 값 이상이면 PCA 각도를 완전히 신뢰. 정사각형에 가까울수록
-# (렌치/망치 머리처럼 폭이 넓은 공구) 각도가 노이즈에 민감해 튀므로 신뢰도를 낮춘다.
+# 뎁스/축 계산 상수 - tool_detection_node에서 검증된 값
+DEPTH_MAX_M = 2.0        # 배경/노이즈 컷오프
+PATCH_HALF = 2           # patch_median_depth 반경 (9x9 패치)
+YAW_MIN_MASK_PX = 50     # 미달 시 축 계산 포기
+FOV_MARGIN_PX = 8        # 화면 가장자리 근접 시 잘림 의심
+# 장단축비가 이 값 이상이면 PCA 각도를 완전히 신뢰 - 정사각형에 가까울수록(폭 넓은 공구) 노이즈에 민감
 ELONGATION_TRUST_MIN = 1.3
-ELONGATION_ALPHA_FLOOR = 0.2  # 저신뢰 구간에서 스무딩 alpha에 곱할 최소 배율
+ELONGATION_ALPHA_FLOOR = 0.2  # 저신뢰 구간 alpha 최소 배율
 
-# 디버그 이미지용 클래스 색상 팔레트(BGR) - YOLO 모델 클래스 목록을 모르는 상태(이 노드는
-# 검출을 직접 안 함)라 tool_detection_node처럼 순번 배정이 안 되니 이름 해시로 고정 배정한다.
+# 디버그 이미지용 클래스 색상 팔레트(BGR) - 클래스 목록을 모르는 상태라 이름 해시로 고정 배정
 _DEBUG_CLASS_COLORS = [
     (0, 255, 0), (255, 100, 0), (0, 0, 255), (0, 255, 255), (255, 0, 255), (255, 255, 0),
 ]
 
-# 디버그 이미지 표시 확대 배율(2026-07-10) - 실제 스트림이 424x240이라 원본 그대로는
-# 화질이 낮고 글자가 조밀해 가까이서 보면 읽기 어렵다. 검출/추적 연산 자체는 원본
-# 해상도 그대로 두고, 발행 직전 시각화 단계에서만 확대한다.
+# 원본 해상도(424x240)는 확대해야 라벨이 읽기 쉬움 - 연산은 원본, 발행 직전에만 확대
 _DEBUG_IMAGE_UPSCALE = 2
 _DEBUG_FONT_SCALE = 0.35 * _DEBUG_IMAGE_UPSCALE
 _DEBUG_FONT_THICKNESS = 1
@@ -67,9 +60,7 @@ def _class_color(class_name):
 
 def _put_text_clamped(frame, text, x, y, color,
                        font_scale=_DEBUG_FONT_SCALE, thickness=_DEBUG_FONT_THICKNESS):
-    """cv2.putText 래퍼 - 텍스트 원점을 프레임 경계 안으로 clamp한다. 근접 촬영 시
-    bbox/keypoint가 화면 가장자리에 붙어 라벨이 프레임 밖으로 잘려나가는 문제
-    (2026-07-10 실기 확인) 대응 - 기존엔 y좌표 일부만 개별적으로 클램프했다."""
+    """cv2.putText 래퍼 - 텍스트 원점을 프레임 경계 안으로 clamp한다."""
     h, w = frame.shape[:2]
     (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
     x = max(0, min(x, w - tw))
@@ -90,39 +81,27 @@ class VisionNode(Node):
         self.mode = SetVisionMode.Request.OFF
         self.tool_class = ''
 
-        self.declare_parameter('vision.min_z_m', 0.10)         # MinZ - 이보다 가까우면 depth 무효 취급
-        self.declare_parameter('vision.approach_ref_x', 0.0)    # approaching 판정 기준점
+        self.declare_parameter('vision.min_z_m', 0.10)         # 이보다 가까우면 depth 무효 취급
+        self.declare_parameter('vision.approach_ref_x', 0.0)
         self.declare_parameter('vision.approach_ref_y', 0.0)
-        self.declare_parameter('vision.tracker_alpha', 0.6)     # ToolTracker 위치 스무딩
-        self.declare_parameter('vision.tracker_beta', 0.3)      # ToolTracker 속도 스무딩
-        # p0/p1/bbox 모드(한쪽 kpt만 보이거나 아예 없어 오프셋/bbox로 폴백) 전용 z
-        # 스무딩 - 이 모드들의 기준점(kpt0/kpt1/bbox 중심)은 mid(양쪽 kpt 중점)보다
-        # depth 노이즈가 훨씬 커서(2026-07-10 실기: 정지 물체인데도 mid 대비 p0에서
-        # z 변동이 ~3배로 커짐 -> servo_pick 조기 락 -> 바닥 충돌) tracker_alpha보다
-        # 더 낮게(더 세게 눌러) 잡는다. 실기 튜닝 대상.
+        self.declare_parameter('vision.tracker_alpha', 0.6)
+        self.declare_parameter('vision.tracker_beta', 0.3)
+        # p0/p1/bbox 폴백 모드 전용 z 스무딩 - mid(양쪽 kpt 중점) 대비 depth 노이즈가 커서 더 세게 누른다
         self.declare_parameter('vision.tracker_alpha_z_offset_mode', 0.15)
         # 축(yaw) 계산 파라미터 - tool_detection_node와 동일 기본값
         self.declare_parameter('vision.yaw_depth_band_m', 0.008)  # 공구 윗면에서 이보다 깊은 픽셀은 벨트로 보고 제외
         self.declare_parameter('vision.axis_smooth_alpha', 0.25)
         self.declare_parameter('vision.depth_valid_min_ratio', 0.2)  # 패치 유효 비율이 이 미만이면 depth_valid=False
-        # 개발/모니터링용 bbox+축 오버레이 이미지 발행 여부 (전체 계획.md 4.6절 계약 -
-        # operator_gui가 구독 예정). 매 프레임 인코딩 비용이 있으니 필요 없으면 끌 수 있게 파라미터화.
+        # 매 프레임 인코딩 비용이 있어 필요 없으면 끌 수 있게 파라미터화 (operator_gui 구독)
         self.declare_parameter('vision.publish_debug_image', True)
-        # 주먹 확정에 필요한 연속 프레임 수 - 매 프레임 판별 결과가 떨려도(관절 각도가
-        # 경계값 근처일 때) 한두 프레임 잘못 잡혔다고 바로 로봇을 멈추지 않게 디바운스한다.
-        # HandTrack.fist는 이미 이 확인을 거친 "확정된" 값이라는 계약이라(robot_control의
-        # HandServoLoop는 재확인 없이 바로 정지 처리), 여기서 debounce를 책임진다.
+        # 주먹 확정 연속 프레임 수(디바운스) - HandTrack.fist는 이미 확정된 값이라는 계약이라
+        # (robot_control의 HandServoLoop가 재확인 없이 정지 처리) 여기서 책임진다.
         self.declare_parameter('vision.fist_confirm_frames', 5)
-        # mediapipe가 컨테이너로 분리되면서 손 검출 결과가 /vision/hand_track_docker로
-        # 비동기 도착한다 - 이 시간(초)보다 오래된 캐시는 "미검출"로 간주한다(TEMP: 실기
-        # 검증 후 조정).
+        # mediapipe 컨테이너 분리로 손 검출 결과가 비동기 도착 - 이 시간(초)보다 오래된 캐시는 미검출로 간주
         self.declare_parameter('vision.hand_detection_max_age_s', 0.2)
-        # DEBUG_LOG: 실기 디버깅용 구조화 이벤트. 안정화 후 GUI/로그 정책 확정 시 제거 가능.
         self.declare_parameter('debug.publish_events', True)
         self.declare_parameter('debug.log_vision_decisions', False)
-        # 프로파일링: "FPS 저하 vs latency 누적" 판별용 구간 타이밍(/perception/timing).
-        # timing_csv_path를 주면 프레임당 1줄 CSV도 남긴다(오프라인 분석: tools/analyze_timing.py) -
-        # 시퀀스 안정성(miss rate/지터) 지표의 원천 데이터라 실기 검증 런에서는 켜고 돌 것.
+        # FPS 저하 vs latency 누적 판별용 구간 타이밍. csv_path 지정 시 프레임당 CSV도 기록(tools/analyze_timing.py)
         self.declare_parameter('vision.publish_timing', True)
         self.declare_parameter('vision.timing_csv_path', '')
         self.min_z_m = self.get_parameter('vision.min_z_m').value
@@ -136,7 +115,7 @@ class VisionNode(Node):
             self.get_parameter('vision.approach_ref_y').value,
         )
 
-        self._bridge = CvBridge()  # ROS Image msg <-> numpy 배열(OpenCV) 변환기
+        self._bridge = CvBridge()
         self.tracker = ToolTracker(
             alpha=self.get_parameter('vision.tracker_alpha').value,
             beta=self.get_parameter('vision.tracker_beta').value,
@@ -144,16 +123,12 @@ class VisionNode(Node):
                 'vision.tracker_alpha_z_offset_mode').value)
         self.axis_smoother = AxisSmoother(
             alpha=self.get_parameter('vision.axis_smooth_alpha').value)
-        self._hand_detection = None  # (payload dict, 수신 시각) - 컨테이너(hand_track_docker_node)가 보낸 최신 검출 결과 캐시
+        self._hand_detection = None  # (payload dict, 수신 시각) - 컨테이너의 최신 검출 캐시
         self._fist_counter = 0  # TRACK_HAND에서 is_fist 연속 참 카운트(디바운스)
-        # realsense2_camera의 align_depth.enable+enable_sync가 이 카메라/드라이버 조합
-        # (FW 5.13.0.50, ROS wrapper v4.57.7)에서 근본적으로 깨져 있어(2026-07-12 확인 -
-        # 켜면 depth 프레임이 요청 fps의 2배로 나오고 aligned_depth_to_color가 0프레임만
-        # 발행 - 해상도/fps를 바꿔도 재현, 카메라 하드웨어 자체는 rs-hello-realsense로 정상
-        # 확인됨), 드라이버 정렬 대신 raw depth(/camera/depth/image_rect_raw)를 받아
-        # grasp_geometry.align_depth_to_color로 직접 컬러 픽셀 격자에 정렬한다.
+        # realsense2_camera의 align_depth 기능이 이 카메라/드라이버 조합에서 깨져 있어(요청 fps의
+        # 2배로 나오거나 0프레임 발행), raw depth를 받아 grasp_geometry.align_depth_to_color로 직접 정렬한다.
         self._depth_intrinsics = None  # (fx,fy,ppx,ppy) - /camera/depth/camera_info 캐시
-        self._depth_to_color = None  # (rotation 3x3, translation 3,) - 뎁스->컬러 TF 캐시(물리적으로 고정값이라 최초 1회만 조회)
+        self._depth_to_color = None  # (rotation 3x3, translation 3,) - 뎁스->컬러 TF 캐시(고정값이라 최초 1회만 조회)
 
         self.pub_tool_track = self.create_publisher(ToolTrack, '/vision/tool_track', 10)  # 서브스크라이버: task_manager, robot_control(servo_pick 중 직접 구독)
         self.pub_hand_track = self.create_publisher(HandTrack, '/vision/hand_track', 10)  # 서브스크라이버: robot_control(handover_approach 중 직접 구독)
@@ -161,10 +136,9 @@ class VisionNode(Node):
             CompressedImage, '/vision/debug_image/compressed', 10)  # 서브스크라이버: operator_gui, 모니터링용(rqt_image_view 등)
         self.pub_debug_events = self.create_publisher(String, '/debug/events', 10)
         self.pub_timing = self.create_publisher(VisionTiming, '/perception/timing', 10)  # 서브스크라이버: 팀 모니터링/tools 분석
-        # 컨테이너(hand_track_docker_node)를 TRACK_HAND 구간에서만 돌리기 위한 게이트.
-        # 컨테이너가 vision_node보다 늦게 떠도 현재 모드를 즉시 알 수 있어야 하므로
-        # transient_local로 마지막 값을 래치한다(구독자도 같은 QoS여야 래치를 받는다).
-        # 컨테이너 이미지에는 handover_interfaces가 없어서 std_msgs 타입만 쓸 수 있다.
+        # 컨테이너를 TRACK_HAND 구간에서만 구동시키는 게이트. transient_local로 래치해 컨테이너가
+        # 늦게 떠도 현재 모드를 즉시 알 수 있게 함(구독자도 동일 QoS 필요). 컨테이너엔
+        # handover_interfaces가 없어 std_msgs 타입만 쓸 수 있다.
         gate_qos = QoSProfile(
             depth=1,
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -177,14 +151,13 @@ class VisionNode(Node):
         self._timing_window = deque(maxlen=100)  # (callback_ms, e2e_ms, infer_ms) rolling 통계용
         self._timing_csv = None                 # timing_csv_path 설정 시 지연 오픈
         self.srv_set_mode = self.create_service(SetVisionMode, '/vision/set_mode', self._on_set_mode)  # 클라이언트: task_manager
-        # mediapipe를 도커 컨테이너로 분리한 뒤 손 검출 결과를 받는 임시 다리 - 컨테이너의
-        # hand_track_node.py가 String(JSON)으로 발행한다. HandTrack 커스텀 메시지로
-        # 정리되면 이 구독은 제거하고 컨테이너도 handover_interfaces를 직접 쓰도록 바꿀 것.
+        # 컨테이너의 mediapipe 결과를 임시로 String(JSON)으로 받는 다리 - HandTrack 커스텀
+        # 메시지로 정리되면 제거 예정.
         self.create_subscription(
             String, '/vision/hand_track_docker', self._on_hand_track_docker, 10)
 
-        # eye-in-hand라 3D 복원엔 "지금"이 아니라 "이미지가 찍힌 시각"의 flange pose가 필요하다
-        # (전체 계획.md 2.4절) - 그래서 TF를 캐시해두고 이미지 stamp로 lookup_transform 한다.
+        # eye-in-hand라 3D 복원엔 "지금"이 아니라 이미지가 찍힌 시각의 flange pose가 필요 -
+        # TF를 캐시해두고 이미지 stamp로 lookup_transform 한다.
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -197,8 +170,7 @@ class VisionNode(Node):
         self.sub_color = message_filters.Subscriber(
             self, Image, '/camera/color/image_raw',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
-        # aligned_depth_to_color 대신 raw depth를 받는다(위 _depth_to_color 주석 참고) -
-        # 정렬은 align_depth_to_color로 우리가 직접 계산한다(_align_depth_msg).
+        # raw depth 사용 - 정렬은 직접 계산(_align_depth_msg, 위 driver 버그 참고)
         self.sub_depth = message_filters.Subscriber(
             self, Image, '/camera/depth/image_rect_raw',
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
@@ -207,16 +179,12 @@ class VisionNode(Node):
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
         self.sub_detections = message_filters.Subscriber(
             self, DetectionArray, '/detection/tool_boxes')  # 퍼블리셔: object_detection(팀원3)
-        # depth intrinsics는 프레임마다 안 바뀌는 카메라 고정값이라 sync 그룹에 넣지 않고
-        # 최신값만 캐시한다(_align_depth_msg가 사용).
+        # depth intrinsics는 프레임마다 안 바뀌는 고정값이라 sync 그룹 없이 최신값만 캐시(_align_depth_msg가 사용)
         self.create_subscription(
             CameraInfo, '/camera/depth/camera_info', self._on_depth_info,
             qos_profile=qos_profile_sensor_data)  # 퍼블리셔: realsense2_camera(기성 패키지)
-        # queue_size는 "카메라 fps x 허용할 최대 검출 지연"으로 잡아야 한다. tool_detection_node는
-        # YOLO 결과에 입력 컬러 프레임의 stamp를 그대로 실어 보내므로, 추론이 오래 걸리면 검출이
-        # 도착했을 때 짝이 맞는 컬러/뎁스 프레임이 큐에 남아 있어야 동기화가 성립한다. 60fps에서
-        # queue_size=10은 166ms 분량뿐이라, 추론이 그보다 느려지는 순간 동기화가 영구히 실패했다
-        # (= tool_track도 debug_image도 아예 안 나감). 120이면 약 2초 분량을 버틴다.
+        # queue_size=카메라fps x 허용 검출지연. 60fps에서 10(166ms분량)은 추론 지연 시
+        # 동기화가 영구 실패했음(tool_track/debug_image 모두 끊김) - 120(~2초분량)으로 완화.
         self._sync = message_filters.ApproximateTimeSynchronizer(
             [self.sub_color, self.sub_depth, self.sub_info, self.sub_detections],
             queue_size=120, slop=0.05)
@@ -263,19 +231,15 @@ class VisionNode(Node):
         'depth_valid', 'grip_deg')
 
     def _publish_timing(self, color_msg, detection_msg, t_entry, entry_wall_s, published):
-        """프레임 하나의 구간 타이밍을 /perception/timing으로 발행하고(팀 실시간 확인용),
-        timing_csv_path가 설정돼 있으면 CSV 한 줄을 append한다(오프라인 분석용).
+        """프레임 타이밍을 /perception/timing으로 발행하고, timing_csv_path 설정 시 CSV에도 기록한다.
 
-        핵심 진단: callback_ms(콜백 내 연산 합)와 e2e_ms(capture->지금)의 괴리.
-        연산 합이 작은데 e2e가 크면 큐 적체(오래된 프레임을 처리 중) - "추론이 느린 게"
-        아니라 "밀린 게" 문제라는 뜻이다."""
+        callback_ms(연산 합) 대비 e2e_ms(capture->지금)가 크면 큐 적체(추론이 느린 게 아니라 밀린 것)를 뜻한다."""
         if not bool(self.get_parameter('vision.publish_timing').value):
             return
         callback_ms = (time.perf_counter() - t_entry) * 1000.0
         stamp_s = color_msg.header.stamp.sec + color_msg.header.stamp.nanosec * 1e-9
         e2e_ms = (self.get_clock().now().nanoseconds * 1e-9 - stamp_s) * 1000.0
-        # capture->콜백진입 경과에서 검출 노드 구간을 빼면 "토픽 홉 + 4토픽 정렬 대기".
-        # 음수가 나오면 노드 간 시계 불일치 신호라 일부러 clamp하지 않는다.
+        # capture~콜백진입에서 검출 노드 구간을 뺀 값(토픽 홉+동기화 대기). 음수면 노드간 시계 불일치 신호라 clamp 안 함.
         sync_wait_ms = (entry_wall_s - stamp_s) * 1000.0 - detection_msg.detect_latency_ms
 
         msg = VisionTiming()
@@ -345,11 +309,8 @@ class VisionNode(Node):
                     throttle_duration_sec=5.0)
 
     def _safe_call(self, fn, *args, default=None, **kwargs):
-        """한 프레임에서 fn이 예외를 던져도 vision_node 프로세스 전체가 죽지 않게 막는다.
-        기본 rclpy.spin()은 SingleThreadedExecutor를 쓰는데, 콜백에서 새어나온 예외를
-        스핀 루프가 그대로 재발생시켜 프로세스가 종료된다(런치에 respawn도 없어 그 뒤로
-        모든 퍼블리셔가 영구히 멈춘다 - 2026-07-12, 태스크 반복 중 카메라 송출이 영구히
-        끊기는 증상의 원인). 예전엔 NotImplementedError만 잡아서 사실상 무방비였다."""
+        """fn이 예외를 던져도 프로세스 전체가 죽지 않게 막는다 - SingleThreadedExecutor는 콜백
+        예외를 스핀 루프에서 그대로 재발생시켜 프로세스를 종료시킨다(런치에 respawn 없음)."""
         try:
             return fn(*args, **kwargs)
         except Exception as exc:
@@ -375,8 +336,7 @@ class VisionNode(Node):
         elif request.mode == SetVisionMode.Request.TRACK_HAND:
             self._fist_counter = 0  # 이전 handover 사이클의 주먹 판정 이력을 지운다
             self._hand_detection = None  # 게이트가 꺼져 있던 동안의 마지막 검출 잔상을 지운다
-        # 컨테이너는 TRACK_HAND일 때만 mediapipe를 돌린다 - 그 이전 단계(공구 추적/서보)에서
-        # CPU를 YOLO와 나눠 쓰지 않게 해야 검출 지연이 동기화 큐를 넘기지 않는다.
+        # TRACK_HAND일 때만 컨테이너 mediapipe 구동 - CPU를 YOLO와 안 나누게 해 검출 지연 방지
         self._publish_hand_enable(request.mode == SetVisionMode.Request.TRACK_HAND)
         response.success = True
         response.message = f'mode set to {request.mode} (tool_class={request.tool_class})'
@@ -395,9 +355,8 @@ class VisionNode(Node):
         self.pub_hand_enable.publish(msg)
 
     def _on_hand_track_docker(self, msg):
-        """컨테이너(hand_track_docker_node)가 보낸 mediapipe 검출 결과(String/JSON)를
-        받아 캐싱한다. _track_hand는 여기 캐싱된 값을 쓰고, 수신 시각 기준으로
-        오래됐으면(vision.hand_detection_max_age_s) 무시한다."""
+        """컨테이너가 보낸 mediapipe 결과(JSON)를 캐싱한다. _track_hand가 사용하며
+        오래되면(vision.hand_detection_max_age_s) 무시된다."""
         try:
             payload = json.loads(msg.data)
         except (json.JSONDecodeError, TypeError):
@@ -414,9 +373,7 @@ class VisionNode(Node):
             float(msg.k[0]), float(msg.k[4]), float(msg.k[2]), float(msg.k[5]))
 
     def _get_depth_to_color_extrinsics(self, depth_msg, color_msg):
-        """뎁스->컬러 광학 좌표계 외부파라미터(rotation, translation)를 TF에서 조회해
-        캐싱한다. 카메라 리그에 고정된 물리적 값이라(안 휘는 한 안 변함) 최초 1회만
-        성공하면 이후 프레임은 캐시를 그대로 쓴다 - 매 프레임 TF 버퍼 조회 비용을 아낀다."""
+        """뎁스->컬러 외부파라미터를 TF에서 조회해 캐싱한다 - 카메라 리그 고정값이라 최초 1회만 조회."""
         if self._depth_to_color is not None:
             return self._depth_to_color
         try:
@@ -435,16 +392,9 @@ class VisionNode(Node):
         return self._depth_to_color
 
     def _align_depth_msg(self, depth_msg, color_msg, info_msg):
-        """raw depth(뎁스 광학 좌표계)를 컬러 픽셀 격자에 정렬해 새 Image msg로 반환한다.
-
-        realsense2_camera의 align_depth.enable+enable_sync가 이 카메라/드라이버 조합에서
-        근본적으로 깨져 있어(__init__ 주석 참고) 드라이버 정렬 대신 여기서 직접 계산한다.
-        TF/depth camera_info가 아직 없으면(기동 직후 한동안) None을 반환해 이번 프레임을
-        건너뛰게 한다 - 한번 확보되면 이후 프레임은 캐시만 쓰므로 계속 None일 일은 없다."""
-        # 실패 사유를 구분해서 로깅한다 - TF 없음/intrinsics 없음/정렬 계산 자체의 예외(cv2.rgbd
-        # 미존재 등, _safe_call이 별도로 잡아 error 로그를 남김)를 뭉뚱그리면 실기에서 원인을
-        # 특정하는 데 오래 걸린다(2026-07-13, 팀원 실기에서 태스크 시작 시 카메라 화면이 계속
-        # 멈추는 증상을 조사하며 확인).
+        """raw depth를 컬러 픽셀 격자에 정렬해 새 Image msg로 반환한다. TF/intrinsics가 아직
+        없으면 None(이후 캐시되면 계속 None일 일 없음)."""
+        # 실패 사유(TF 없음/intrinsics 없음/정렬 계산 예외)를 구분해 로깅 - 뭉뚱그리면 원인 특정이 오래 걸림
         extrinsics = self._get_depth_to_color_extrinsics(depth_msg, color_msg)
         if extrinsics is None:
             return None  # 사유는 _get_depth_to_color_extrinsics가 이미 로깅함
@@ -476,20 +426,13 @@ class VisionNode(Node):
         t_entry = time.perf_counter()
         entry_wall_s = self.get_clock().now().nanoseconds * 1e-9
         self._t = {}  # 이번 프레임 타이밍 기록 시작 (_track_tool의 구간들이 여기 쌓인다)
-        # camera->base TF는 _track_tool/_track_hand의 3D 변환에만 필요하다 - _publish_debug_image
-        # (GUI로 나가는 카메라 화면의 유일한 통로)는 카메라 픽셀 좌표계만 쓰므로 이 TF와 무관하다.
-        # 예전엔 조회 실패 시 여기서 곧장 return해 모드/디버그영상과 무관하게 프레임 전체가
-        # 드롭됐다 - 로봇이 정지 상태에서 처음 움직이기 시작하는 순간(태스크 시작 직후
-        # move_named('watch'))처럼 joint_states/TF 방송이 흔들리기 쉬운 전이 구간에서 실패하면
-        # 그 순간부터 카메라 화면 전체가 멈춰 보였다(2026-07-13, "태스크 지시 순간 카메라가
-        # 죽는다" 실기 확인 - _align_depth_msg 게이팅 수정은 이 상류 지점을 못 건드려 재발했다).
-        # 이제 조회가 실패해도 tf_at_stamp=None으로 두고 계속 진행 - 3D 변환(_track_tool/
-        # _track_hand)만 이번 프레임에 건너뛰고, 디버그 영상은 그대로 발행한다.
+        # camera->base TF는 3D변환에만 필요, debug_image는 픽셀좌표만 써서 무관하다. TF 조회
+        # 실패해도 tf_at_stamp=None으로 두고 진행 - 3D변환만 건너뛰고 디버그영상은 계속 발행한다
+        # (과거엔 실패 시 프레임 전체를 드롭해 카메라 화면이 멈춘 것처럼 보였음).
         t0 = time.perf_counter()
         try:
-            # "지금"이 아니라 color_msg가 찍힌 시각의 flange pose로 조회 (2.4절 핵심)
-            # color_msg.header.frame_id(RealSense가 붙이는 camera_color_optical_frame)가
-            # 아니라 CAMERA_OPTICAL_CALIB_FRAME을 조회한다 - 캘리브레이션 회전 중복 적용 방지.
+            # color_msg가 찍힌 시각의 flange pose로 조회 - color_msg.header.frame_id 대신
+            # CAMERA_OPTICAL_CALIB_FRAME 사용(회전 중복 방지, 위 상수 설명 참고)
             tf_at_stamp = self.tf_buffer.lookup_transform(
                 'base_link', CAMERA_OPTICAL_CALIB_FRAME, color_msg.header.stamp,
                 timeout=Duration(seconds=0.1))
@@ -502,11 +445,8 @@ class VisionNode(Node):
         self._t['tf_ms'] = (time.perf_counter() - t0) * 1000.0
 
         if self.mode == SetVisionMode.Request.TRACK_TOOL:
-            # _align_depth_msg 실패(TF/camera_info 미비, cv2.rgbd 예외 등)는 depth 3D 복원만
-            # 못 하는 부분 열화여야지, 프레임 전체를 드롭하면 안 된다 - 예전엔 실패 시 여기서
-            # 곧장 return해 _track_tool 자체가 안 불렸고, 그 안에서만 이뤄지는 디버그 영상
-            # 발행(아래 _track_tool의 591/633줄)까지 함께 끊겨 GUI가 "카메라 꺼짐"으로 보였다
-            # (팀원 실기 확인: 태스크 시작 순간 카메라 화면 정지 + 툴 트래킹 불가).
+            # _align_depth_msg 실패는 부분 열화(3D복원만 실패)로 다뤄야 한다 - 전체 드롭 시
+            # 디버그영상 발행도 함께 끊겨 GUI가 카메라 꺼짐으로 오인했었다.
             aligned_depth_msg = None
             if tf_at_stamp is not None:
                 aligned_depth_msg = self._safe_call(
@@ -525,11 +465,8 @@ class VisionNode(Node):
             self._publish_timing(color_msg, detection_msg, t_entry, entry_wall_s,
                                  published=track is not None)
         elif self.mode == SetVisionMode.Request.TRACK_HAND:
-            # TRACK_TOOL과 같은 이유로 depth 정렬 실패를 전체 프레임 드롭이 아니라 부분
-            # 열화로 다룬다 - _track_hand는 depth_msg가 없으면 detected=False로 발행하는
-            # 것으로 처리한다(아래 _track_hand 참고). 정렬 실패로 이 토픽이 조용히 멈추면
-            # robot_control의 HandServoLoop가 "손 유실"과 "vision_node 응답 없음"을 구분할
-            # 수 없다 - _track_hand는 원래 절대 None을 반환하지 않는 설계다.
+            # depth 정렬 실패는 부분 열화로 처리 - _track_hand는 detected=False로 계속
+            # 발행해야 HandServoLoop가 손 유실과 노드 응답없음을 구분할 수 있다.
             aligned_depth_msg = None
             if tf_at_stamp is not None:
                 aligned_depth_msg = self._safe_call(
@@ -538,17 +475,12 @@ class VisionNode(Node):
                 self._track_hand, color_msg, aligned_depth_msg, info_msg, tf_at_stamp, default=None)
             if hand_track is not None:
                 self.pub_hand_track.publish(hand_track)
-            # OFF와 동일한 이유로(아래 주석 참고) - TRACK_HAND(핸드오버 접근/대기) 구간
-            # 내내 디버그 영상이 끊기면 GUI가 "카메라 영상이 멈췄습니다"로 표시해 실제
-            # 고장과 구분이 안 된다. 인식 박스 없는 원본 화면만이라도 계속 흘려보낸다.
+            # TRACK_HAND 구간에도 디버그영상은 계속 발행 - 안 그러면 GUI가 카메라 정지로 오인
             if self.publish_debug_image:
                 self._safe_call(self._publish_debug_image, color_msg, [], None, None, default=None)
         elif self.publish_debug_image:
-            # mode == OFF: 추적/서보 목표용 데이터는 발행하지 않지만(ToolTrack/
-            # HandTrack), GUI가 카메라 연결 여부를 항상 눈으로 확인할 수 있도록
-            # 인식 박스 없는 원본 화면은 그대로 흘려보낸다. tool_detection_node는
-            # 모드와 무관하게 항상 돌고 있어 detection_msg는 이미 매 프레임
-            # 들어오지만, OFF일 때는 그 결과를 화면에 그리지 않는다(detections=[]).
+            # OFF: 추적 데이터는 발행 안 하지만 GUI가 카메라 연결을 확인할 수 있게
+            # 원본 화면은 계속 발행(detections=[])
             self._safe_call(self._publish_debug_image, color_msg, [], None, None, default=None)
 
     def _tf_matrix(self, tf_at_stamp):
@@ -558,14 +490,10 @@ class VisionNode(Node):
         return transform_to_matrix((t.x, t.y, t.z), (r.x, r.y, r.z, r.w))
 
     def _track_tool(self, color_msg, depth_msg, info_msg, detection_msg, tf_at_stamp, tool_class):
-        """저해상도 검출(팀원3 제공) + 3D 복원(tf_at_stamp 사용) + 알파-베타 필터로 ToolTrack을 만든다.
-
-        yaw(그립 방향)는 선택된 bbox의 depth ROI에서 3D 포인트클라우드 PCA로 구한다
-        (grasp_geometry.tool_axis_from_depth - 프로토타입 tool_detection_node에서 실기 검증됨).
-        """
-        # CameraInfo.k는 3x3 intrinsic 행렬을 1차원으로 편 것: [fx,0,ppx, 0,fy,ppy, 0,0,1]
-        # numpy 배열이라 float()로 캐스팅해두지 않으면 이후 계산 결과가 numpy 타입으로 오염되어
-        # bool 필드(approaching 등)에 대입할 때 타입 에러가 난다.
+        """검출 + 3D복원(tf_at_stamp 사용) + 알파-베타 필터로 ToolTrack을 만든다. yaw는 bbox
+        depth ROI의 3D PCA로 구한다(grasp_geometry.tool_axis_from_depth)."""
+        # CameraInfo.k = 3x3 intrinsic 1차원화: [fx,0,ppx,0,fy,ppy,0,0,1]. float() 캐스팅 안 하면
+        # numpy 타입이 섞여 bool 필드(approaching 등) 대입 시 에러.
         fx, fy, ppx, ppy = (float(info_msg.k[0]), float(info_msg.k[4]),
                             float(info_msg.k[2]), float(info_msg.k[5]))
         t0 = time.perf_counter()
@@ -575,29 +503,22 @@ class VisionNode(Node):
         tf_matrix = self._tf_matrix(tf_at_stamp)
 
         def reconstruct(cx, cy, bbox_w, bbox_h):
-            """bbox 중심 픽셀(cx, cy) -> base_link 3D 좌표. ToolTracker.update()가
-            후보 bbox마다 이 함수를 호출한다 (tracking.py는 ROS/depth 이미지를 몰라도 되게
-            이 클로저 하나로 depth 조회 + intrinsics + tf 변환을 전부 감춘다)."""
+            """bbox 중심 픽셀 -> base_link 3D 좌표. tracking.py가 ROS/depth를 몰라도 되도록
+            이 클로저에 depth조회+intrinsics+tf변환을 감춘다."""
             px, py = int(cx), int(cy)
             if not (0 <= py < depth_m_img.shape[0] and 0 <= px < depth_m_img.shape[1]):
                 self.get_logger().warn(
                     f'bbox 중심 픽셀({px},{py})이 depth 이미지 범위를 벗어났습니다.',
                     throttle_duration_sec=1.0)
                 return None
-            # 단일 픽셀은 금속/반사면 뎁스 구멍에 취약해서 patch median으로 보완하되,
-            # bbox가 patch(9x9)보다 작으면(멀리 있거나 작은 물체) 패치가 bbox 밖 배경까지
-            # 덮어 median이 배경 depth로 쏠릴 수 있어 bbox 안쪽으로 반경을 제한한다.
+            # 단일 픽셀은 depth 구멍에 취약해 patch median 사용 - bbox가 patch보다 작으면
+            # 반경을 bbox 안쪽으로 제한(배경 유입 방지)
             half = max(1, min(PATCH_HALF, int(min(bbox_w, bbox_h) // 2)))
             z_m, valid_ratio = patch_median_depth(
                 depth_m_img, px, py, half=half, dmin=self.min_z_m, dmax=DEPTH_MAX_M)
             depth_valid = z_m is not None and valid_ratio >= self.valid_min_ratio
-            # depth 무효 구간은 마지막 유효 z로 픽셀->광선을 역산해 x,y만 RGB 추적으로 갱신 (2.7절).
-            # 추적 사이클의 첫 프레임부터 depth가 무효면(반사면 공구에서 흔함) last_valid_z도
-            # 아직 없다 - 이때 z를 0.0 등으로 지어내면 카메라 장착 위치 근방의 엉뚱한 3D 좌표가
-            # 나가버린다(2026-07-08 실기 사고: 망치가 보이는데도 로봇이 엉뚱한 위치로 이동해
-            # 바닥을 내려찍음 - 원인이 이 좌표 조작이었다). 만들어낼 z가 없으면 이 후보를 그냥
-            # 버린다(None) - ToolTracker.update()가 다른 유효 후보를 쓰거나, 없으면 검출 없음과
-            # 동일하게 처리한다.
+            # depth 무효 시 마지막 유효 z로 x,y만 갱신. z를 지어내면(0.0 등) 엉뚱한 좌표로
+            # 로봇이 이동할 위험이 있어 last_valid_z도 없으면 이 후보를 버린다.
             if z_m is not None:
                 z = z_m
             elif self.tracker.last_valid_z is not None:
@@ -617,9 +538,7 @@ class VisionNode(Node):
         result = self.tracker.update(detection_msg.detections, tool_class, reconstruct, stamp)
         self._t['track_ms'] = (time.perf_counter() - t0) * 1000.0
         if result is None:
-            # 검출이 끊긴 프레임 - 축 이력도 지운다. 물체가 화면에서 사라졌다 다시
-            # 나타났을 때 이전 물체의 각도가 새 물체 각도와 섞이는 것을 막는다
-            # (프로토타입 reset_missing과 같은 방침).
+            # 검출 끊긴 프레임 - 축 이력도 리셋해 다른 물체 각도와 안 섞이게 함
             self.axis_smoother.reset(tool_class)
             if self.publish_debug_image:
                 # tool_class 매칭 검출이 없어도 들어온 검출 전체는 그려서 보여준다 -
@@ -670,10 +589,8 @@ class VisionNode(Node):
 
         track = ToolTrack()
         track.header = color_msg.header  # 관측 시각(stamp)은 그대로 - 서보 루프의 시간 정합 기준
-        # position/orientation은 위에서 이미 base_link로 변환했으므로 frame_id도 base_link로
-        # 고쳐야 한다 - color_msg.header를 그대로 복사하면 frame_id가 카메라 프레임으로 남아
-        # robot_control의 _validate_tool_track_message(frame_id=='base_link' 검사)가 거부한다.
-        # _track_tool은 TF 조회 성공(_on_synced_images) 후에만 호출되므로 항상 base_link.
+        # frame_id를 base_link로 교정 - color_msg 그대로 두면 카메라 프레임으로 남아
+        # robot_control의 검증(frame_id=='base_link')이 거부한다.
         track.header.frame_id = 'base_link'
         track.tool_class = tool_class
         track.confidence = float(chosen_det.score)
@@ -704,17 +621,12 @@ class VisionNode(Node):
     def _grip_yaw_quaternion(self, det, depth_m_img, fx, fy, ppx, ppy, tf_matrix, tool_class):
         """선택된 검출의 bbox depth ROI에서 그립 yaw 쿼터니언(base 기준)을 계산한다.
 
-        장축은 3D 포인트클라우드 PCA(tool_axis_from_depth)로 구하고, 장단축비가 낮을수록
-        (정사각형에 가까운 마스크 - PCA 각도가 노이즈에 민감) 스무딩을 강하게 눌러
-        저신뢰 관측이 각도를 흔들지 못하게 한다. 그립 방향은 장축에 수직(top-down 파지).
-        마스크 픽셀 부족 등으로 축을 못 구한 프레임은 (None, None).
-
-        반환: (쿼터니언 또는 None, 디버그 시각화용 정보 dict 또는 None). 디버그 정보는
-        카메라 이미지 평면 좌표계 그대로(base 회전 반영 전)라 _publish_debug_image에서
-        원본 프레임 위에 곧바로 그릴 수 있다."""
-        # pose 모델 경로: 검출에 keypoint(공구 장축 양 끝점)가 있으면 그 벡터각이 곧
-        # 장축이다 - depth 마스크/PCA 없이 직접, 근접·가림에도 bbox보다 강건.
-        # keypoint가 없거나 저신뢰면 기존 depth-PCA로 폴백 (box 모델 하위호환).
+        장축은 3D PCA로 구하고, 장단축비가 낮을수록(정사각형에 가까울수록) 스무딩을 강하게
+        눌러 저신뢰 관측의 영향을 줄인다. 그립 방향은 장축에 수직(top-down). 축을 못 구하면
+        (None, None). debug_info는 카메라 이미지 평면 좌표계 그대로라 _publish_debug_image에서
+        바로 그릴 수 있다."""
+        # pose 모델: keypoint가 있으면 그 벡터각이 곧 장축 - depth-PCA보다 근접/가림에 강건.
+        # 없거나 저신뢰면 depth-PCA로 폴백(box 모델 하위호환).
         kpt_axis = self._axis_from_keypoints(det)
         if kpt_axis is not None:
             axis_deg, kpt_debug, trust = kpt_axis
@@ -723,10 +635,9 @@ class VisionNode(Node):
             grip_deg = (axis_deg + 90.0) % 180.0  # top-down 파지: 장축에 수직으로 닫음
             debug_info = {'kpts': kpt_debug, 'axis_deg': axis_deg, 'grip_deg': grip_deg}
             return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
-        # 한쪽 kpt만 유효(근접 시 반대쪽 끝이 화면 밖으로 잘림 - 라이브런 실측)이고
-        # 직전까지 keypoint로 축을 추정한 이력이 있으면, 잘린 bbox ROI의 depth-PCA
-        # (노이즈로 yaw 드리프트 유발)보다 직전 스무딩 각도를 유지하는 게 정확하다
-        # (도구는 접근 중 정지 상태라 축이 변하지 않음).
+        # 한쪽 kpt만 유효(근접 시 반대쪽이 화면 밖으로 잘림)하고 직전 keypoint 이력이
+        # 있으면, 잘린 bbox의 depth-PCA보다 직전 각도를 유지하는 게 정확하다(공구는
+        # 접근 중 정지 상태).
         c0 = getattr(det, 'kpt0_conf', 0.0)
         c1 = getattr(det, 'kpt1_conf', 0.0)
         if (c0 >= KPT_CONF_MIN) != (c1 >= KPT_CONF_MIN):
@@ -741,8 +652,7 @@ class VisionNode(Node):
         if x2 <= x1 or y2 <= y1:
             return None, None
         if is_bbox_at_edge(det.x1, det.y1, det.x2, det.y2, w, h, FOV_MARGIN_PX):
-            # 가장자리 걸침은 컨베이어 위에서 흔해 무효화하면 축이 거의 안 나온다 -
-            # 보이는 부분만으로 계속 계산하되 정보성 로그만 남긴다 (프로토타입 방침).
+            # 가장자리 걸침은 컨베이어에서 흔해 무효화하면 축이 거의 안 나옴 - 보이는 부분만으로 계산
             self.get_logger().debug(
                 f'{det.class_name} bbox가 화면 가장자리에 걸침 - 잘린 실루엣으로 축 계산',
                 throttle_duration_sec=1.0)
@@ -765,18 +675,14 @@ class VisionNode(Node):
         return self._grip_deg_to_base_quaternion(grip_deg, tf_matrix), debug_info
 
     def _axis_from_keypoints(self, det):
-        """검출의 2-keypoint(장축 양 끝점)에서 (axis_deg, 디버그 좌표, trust)를 구한다.
-
-        keypoint가 없거나(kpt_conf 기본값 0 - 구 box 모델), 저신뢰거나, 두 점이 너무
-        붙어 있으면(각도 신뢰 불가) None - 호출측이 depth-PCA로 폴백한다.
-        trust는 두 kpt conf의 평균으로, elongation 기반 trust와 같은 방식으로
-        AxisSmoother의 alpha를 누른다(저신뢰 관측이 각도를 흔들지 못하게)."""
+        """검출의 2-keypoint에서 (axis_deg, 디버그좌표, trust)를 구한다. keypoint 없음/저신뢰/
+        두 점이 너무 가까우면 None(depth-PCA로 폴백). trust는 두 kpt conf 평균으로
+        AxisSmoother alpha를 누른다."""
         c0, c1 = det.kpt0_conf, det.kpt1_conf
         if c0 < KPT_CONF_MIN or c1 < KPT_CONF_MIN:
             return None
         dx, dy = det.kpt1_x - det.kpt0_x, det.kpt1_y - det.kpt0_y
-        # 축 길이 하한: bbox 장변의 30%. 그 미만이면 두 점이 뭉쳐 있어 각도가 노이즈
-        # (라벨 스펙상 끝점 간 거리는 장변 근처여야 정상 - validate_pose_labels.py의 50% 경고와 일관)
+        # 두 점이 bbox 장변의 30% 미만으로 붙어있으면 각도가 노이즈(끝점 간 거리는 장변 근처가 정상)
         min_axis_px = 0.3 * max(det.x2 - det.x1, det.y2 - det.y1)
         if np.hypot(dx, dy) < max(min_axis_px, 2.0):
             self.get_logger().warn(
@@ -799,20 +705,11 @@ class VisionNode(Node):
 
     def _publish_debug_image(
             self, color_msg, detections, chosen_det, axis_debug, position=None, depth_valid=None):
-        """검출 전체의 bbox + (있으면) 추적 대상의 축선을 그려 압축 이미지로 발행한다
-        (전체 계획.md 4.6절 계약, operator_gui/rqt_image_view로 모니터링용). 클래스별
-        색상은 YOLO 모델 정보 없이도 이름 해시로 고정 배정한다.
-
-        position/depth_valid가 있으면(= ToolTrack이 실제로 발행된 프레임) 계산된
-        base_link 좌표를 화면에 같이 찍는다 - 2026-07-08 실기 사고(z=0 폴백 버그로 엉뚱한
-        좌표가 서보 목표가 됨) 이후 추가됨. bbox가 맞게 잡히는지뿐 아니라 좌표 계산
-        결과가 말이 되는 값인지(카메라 근처 등 이상값이 아닌지)를 rqt_image_view만 보고도
-        바로 판단할 수 있게 하기 위함이다."""
-        # 실제 스트림이 424x240(launch 설정)이라 원본 그대로 그리면 화질이 낮고, 특히
-        # 근접 촬영 시(bbox가 화면을 꽉 채움) 글자가 서로 겹치거나 화면 밖으로 잘려
-        # 읽기 어렵다(2026-07-08/2026-07-10 실기 확인) - 검출 좌표는 원본 기준으로 계산된
-        # 값이라 여기서 _DEBUG_IMAGE_UPSCALE배로 스케일해 그리고, 텍스트는 전부
-        # _put_text_clamped로 화면 경계 안에 들어오게 한다.
+        """검출 bbox + 추적 대상 축선을 그려 압축 이미지로 발행한다(operator_gui/rqt_image_view
+        모니터링용). position/depth_valid가 있으면 계산된 base_link 좌표도 화면에 표시해
+        좌표 계산 결과가 말이 되는지 바로 확인할 수 있게 한다."""
+        # 원본(424x240) 그대로 그리면 근접 촬영 시 글자가 겹치거나 잘려 upscale해서 그리고
+        # _put_text_clamped로 경계 안에 고정한다.
         u = _DEBUG_IMAGE_UPSCALE
         frame = self._bridge.imgmsg_to_cv2(color_msg, desired_encoding='bgr8').copy()
         frame = cv2.resize(frame, None, fx=u, fy=u, interpolation=cv2.INTER_LINEAR)
@@ -873,19 +770,14 @@ class VisionNode(Node):
     def _track_hand(self, color_msg, depth_msg, info_msg, tf_at_stamp):
         """MediaPipe로 매 프레임 손 위치·주먹 여부를 판별해 HandTrack을 만든다.
 
-        ToolTrack과 달리 미검출/복원 실패 프레임도 detected=False로 계속 발행한다 -
-        robot_control의 HandServoLoop는 "마지막으로 메시지를 받은 시각"으로 손 유실
-        (t_lost_s)을 판정하므로(should_abort와 동일한 설계), 이 노드가 조용히 멈추지
-        않고 매 프레임 신호를 보내야 한다. 반환값은 절대 None이 아니다(_safe_call의
-        NotImplementedError 경로만 예외)."""
+        ToolTrack과 달리 미검출/실패 프레임도 detected=False로 계속 발행한다 - HandServoLoop가
+        마지막 수신 시각으로 손 유실을 판정하므로 조용히 멈추면 안 된다. 반환값은 절대 None이 아니다."""
         track = HandTrack()
         track.header = color_msg.header
         track.header.frame_id = 'base_link'
         track.pose.orientation.w = 1.0  # 손 자세는 위치만 쓰고 방향은 무시
 
-        # mediapipe는 컨테이너(hand_track_docker_node)에서 돌고, 결과는
-        # _on_hand_track_docker가 /vision/hand_track_docker에서 받아 캐싱해둔 것을 쓴다
-        # (비동기 도착이라 "이 프레임 정확히"가 아니라 "충분히 최근" 결과를 쓴다).
+        # 컨테이너가 비동기로 보낸 결과를 캐시에서 사용(이 프레임 정확히가 아니라 충분히 최근 값)
         if self._hand_detection is None:
             self._fist_counter = 0
             self.get_logger().warn(
@@ -917,10 +809,7 @@ class VisionNode(Node):
         track.fist = confirmed_fist
 
         if depth_msg is None:
-            # _align_depth_msg가 이번 프레임 실패(TF/camera_info 미비, cv2.rgbd 예외 등) -
-            # 3D 위치만 계산 못 할 뿐 2D 검출/주먹 판정은 이미 유효하므로 그대로 반영해
-            # 발행한다(위 docstring의 "절대 None 아님" 불변식 유지 - HandServoLoop가 이
-            # 토픽의 수신 여부로 손 유실을 판정한다).
+            # 정렬 실패해도 2D 검출/주먹 판정은 유효하니 3D만 스킵하고 그대로 발행(위 docstring의 "절대 None 아님" 유지)
             self.get_logger().warn(
                 '뎁스 정렬 결과가 없어 손 3D 위치를 계산할 수 없습니다.',
                 throttle_duration_sec=1.0)

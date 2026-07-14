@@ -4,10 +4,7 @@ from handover_interfaces.srv import SetVisionMode
 from task_manager.task_models import Safety, State
 
 
-# _on_robot_result의 result_state(goal 송신 시점의 self.state) -> (phase, checkpoint_id).
-# SERVO_PICK/VERIFY_GRASP/MANUAL_MOVE 결과는 파이프라인 점검.md 체크리스트
-# 항목이 아니므로(각각 D/servo_pick_result가 별도로 처리하거나, 수동 이동/재시도라
-# 체크리스트 밖) 체크포인트를 발행하지 않는다.
+# result_state(goal 송신 시점의 self.state) -> (phase, checkpoint_id). 없는 항목은 체크포인트를 발행하지 않는다.
 _RESULT_STATE_CHECKPOINTS = {
     State.MOVE_TO_WATCH: ('B', 'move_watch_result_received'),
     State.MOVE_SAFE: ('F', 'handover_safe_result_received'),
@@ -33,11 +30,9 @@ class ActionCoordinator:
     def _on_cancel_timeout(self):
         self._stop_cancel_timeout_timer()
         if self._cancel_pending_callback is None:
-            return  # 이미 취소가 확인되어 콜백이 실행/정리됨
-        # 취소 완료를 확인하지 못했으므로, 나중에 지연 도착하는 result가 있어도
-        # 정상 상태로 전이하지 않도록 콜백을 무시(no-op)로 바꿔 남겨둔다.
+            return
+        # 지연 도착하는 result가 정상 상태로 전이시키지 못하도록 콜백을 no-op으로 바꿔둔다.
         self._cancel_pending_callback = lambda: None
-        # 취소 타임아웃이면 복구를 시작하지 않는다 - 진행 중이던 복구 요청이 있었다면 중단한다.
         self._recovery_generation += 1
         self._recovery_in_progress = False
         self.safety_state = Safety.FAULT
@@ -47,14 +42,7 @@ class ActionCoordinator:
     # ---- Action 취소 (STOP / 모드 전환 / Fault 공용) ----
 
     def _request_cancel(self, on_cancelled):
-        """진행 중인 goal의 취소를 요청하고 Vision을 OFF로 전환한다.
-
-        cancel_goal_async() 호출 자체는 취소 완료를 보장하지 않으므로,
-        goal의 최종 result 콜백이 도착한 뒤에만 on_cancelled를 실행한다.
-        아직 GoalHandle을 받기 전(accept/reject 응답 대기 중)이면 취소 요청 사실만
-        기억해두고, _on_goal_response가 수락/거절에 따라 이어서 처리한다.
-        일정 시간 안에 취소가 확인되지 않으면 _on_cancel_timeout이 안전하게 FAULT로 전환한다.
-        """
+        """cancel_goal_async()는 취소 완료를 보장하지 않으므로, 최종 result 콜백 도착 후에만 on_cancelled를 실행한다."""
         self._set_vision_mode(SetVisionMode.Request.OFF)
         self._cancel_all_timers()
         if not self._goal_in_progress:
@@ -68,19 +56,11 @@ class ActionCoordinator:
                 self._current_goal_handle.cancel_goal_async()
             except Exception as exc:
                 self._handle_action_future_exception(exc, 'cancel_goal_async')
-        # else: GoalHandle을 아직 받지 못함 - _on_goal_response에서 accept 시 즉시
-        # cancel_goal_async()를 호출하거나, reject 시 이 콜백을 안전하게 정리한다.
+        # else: GoalHandle 미수신 - _on_goal_response가 accept/reject에 따라 이어서 처리한다.
 
     def _handle_action_future_exception(self, exc, context_label):
-        """send_goal_async/cancel_goal_async/future.result() 등 Action 통신 경계에서
-        예외가 발생했을 때 공통으로 처리한다.
-
-        pending callback(STOP/모드전환/복구 대기 중이던 콜백)을 성공 처리로 착각해
-        호출하지 않는다 - 대신 그 콜백을 버리고 곧바로 FAULT로 전환한다. _goal_generation을
-        올려 지연 도착하는 콜백(이미 진행 중이던 send_goal_async/get_result_async의
-        결과 등)이 이후에도 상태를 되돌리지 못하게 한다."""
-        # self.state가 바뀌기 전에 재개용 스냅샷을 남긴다 (_capture_resume_snapshot 참고,
-        # _enter_fault를 거치지 않는 이 예외 경로에서도 동일하게 필요하다).
+        """pending callback을 성공 처리로 착각하지 않도록 버리고 곧바로 FAULT로 전환한다."""
+        # _enter_fault를 거치지 않는 예외 경로라 여기서도 스냅샷을 남겨야 한다.
         self._capture_resume_snapshot()
         self._goal_in_progress = False
         self._current_goal_handle = None

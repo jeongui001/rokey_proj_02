@@ -11,12 +11,7 @@ class SafetyRecovery:
 
     @staticmethod
     def _classify_fault_prefix(text: str) -> str:
-        """robot_control과 합의된 /robot/fault 접두어로 안전상태를 분류한다.
-
-        단순히 문자열에 특정 단어가 포함됐는지가 아니라, 정해진 접두어로
-        시작하는지를 우선 확인한다. 접두어가 없거나 알 수 없으면 안전하게
-        FAULT로 간주한다.
-        """
+        """robot_control과 합의된 접두어로 분류 - 접두어가 없거나 알 수 없으면 FAULT로 간주(fail-safe)."""
         stripped = (text or '').lstrip()
         if stripped.startswith('PROTECTIVE_STOP:'):
             return Safety.PROTECTIVE_STOP
@@ -27,20 +22,12 @@ class SafetyRecovery:
         return Safety.FAULT
 
     def _enter_fault(self, detail, safety_state=Safety.FAULT):
-        # self.state가 아직 바뀌기 전(이 아래 어떤 코드도 self.state를 직접 바꾸지
-        # 않는다 - _request_cancel(lambda: None)의 콜백도 no-op이다)에 재개용
-        # 스냅샷을 남긴다 (_capture_resume_snapshot 참고).
+        # self.state가 바뀌기 전에 재개용 스냅샷을 남긴다(_capture_resume_snapshot 참고).
         self._capture_resume_snapshot()
-        # 새로운 Fault는 복구 진행보다 항상 우선한다 - 진행 중이던 복구 요청(취소
-        # 대기, 서비스 응답 대기, 또는 응답 타임아웃 타이머)이 있었다면 모두
-        # 무효화한다. generation을 올려두면 이미 보낸 /robot/recover 요청의 지연
-        # 응답(성공이든 타임아웃이든)이 나중에 도착해도 무시된다.
+        # 새 Fault는 진행 중이던 복구 요청보다 우선한다 - generation을 올려 지연 응답을 무시시킨다.
         self._recovery_generation += 1
         self._recovery_in_progress = False
         self._stop_recovery_timeout_timer()
-        # 진행 중이던 /vision/set_mode 응답 대기도 함께 무효화한다 - 아래 _request_cancel이
-        # _set_vision_mode(OFF)로 세대를 올리므로 그 응답/타임아웃은 어차피 무시되지만,
-        # 타이머 자체를 남겨두지 않는다.
         self._stop_vision_timeout_timer()
         self.safety_state = safety_state
         self._publish_status(detail=detail)
@@ -49,13 +36,7 @@ class SafetyRecovery:
         self._request_cancel(lambda: None)
 
     def _on_fault(self, msg):
-        """SAFETY_PRIORITY 기준으로 안전상태를 갱신한다.
-
-        이미 비정상 상태라는 이유만으로 새 Fault를 전부 무시하지 않는다 - 더 높은
-        단계(예: PROTECTIVE_STOP -> EMERGENCY_STOP, FAULT -> EMERGENCY_STOP)는
-        반드시 즉시 반영한다. 반대로 현재보다 낮은 단계로는 강등하지 않는다
-        (EMERGENCY_STOP은 자동으로 낮은 상태가 되지 않는다). 완전히 동일한 메시지가
-        같은 등급으로 반복되는 경우에만 중복 처리를 생략한다."""
+        """SAFETY_PRIORITY 기준으로 갱신 - 더 높은 단계는 즉시 반영하되 낮은 단계로는 강등하지 않는다."""
         new_state = self._classify_fault_prefix(msg.data)
         new_priority = SAFETY_PRIORITY[new_state]
         current_priority = SAFETY_PRIORITY[self.safety_state]
@@ -106,10 +87,6 @@ class SafetyRecovery:
 
     def _handle_reset(self):
         if self.safety_state == Safety.NORMAL:
-            # 정상 상태에서의 리셋은 "확실하게 대기모드로 되돌리기"다 - 일시정지로
-            # 남은 재개 스냅샷을 지우거나(_handle_stop 참고), 아직 진행 중인
-            # 작업이 있다면 취소까지 함께 한다(예전 "작업 중단" 버튼이 하던 일).
-            # 재개할 스냅샷도 없고 이미 IDLE이면 정말 할 일이 없는 경우다.
             if self.state == State.IDLE and self._resume_kind is None:
                 self._publish_status(detail='정상 상태입니다.')
                 return
@@ -126,37 +103,28 @@ class SafetyRecovery:
         if self._recovery_in_progress:
             self._publish_status(detail='이미 복구 요청이 진행 중입니다.')
             return
-        # 리셋 명령을 받았다고 바로 NORMAL로 바꾸지 않는다. 먼저 RECOVERY_REQUIRED로
-        # 전환하고(Vision OFF + 업무 타이머 정리는 _request_cancel이 처리), 진행 중인
-        # Action goal이 있다면 취소가 확인된 뒤에만 robot_control의 /robot/recover를
-        # 호출한다 (_maybe_start_recovery가 취소 확인 지점에서 이어받는다).
+        # 취소 확인 뒤에만 /robot/recover를 호출한다(_maybe_start_recovery가 이어받음).
         self.safety_state = Safety.RECOVERY_REQUIRED
         self._recovery_in_progress = True
         self._publish_status(detail='리셋 요청 접수 - 취소 확인 후 복구를 요청합니다.')
         if self._cancel_pending_callback is not None:
-            # 이미 다른 사유(Fault 등)로 취소가 진행 중이다 - 그 완료 콜백을 임의로
-            # 덮어쓰지 않는다. 그 콜백이 끝나면 _maybe_start_recovery가 이어서
-            # 복구 시도 여부를 판단한다.
+            # 이미 다른 사유로 취소 진행 중 - 콜백을 덮어쓰지 않는다.
             return
         self._request_cancel(lambda: None)
 
     def _maybe_start_recovery(self):
-        """진행 중이던 goal 취소가 확인된 직후(또는 취소할 것이 없던 경우 즉시)
-        호출된다. 리셋 요청이 걸려 있고, 그 사이 다른 goal이 시작되지 않았고,
-        안전상태가 여전히 RECOVERY_REQUIRED일 때만 실제 복구 서비스를 호출한다."""
+        """취소 완료 확인 직후 호출 - 리셋 요청이 걸려 있고 안전상태가 여전히 RECOVERY_REQUIRED일 때만 복구를 호출한다."""
         if not self._recovery_in_progress:
             return
         if self._goal_in_progress:
-            return  # 취소 완료 콜백이 새 goal을 보냈다면(예: place_down) 그것부터 기다린다
+            return  # 취소 완료 콜백이 새 goal을 보냈다면 그것부터 기다린다
         if self.safety_state != Safety.RECOVERY_REQUIRED:
-            # 그 사이 새 Fault 등으로 안전상태가 바뀌었다 - 이번 복구 시도는 중단한다.
             self._recovery_in_progress = False
             return
         self._call_recover_service()
 
     def _call_recover_service(self):
-        """goal 취소 완료가 확인된 뒤에만 호출된다. 반드시 비동기로 호출해
-        executor를 막지 않는다."""
+        """goal 취소 완료 확인 후에만 호출된다."""
         generation = self._recovery_generation
         if not self.recover_client.service_is_ready():
             self._recovery_in_progress = False
@@ -191,25 +159,17 @@ class SafetyRecovery:
         self._recovery_timeout_owner_generation = None
 
     def _stop_recovery_timeout_timer_if_owned_by(self, generation):
-        """현재 살아있는 타이머가 정확히 이 generation 소유일 때만 정리한다.
-
-        오래된(stale) 응답/타임아웃 콜백이 그 사이 시작된 다음 세대의 새 타이머를
-        실수로 취소하지 않도록 한다 - generation 일치 여부만으로는 부족하다: 콜백이
-        자신의 generation과 self._recovery_generation이 같더라도, 정작 지금 살아있는
-        타이머 인스턴스는 자신이 만든 것이 아닐 수 있기 때문에 소유권을 별도로
-        확인한다."""
+        """generation이 같아도 지금 살아있는 타이머가 자신이 만든 게 아닐 수 있어 소유권을 별도 확인한다."""
         if self._recovery_timeout_owner_generation == generation:
             self._stop_recovery_timeout_timer()
 
     def _on_recovery_timeout(self, generation):
         if generation != self._recovery_generation:
-            return  # 이미 새 Fault 등으로 세대가 바뀜 - 현재 타이머/상태를 건드리지 않는다
+            return
         self._stop_recovery_timeout_timer_if_owned_by(generation)
         if not self._recovery_in_progress:
-            return  # 이미 정상 응답(success/실패)으로 처리가 끝남 - 안전하게 무시
-        # 응답이 오지 않았다 - generation을 올려 이후 늦게 도착하는 success/실패
-        # 응답을 모두 무시하게 하고, RECOVERY_REQUIRED를 유지한 채(자동으로 NORMAL로
-        # 전환하지 않고) 사용자가 다시 리셋을 요청할 수 있게 한다.
+            return
+        # generation 증가로 이후 늦게 도착하는 응답을 모두 무시하고, RECOVERY_REQUIRED를 유지한다.
         self._recovery_generation += 1
         self._recovery_in_progress = False
         self._publish_status(
@@ -217,15 +177,12 @@ class SafetyRecovery:
                    '다시 리셋을 요청할 수 있습니다.')
 
     def _on_recover_response(self, future, generation):
-        # generation 확인이 가장 먼저다 - 오래된(stale) 응답이면 현재 타이머나
-        # _recovery_in_progress를 절대 건드리지 않는다(그 사이 시작된 다음 세대의
-        # 새 타이머/상태를 실수로 되돌리지 않기 위함).
         if generation != self._recovery_generation:
-            return  # 그 사이 새 Fault(또는 타임아웃)로 세대가 바뀜 - 지연 응답을 무시한다
+            return  # 지연 응답 - 세대가 바뀜
         self._stop_recovery_timeout_timer_if_owned_by(generation)
         self._recovery_in_progress = False
         if self.safety_state != Safety.RECOVERY_REQUIRED:
-            return  # 이미 다른 경로(새 Fault 등)로 안전상태가 바뀜 - 무시한다
+            return
         try:
             response = future.result()
         except Exception as exc:
