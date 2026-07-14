@@ -303,7 +303,7 @@
         robot_ip: '192.168.1.100'  # M0609 실제 IP - roboton(dsr_bringup2) 실행 인자와 일치해야 함
         robot_port: 12345          # M0609 DRFL 포트
         direct_poll_hz: 100.0      # DRFL 직접 연결 외력 폴링 주파수(Hz)
-        direct_threshold_nm: [20.0, 20.0, 20.0, 20.0, 20.0, 20.0]  # TODO: 관절별 실기 캘리브레이션 필요
+        direct_threshold_nm: [25.0, 25.0, 25.0, 25.0, 25.0, 25.0]  # TODO: 관절별 실기 캘리브레이션 필요
         direct_reset_below_count: 20  # on_triggered 재무장까지 연속 임계값 미만 횟수(히스테리시스) - FAULT 자체 해제는 아님, 아래 참고
         # DrflForceMonitor.stop()이 폴링 스레드 종료를 기다리는 타임아웃 - 내부
         # 종료 안전 마진이었으나 다른 external_torque.* 값들과 함께 승격했다.
