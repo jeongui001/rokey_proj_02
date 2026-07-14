@@ -30,4 +30,8 @@ pip install -r src/vision_node/requirements.txt
 colcon build --symlink-install
 ```
 
+## 실행방식
 노드별 실행 방법은 `docs/실행방식.md` 참고 (mediapipe 손 추적은 Docker 컨테이너로 별도 실행 필요).
+
+## 시연
+https://youtu.be/YrdxbWTCtsk
