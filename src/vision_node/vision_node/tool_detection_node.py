@@ -52,13 +52,23 @@ class ToolDetectionNode(Node):
         super().__init__('tool_detection_node')
         self.declare_parameter('model_path', _default_resource('tool_detector_best.pt'))
         self.declare_parameter('conf', 0.25)
+        # NMS IoU 임계값 - 이전엔 predict()에 안 넘겨 Ultralytics 기본값(0.7, 느슨함)이
+        # 암묵적으로 쓰였다. 같은 물체에 박스가 여러 개로 쪼개져 나올 때 conf를 올리고
+        # iou를 낮추면(더 공격적인 억제) 재학습 없이 바로 조정할 수 있어 파라미터로 노출한다.
+        self.declare_parameter('iou', 0.7)
         self.declare_parameter('show_window', False)  # 개발 확인용 - YOLO bbox만 그리는 RGB 창
 
         self.conf = self.get_parameter('conf').value
+        self.iou = self.get_parameter('iou').value
         self.show_window = self.get_parameter('show_window').value
 
         from ultralytics import YOLO  # import가 느려서(수 초) 노드 초기화 시점에 수행
-        self.model = YOLO(self.get_parameter('model_path').value)
+        model_path = self.get_parameter('model_path').value
+        # TensorRT .engine은 .pt와 달리 task 메타데이터를 못 들고 있어(export 시 확인됨)
+        # task 힌트 없이 로드하면 'detect'로 잘못 추정돼 keypoint 출력이 깨진다 - .pt는
+        # 기존처럼 자체 메타데이터로 자동 판별(task=None)하게 둔다.
+        task = 'pose' if str(model_path).endswith('.engine') else None
+        self.model = YOLO(model_path, task=task)
         self.class_colors = {name: CLASS_COLORS[i % len(CLASS_COLORS)]
                              for i, name in self.model.names.items()}
 
@@ -74,7 +84,7 @@ class ToolDetectionNode(Node):
         try:
             frame = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             t0 = time.perf_counter()
-            result = self.model.predict(source=frame, conf=self.conf, verbose=False)[0]
+            result = self.model.predict(source=frame, conf=self.conf, iou=self.iou, verbose=False)[0]
             infer_ms = (time.perf_counter() - t0) * 1000.0
         except Exception as exc:
             # 기본 rclpy.spin()은 SingleThreadedExecutor를 쓰는데, 콜백에서 새어나온 예외를
