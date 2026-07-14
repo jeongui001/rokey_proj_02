@@ -39,7 +39,7 @@ CAMERA_OPTICAL_CALIB_FRAME = 'camera_optical_calib'
 
 # 뎁스/축 계산 상수 - tool_detection_node(프로토타입 계열)에서 실기 검증된 값 그대로.
 DEPTH_MAX_M = 2.0        # 이보다 먼 뎁스는 무효(배경/노이즈)
-PATCH_HALF = 4           # patch_median_depth 반경 -> (2*4+1)^2 = 9x9 패치
+PATCH_HALF = 2           # patch_median_depth 반경 -> (2*4+1)^2 = 9x9 패치
 YAW_MIN_MASK_PX = 50     # 공구 윗면 마스크 최소 픽셀 수 - 미달이면 축 계산 포기
 FOV_MARGIN_PX = 8        # bbox가 화면 가장자리에 이만큼 가까우면 잘림 의심 플래그
 # 장단축비(길이/폭)가 이 값 이상이면 PCA 각도를 완전히 신뢰. 정사각형에 가까울수록
